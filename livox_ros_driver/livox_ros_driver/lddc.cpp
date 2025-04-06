@@ -244,8 +244,8 @@ uint32_t Lddc::PublishPointcloud2(LidarDataQueue *queue, uint32_t packet_num,
     LivoxPointXyzrtl *all_points = reinterpret_cast<LivoxPointXyzrtl *>(cloud.data.data());
     size_t total_points = cloud.width;
     size_t keep_count = 0;
-    const float max_distance = 5.0f;
-    // Filter out points beyond 5.0 meters before publishing
+    const float max_distance = 25.0f;
+    // Filter out points beyond 25.0 meters before publishing
 
     for (size_t i = 0; i < total_points; ++i) {
       float x = all_points[i].x;
@@ -372,7 +372,7 @@ uint32_t Lddc::PublishPointcloudData(LidarDataQueue *queue, uint32_t packet_num,
 
   // ADDED FOR DISTANCE FILTERING
   {
-    const float max_distance = 5.0f;
+    const float max_distance = 25.0f;
     size_t keep_count = 0;
     for (size_t i = 0; i < cloud->points.size(); ++i) {
       const auto &pt = cloud->points[i];
@@ -515,7 +515,7 @@ uint32_t Lddc::PublishCustomPointcloud(LidarDataQueue *queue,
 
  // ADDED FOR DISTANCE FILTERING
   {
-    const float max_distance = 5.0f;
+    const float max_distance = 25.0f;
     size_t keep_count = 0;
     for (size_t i = 0; i < livox_msg.points.size(); ++i) {
       const auto &pt = livox_msg.points[i];

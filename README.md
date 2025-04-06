@@ -1,3 +1,12 @@
+![img_v3_02hn_14358272-a33b-4c0b-a01e-f7d5159aa04g](https://github.com/user-attachments/assets/bdbd4048-2a49-4711-98eb-e0780367fe17)
+![image](https://github.com/user-attachments/assets/33d7e3f8-ee40-4d72-862b-4690bf0b3d70)
+CHANGES were made in lddc.cpp file
+![img_v3_02hn_fb25c693-4f3b-4e11-8ed1-5098043fcc8g](https://github.com/user-attachments/assets/2d8284a2-b5cf-475a-accf-4ce6acaf72fd)
+
+
+
+
+
 # Livox ROS Driver([览沃ROS驱动程序中文说明](https://github.com/Livox-SDK/livox_ros_driver/blob/master/README_CN.md))
 
 livox_ros_driver is a new ROS package, specially used to connect LiDAR products produced by Livox. The driver can be run under ubuntu 14.04/16.04/18.04 operating system with ROS environment (indigo, kinetic, melodic) installed. Tested hardware platforms that can run livox_ros_driver include: Intel x86 cpu platforms, and some ARM64 hardware platforms (such as nvida TX2 / Xavier, etc.).
