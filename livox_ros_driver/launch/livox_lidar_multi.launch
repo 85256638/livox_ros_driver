@@ -19,12 +19,12 @@
     
     <remap from="/livox/lidar_3WEDJA700100021" to="/livox/lidar_farleft_2"/>
     <remap from="/livox/lidar_3WEDJA600100571" to="/livox/lidar_left_57"/>	
-    <remap from="/livox/lidar_3WEDJ5400100651" to="/livox/lidar_mid_65"/>
+    <remap from="/livox/lidar_1HDDH3200104431" to="/livox/lidar_mid_65"/>
     <remap from="/livox/lidar_3WEDJA600100751" to="/livox/lidar_right_75"/>	
     
     <remap from="/livox/imu_3WEDJA700100021" to="/livox/imu_farleft_2"/>
     <remap from="/livox/imu_3WEDJA600100571" to="/livox/imu_left_57"/>	
-    <remap from="/livox/imu_3WEDJ5400100651" to="/livox/imu_mid_65"/>
+    <remap from="/livox/imu_1HDDH3200104431" to="/livox/imu_mid_65"/>
     <remap from="/livox/imu_3WEDJA600100751" to="/livox/imu_right_75"/>	
     
     <param name="data_src" value="$(arg data_src)"/>
