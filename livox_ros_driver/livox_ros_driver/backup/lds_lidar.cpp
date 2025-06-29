@@ -1,33 +1,4 @@
-//
-// The MIT License (MIT)
-//
-// Copyright (c) 2019 Livox. All rights reserved.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-//
-
 #include "lds_lidar.h"
-
-// Forward declarations for mode-switcher callbacks
-extern void OnBroadcast(const BroadcastDeviceInfo* info);
-extern void OnChange(const DeviceInfo* info, DeviceEvent evt);
-
 
 #include <stdio.h>
 #include <string.h>
@@ -38,6 +9,10 @@ extern void OnChange(const DeviceInfo* info, DeviceEvent evt);
 #include "rapidjson/document.h"
 #include "rapidjson/filereadstream.h"
 #include "rapidjson/stringbuffer.h"
+
+// Forward declare the mode-switcher hooks (implemented in livox_ros_driver.cpp)
+extern void OnBroadcast(const BroadcastDeviceInfo* info);
+extern void OnChange(const DeviceInfo* info, DeviceEvent evt);
 
 using namespace std;
 
@@ -82,11 +57,12 @@ int LdsLidar::InitLdsLidar(std::vector<std::string> &broadcast_code_strs,
   printf("Livox SDK version %d.%d.%d\n", _sdkversion.major, _sdkversion.minor,
          _sdkversion.patch);
 
+  // Register the driver’s own callbacks first
   SetBroadcastCallback(OnDeviceBroadcast);
   SetDeviceStateUpdateCallback(OnDeviceChange);
 
   /** Add commandline input broadcast code */
-  for (auto input_str : broadcast_code_strs) {
+  for (auto &input_str : broadcast_code_strs) {
     AddBroadcastCodeToWhitelist(input_str.c_str());
   }
 
@@ -96,14 +72,14 @@ int LdsLidar::InitLdsLidar(std::vector<std::string> &broadcast_code_strs,
     DisableAutoConnectMode();
     printf("Disable auto connect mode!\n");
 
-    printf("List all broadcast code in whiltelist:\n");
+    printf("List all broadcast code in whitelist:\n");
     for (uint32_t i = 0; i < whitelist_count_; i++) {
       printf("%s\n", broadcast_code_whitelist_[i]);
     }
   } else {
     EnableAutoConnectMode();
     printf(
-        "No broadcast code was added to whitelist, swith to automatic "
+        "No broadcast code was added to whitelist, switch to automatic "
         "connection mode!\n");
   }
 
@@ -157,8 +133,6 @@ int LdsLidar::DeInitLdsLidar(void) {
 
 void LdsLidar::PrepareExit(void) { DeInitLdsLidar(); }
 
-/** Static function in LdsLidar for callback or event process ----------------*/
-
 /** Receiving point cloud data from Livox LiDAR. */
 void LdsLidar::OnLidarDataCb(uint8_t handle, LivoxEthPacket *data,
                              uint32_t data_num, void *client_data) {
@@ -174,14 +148,18 @@ void LdsLidar::OnLidarDataCb(uint8_t handle, LivoxEthPacket *data,
   lds_lidar->StorageRawPacket(handle, eth_packet);
 }
 
+/** Callback when a device broadcasts its presence. */
 void LdsLidar::OnDeviceBroadcast(const BroadcastDeviceInfo *info) {
   if (info == nullptr) {
+    // still notify mode switcher
+    OnBroadcast(info);
     return;
   }
 
   if (info->dev_type == kDeviceTypeHub) {
     printf("In lidar mode, couldn't connect a hub : %s\n",
            info->broadcast_code);
+    OnBroadcast(info);
     return;
   }
 
@@ -192,6 +170,7 @@ void LdsLidar::OnDeviceBroadcast(const BroadcastDeviceInfo *info) {
     if (!g_lds_ldiar->IsBroadcastCodeExistInWhitelist(info->broadcast_code)) {
       printf("Not in the whitelist, please add %s to if want to connect!\n",
              info->broadcast_code);
+      OnBroadcast(info);
       return;
     }
   }
@@ -217,32 +196,31 @@ void LdsLidar::OnDeviceBroadcast(const BroadcastDeviceInfo *info) {
       config.enable_high_sensitivity = false;
     }
 
+        // Apply raw config to UserConfig fields
     p_lidar->config.enable_fan = config.enable_fan;
     p_lidar->config.return_mode = config.return_mode;
     p_lidar->config.coordinate = config.coordinate;
     p_lidar->config.imu_rate = config.imu_rate;
-    p_lidar->config.extrinsic_parameter_source =
-        config.extrinsic_parameter_source;
+    p_lidar->config.extrinsic_parameter_source = config.extrinsic_parameter_source;
     p_lidar->config.enable_high_sensitivity = config.enable_high_sensitivity;
   } else {
     printf("Add lidar to connect is failed : %d %d \n", result, handle);
   }
+
+  // Chain to mode-switcher
+  OnBroadcast(info);
 }
 
-/** Callback function of changing of device state. */
+/** Callback when device state changes. */
 void LdsLidar::OnDeviceChange(const DeviceInfo *info, DeviceEvent type) {
-  // ------- Mode switch: restart sampling on returning to NORMAL -------
-  if (info && type == kEventStateChange && info->state == kLidarStateNormal) {
-    LidarStartSampling(info->handle, StartSampleCb, g_lds_ldiar);
-    printf("ModeSwitch: restart sampling bc=%s handle=%u\n", info->broadcast_code, info->handle);
-  }
-
   if (info == nullptr) {
+    OnChange(info, type);
     return;
   }
 
   uint8_t handle = info->handle;
   if (handle >= kMaxLidarCount) {
+    OnChange(info, type);
     return;
   }
 
@@ -269,8 +247,7 @@ void LdsLidar::OnDeviceChange(const DeviceInfo *info, DeviceEvent type) {
 
     /** Config lidar parameter */
     if (p_lidar->info.state == kLidarStateNormal) {
-      /** Ensure the thread safety for set_bits and connect_state */
-      lock_guard<mutex> lock(g_lds_ldiar->config_mutex_);
+      std::lock_guard<std::mutex> lock(g_lds_ldiar->config_mutex_);
 
       if (p_lidar->config.coordinate != 0) {
         SetSphericalCoordinate(handle, SetCoordinateCb, g_lds_ldiar);
@@ -315,6 +292,9 @@ void LdsLidar::OnDeviceChange(const DeviceInfo *info, DeviceEvent type) {
       p_lidar->connect_state = kConnectStateConfig;
     }
   }
+
+  // Chain to mode-switcher
+  OnChange(info, type);
 }
 
 /** Query the firmware version of Livox LiDAR. */
@@ -789,5 +769,4 @@ int LdsLidar::GetRawConfig(const char *broadcast_code, UserRawConfig &config) {
 }
 
 }  // namespace livox_ros
-
 
