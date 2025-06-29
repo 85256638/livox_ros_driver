@@ -4,6 +4,105 @@ CHANGES were made in lddc.cpp file
 ![img_v3_02hn_fb25c693-4f3b-4e11-8ed1-5098043fcc8g](https://github.com/user-attachments/assets/2d8284a2-b5cf-475a-accf-4ce6acaf72fd)
 
 
+livox_mode_switcher 最初是一个单独的 ROS 节点，专门负责通过 Livox SDK 下发模式切换命令（Normal、Power-Saving、Standby 等。它自己也会初始化一个 Livox SDK 实例，与雷达保持命令通道（UDP 55501–56004）连接，然后再执行模式切换。
+
+![image](https://github.com/user-attachments/assets/18d6d595-2cce-4dcc-9c45-dc9db251cc74)
+
+![image](https://github.com/user-attachments/assets/8188cc3e-a4a6-4bfb-923f-7b70480cf794)
+
+![image](https://github.com/user-attachments/assets/efc068df-3a48-463b-adeb-3ffed2e4d7c9)
+
+
+![b38a860eea3bed3ccaf3a7980c611a0](https://github.com/user-attachments/assets/6e54b43a-aee9-4f08-8fdd-472af188be30)
+
+
++---------------------------------------------------------------------------------+
+|                             livox_ros_driver_node                                |
+|                                                                                 |
+|  +----------------+   InitLivoxSDK()    +-------------------------------------+  |
+|  |  main()        | ───────────────────> | LivoxSdkInit & Register Callbacks |  |
+|  |  - parse params|                     |   • OnDeviceBroadcast              |  |
+|  |  - create Lddc |                     |   • OnDeviceChange                 |  |
+|  |  - init Lds*   |                     +-------------------------------------+  |
+|  +----------------+                                                            |
+|           |                                                                    |
++---------------------------------------------------------------------------------+
+            |
+            v
++-------------------------------+       SDK 收到广播        +-------------------------+
+| OnDeviceBroadcast(info)      | <──────────────────────── | UDP Packet from Lidar   |
+|  • call Chain→OnBroadcast    |                           (dev_type, bc, IP…)  |
+|  • then original OnDevice... |                           +-------------------------+
++-------------------------------+
+            |
+            v
++-------------------------------+       SDK 设备上线         +-------------------------+
+| OnDeviceChange(info, evt)     | <──────────────────────── | Lidar sends Connect     |
+|  • call Chain→OnChange       |                           (handle, status…)     |
+|  • update map[bc→handle]     |                           +-------------------------+
+|  • original config & Start() |
++-------------------------------+
+            |
+            v
++-------------------------------+
+| Main Loop:                   |
+| while(ros::ok()) {           |
+|   lddc->DistributeLidarData  |
+|   → publish /livox/lidar_*   |
+|     & /livox/imu_*           |
+|   ros::spinOnce();           |
+| }                             |
++-------------------------------+
+            ^
+            |                   
+            |                   (数据持续发布)
+            |
++-----------+-----------+
+| ROS Service Server    |
+| advertise "/set_mode" |
++-----------+-----------+
+            |
+            v
++-------------------------------+
+| SetModeSrv(Request req)       |
+|  • lock mutex                 |
+|  • it = map.find(bc)          |
+|  • if not found, fallback:    |
+|      for each lidar in LdsLidar│
+|        if info.bc == req.bc:  |
+|          map[bc]=handle       |
+|  • call LidarSetMode(handle,  |
+|      req.mode)                |
+|  • fill res.success/message   |
+|  • unlock, return true        |
++-------------------------------+
+            |
+            v
++-------------------------------+       LidarSetMode         +-------------------------+
+| SDK Command Channel           | ─────────────────────────> | UDP Command to Lidar     |
+| (UDP port 5550x)              |                            (mode id, seq…)         |
++-------------------------------+                            +-------------------------+
+            |
+            v
++-------------------------------+       Mode Change Ack      +-------------------------+
+| SDK receives Ack & triggers   | <──────────────────────── | Lidar status update      |
+| OnDeviceChange(handle, evt)   |   (state→2/0/1…)         |                         |
+|  • Chain→OnChange updates map |                            +-------------------------+
+|  • original StateChange logic |
++-------------------------------+
+            |
+            v
+[If state==Normal] Starts/resumes sampling → 回到 Main Loop，恢复 /livox/... 发布
+
+
+
+![image](https://github.com/user-attachments/assets/772078ff-98cc-4165-a073-1f70260678ca)
+
+
+
+
+
+
 
 
 
