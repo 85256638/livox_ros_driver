@@ -1,6 +1,9 @@
 ![img_v3_02hn_14358272-a33b-4c0b-a01e-f7d5159aa04g](https://github.com/user-attachments/assets/bdbd4048-2a49-4711-98eb-e0780367fe17)
+
+Distance CHANGES were made in lddc.cpp file
+
 ![image](https://github.com/user-attachments/assets/33d7e3f8-ee40-4d72-862b-4690bf0b3d70)
-CHANGES were made in lddc.cpp file
+
 
 
 livox_mode_switcher 最初是一个单独的 ROS 节点，专门负责通过 Livox SDK 下发模式切换命令（Normal、Power-Saving、Standby 等。它自己也会初始化一个 Livox SDK 实例，与雷达保持命令通道（UDP 55501–56004）连接，然后再执行模式切换。
