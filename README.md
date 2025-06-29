@@ -1,7 +1,6 @@
 ![img_v3_02hn_14358272-a33b-4c0b-a01e-f7d5159aa04g](https://github.com/user-attachments/assets/bdbd4048-2a49-4711-98eb-e0780367fe17)
 ![image](https://github.com/user-attachments/assets/33d7e3f8-ee40-4d72-862b-4690bf0b3d70)
 CHANGES were made in lddc.cpp file
-![img_v3_02hn_fb25c693-4f3b-4e11-8ed1-5098043fcc8g](https://github.com/user-attachments/assets/2d8284a2-b5cf-475a-accf-4ce6acaf72fd)
 
 
 livox_mode_switcher 最初是一个单独的 ROS 节点，专门负责通过 Livox SDK 下发模式切换命令（Normal、Power-Saving、Standby 等。它自己也会初始化一个 Livox SDK 实例，与雷达保持命令通道（UDP 55501–56004）连接，然后再执行模式切换。
@@ -12,10 +11,10 @@ livox_mode_switcher 最初是一个单独的 ROS 节点，专门负责通过 Liv
 
 ![image](https://github.com/user-attachments/assets/efc068df-3a48-463b-adeb-3ffed2e4d7c9)
 
-
 ![b38a860eea3bed3ccaf3a7980c611a0](https://github.com/user-attachments/assets/6e54b43a-aee9-4f08-8fdd-472af188be30)
 
 
+```
 +---------------------------------------------------------------------------------+
 |                             livox_ros_driver_node                                |
 |                                                                                 |
@@ -94,13 +93,8 @@ livox_mode_switcher 最初是一个单独的 ROS 节点，专门负责通过 Liv
             v
 [If state==Normal] Starts/resumes sampling → 回到 Main Loop，恢复 /livox/... 发布
 
-
-
-![image](https://github.com/user-attachments/assets/772078ff-98cc-4165-a073-1f70260678ca)
-
-
-
-
+```
+![image](https://github.com/user-attachments/assets/b99496b3-1e0d-4a72-9612-6b993d0ccb25)
 
 
 
