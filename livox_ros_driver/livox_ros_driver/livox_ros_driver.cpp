@@ -63,6 +63,7 @@ void OnChange(const DeviceInfo* info, DeviceEvent evt) {
 bool SetModeSrv(livox_mode_switcher::SetLidarMode::Request &req,
                 livox_mode_switcher::SetLidarMode::Response &res) {
   std::lock_guard<std::mutex> lk(g_mtx);
+  g_manual_switch_time[req.broadcast_code] = ros::Time::now().toSec();
   auto it = g_bc2handle.find(req.broadcast_code);
   if (it == g_bc2handle.end()) {
     // fallback: 遍历 LdsLidar 实例
@@ -220,4 +221,5 @@ int main(int argc, char **argv) {
 
   return 0;
 }
+
 

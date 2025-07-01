@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <unordered_map>
 
 #include "lds.h"
 #include "livox_sdk.h"
@@ -37,6 +38,8 @@
 #include "timesync.h"
 
 namespace livox_ros {
+
+extern std::unordered_map<std::string, double> g_manual_switch_time;
 
 /**
  * LiDAR data source, data from dependent lidar.
