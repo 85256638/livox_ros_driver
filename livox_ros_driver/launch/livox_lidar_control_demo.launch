@@ -1,0 +1,66 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- 
+    Livox激光雷达模式控制演示launch文件
+    
+    该launch文件演示了如何使用新增的激光雷达工作模式控制功能。
+    包括：
+    1. 启动livox_ros_driver节点
+    2. 启动状态监控节点
+    3. 启动测试脚本（可选）
+  -->
+
+  <!-- 参数配置 -->
+  <arg name="xfer_format" default="0" doc="0: PointCloud2, 1: LivoxCustomMsg, 2: PclPxyziMsg"/>
+  <arg name="multi_topic" default="1" doc="0: single topic, 1: multi topic"/>
+  <arg name="data_src" default="0" doc="0: raw lidar, 1: hub, 2: lvx file"/>
+  <arg name="publish_freq" default="10.0" doc="publish frequency"/>
+  <arg name="output_data_type" default="0" doc="0: output to ros, 1: output to rosbag"/>
+  <arg name="frame_id" default="livox_frame" doc="frame id"/>
+  <arg name="enable_lidar_bag" default="false" doc="enable lidar bag"/>
+  <arg name="enable_imu_bag" default="false" doc="enable imu bag"/>
+  <arg name="user_config_path" default="$(find livox_ros_driver)/config/livox_lidar_config.json" doc="user config file path"/>
+  <arg name="cmdline_str" default="" doc="broadcast code list"/>
+  <arg name="status_publish_interval" default="1.0" doc="status publish interval in seconds"/>
+  
+  <!-- 启动测试脚本参数 -->
+  <arg name="run_test" default="false" doc="whether to run test script"/>
+  <arg name="test_mode" default="interactive" doc="test mode: interactive or auto"/>
+
+  <!-- 启动livox_ros_driver节点 -->
+  <node name="livox_lidar_publisher" pkg="livox_ros_driver" type="livox_ros_driver_node" output="screen">
+    <param name="xfer_format" value="$(arg xfer_format)"/>
+    <param name="multi_topic" value="$(arg multi_topic)"/>
+    <param name="data_src" value="$(arg data_src)"/>
+    <param name="publish_freq" value="$(arg publish_freq)"/>
+    <param name="output_data_type" value="$(arg output_data_type)"/>
+    <param name="frame_id" value="$(arg frame_id)"/>
+    <param name="enable_lidar_bag" value="$(arg enable_lidar_bag)"/>
+    <param name="enable_imu_bag" value="$(arg enable_imu_bag)"/>
+    <param name="user_config_path" value="$(arg user_config_path)"/>
+    <param name="cmdline_str" value="$(arg cmdline_str)"/>
+    <param name="status_publish_interval" value="$(arg status_publish_interval)"/>
+  </node>
+
+  <!-- 启动状态监控节点 -->
+  <node name="lidar_status_monitor" pkg="livox_ros_driver" type="lidar_status_monitor.py" output="screen" if="$(arg run_test)">
+    <param name="status_topic" value="livox/status"/>
+    <param name="monitor_interval" value="2.0"/>
+  </node>
+
+  <!-- 启动测试脚本 -->
+  <node name="lidar_control_tester" pkg="livox_ros_driver" type="test_lidar_control.py" output="screen" if="$(arg run_test)">
+    <param name="test_mode" value="$(arg test_mode)"/>
+  </node>
+
+  <!-- 启动RViz进行可视化（可选） -->
+  <group if="$(eval arg('run_test') and arg('multi_topic') == 0)">
+    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find livox_ros_driver)/config/display_lidar_points.rviz" output="screen"/>
+  </group>
+
+  <!-- 显示启动信息 -->
+  <group if="$(arg run_test)">
+    <node name="startup_info" pkg="rostopic" type="rostopic" args="echo /livox/status" output="screen" launch-prefix="timeout 10"/>
+  </group>
+
+</launch> 

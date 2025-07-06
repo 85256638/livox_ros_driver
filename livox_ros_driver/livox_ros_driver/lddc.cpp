@@ -56,10 +56,16 @@ Lddc::Lddc(int format, int multi_topic, int data_src, int output_type,
   lds_ = nullptr;
   memset(private_pub_, 0, sizeof(private_pub_));
   memset(private_imu_pub_, 0, sizeof(private_imu_pub_));
+  memset(private_status_pub_, 0, sizeof(private_status_pub_));
   global_pub_ = nullptr;
   global_imu_pub_ = nullptr;
+  global_status_pub_ = nullptr;
   cur_node_ = nullptr;
   bag_ = nullptr;
+  
+  // 新增：初始化状态发布相关成员
+  status_publish_interval_ = 1.0;  // 默认1秒发布一次状态
+  last_status_publish_time_ = ros::Time::now();
 };
 
 Lddc::~Lddc() {
@@ -69,6 +75,10 @@ Lddc::~Lddc() {
 
   if (global_imu_pub_) {
     delete global_imu_pub_;
+  }
+
+  if (global_status_pub_) {
+    delete global_status_pub_;
   }
 
   if (lds_) {
@@ -84,6 +94,12 @@ Lddc::~Lddc() {
   for (uint32_t i = 0; i < kMaxSourceLidar; i++) {
     if (private_imu_pub_[i]) {
       delete private_imu_pub_[i];
+    }
+  }
+
+  for (uint32_t i = 0; i < kMaxSourceLidar; i++) {
+    if (private_status_pub_[i]) {
+      delete private_status_pub_[i];
     }
   }
 }
@@ -654,6 +670,13 @@ void Lddc::DistributeLidarData(void) {
     PollingLidarImuData(lidar_id, lidar);
   }
 
+  // 新增：定期发布激光雷达状态
+  ros::Time current_time = ros::Time::now();
+  if ((current_time - last_status_publish_time_).toSec() >= status_publish_interval_) {
+    PublishAllLidarStatus();
+    last_status_publish_time_ = current_time;
+  }
+
   if (lds_->IsRequestExit()) {
     PrepareExit();
   }
@@ -739,6 +762,108 @@ ros::Publisher *Lddc::GetCurrentImuPublisher(uint8_t handle) {
   }
 
   return *pub;
+}
+
+// 新增：获取状态发布器
+ros::Publisher *Lddc::GetCurrentStatusPublisher(uint8_t handle) {
+  ros::Publisher **pub = nullptr;
+  uint32_t queue_size = kMinEthPacketQueueSize;
+
+  if (use_multi_topic_) {
+    pub = &private_status_pub_[handle];
+    queue_size = queue_size * 2; // queue size is 64 for only one lidar
+  } else {
+    pub = &global_status_pub_;
+    queue_size = queue_size * 8; // shared queue size is 256, for all lidars
+  }
+
+  if (*pub == nullptr) {
+    char name_str[48];
+    memset(name_str, 0, sizeof(name_str));
+    if (use_multi_topic_) {
+      snprintf(name_str, sizeof(name_str), "livox/status_%s",
+               lds_->lidars_[handle].info.broadcast_code);
+      ROS_INFO("Support multi status topics.");
+    } else {
+      ROS_INFO("Support only one status topic.");
+      snprintf(name_str, sizeof(name_str), "livox/status");
+    }
+
+    *pub = new ros::Publisher;
+    **pub = cur_node_->advertise<livox_ros_driver::LidarStatus>(name_str, queue_size);
+    ROS_INFO("%s publish lidar status, set ROS publisher queue size %d", name_str, queue_size);
+  }
+
+  return *pub;
+}
+
+// 新增：发布单个激光雷达状态
+void Lddc::PublishLidarStatus(uint8_t handle) {
+  if (!lds_ || handle >= kMaxSourceLidar) {
+    return;
+  }
+
+  const LidarDevice& lidar = lds_->lidars_[handle];
+  if (lidar.connect_state == kConnectStateOff) {
+    return;  // 未连接，不发布状态
+  }
+
+  livox_ros_driver::LidarStatus status_msg;
+  status_msg.header.stamp = ros::Time::now();
+  status_msg.header.frame_id = frame_id_;
+  
+  status_msg.broadcast_code = std::string(lidar.info.broadcast_code);
+  status_msg.handle = handle;
+  status_msg.device_type = lidar.info.type;
+  status_msg.state = lidar.info.state;
+  // 根据state推断mode，因为SDK没有提供查询mode的API
+  if (lidar.info.state == kLidarStateNormal) {
+    status_msg.mode = 1;  // 正常模式
+  } else if (lidar.info.state == kLidarStatePowerSaving) {
+    status_msg.mode = 2;  // 省电模式
+  } else if (lidar.info.state == kLidarStateStandBy) {
+    status_msg.mode = 3;  // 待机模式
+  } else {
+    status_msg.mode = 0;  // 未知模式
+  }
+  status_msg.feature = lidar.info.feature;
+  status_msg.return_mode = lidar.config.return_mode;  // 添加点云回波模式
+  status_msg.ip = std::string(lidar.info.ip);
+  status_msg.data_port = lidar.info.data_port;
+  status_msg.cmd_port = lidar.info.cmd_port;
+  status_msg.sensor_port = lidar.info.sensor_port;
+  
+  for (int i = 0; i < 4; i++) {
+    status_msg.firmware_version[i] = lidar.info.firmware_version[i];
+  }
+  
+  status_msg.is_connected = (lidar.connect_state != kConnectStateOff);
+  status_msg.is_sampling = (lidar.connect_state == kConnectStateSampling);
+  status_msg.error_code = lidar.info.status.status_code.error_code;
+
+  ros::Publisher *p_publisher = GetCurrentStatusPublisher(handle);
+  if (kOutputToRos == output_type_) {
+    p_publisher->publish(status_msg);
+  } else {
+    if (bag_ && enable_lidar_bag_) {
+      bag_->write(p_publisher->getTopic(), status_msg.header.stamp, status_msg);
+    }
+  }
+}
+
+// 新增：发布所有激光雷达状态
+void Lddc::PublishAllLidarStatus() {
+  if (!lds_) {
+    return;
+  }
+
+  for (uint32_t i = 0; i < lds_->lidar_count_; i++) {
+    uint32_t lidar_id = i;
+    LidarDevice *lidar = &lds_->lidars_[lidar_id];
+    if (lidar->connect_state != kConnectStateOff) {
+      PublishLidarStatus(lidar_id);
+    }
+  }
 }
 
 void Lddc::CreateBagFile(const std::string &file_name) {

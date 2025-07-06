@@ -32,6 +32,7 @@
 #include <pcl_ros/point_cloud.h>
 #include <livox_ros_driver/CustomMsg.h>
 #include <livox_ros_driver/CustomPoint.h>
+#include <livox_ros_driver/LidarStatus.h>
 
 namespace livox_ros {
 
@@ -62,6 +63,10 @@ class Lddc {
   void SetRosPub(ros::Publisher *pub) { global_pub_ = pub; };
   void SetPublishFrq(uint32_t frq) { publish_frq_ = frq; }
 
+  void PublishLidarStatus(uint8_t handle);
+  void PublishAllLidarStatus();
+  void SetStatusPublishInterval(double interval_seconds) { status_publish_interval_ = interval_seconds; }
+
   Lds *lds_;
 
  private:
@@ -79,6 +84,7 @@ class Lddc {
 
   ros::Publisher *GetCurrentPublisher(uint8_t handle);
   ros::Publisher *GetCurrentImuPublisher(uint8_t handle);
+  ros::Publisher *GetCurrentStatusPublisher(uint8_t handle);
   void PollingLidarPointCloudData(uint8_t handle, LidarDevice *lidar);
   void PollingLidarImuData(uint8_t handle, LidarDevice *lidar);
   void InitPointcloud2MsgHeader(sensor_msgs::PointCloud2& cloud);
@@ -100,6 +106,11 @@ class Lddc {
   ros::Publisher *global_pub_;
   ros::Publisher *private_imu_pub_[kMaxSourceLidar];
   ros::Publisher *global_imu_pub_;
+
+  ros::Publisher *private_status_pub_[kMaxSourceLidar];
+  ros::Publisher *global_status_pub_;
+  double status_publish_interval_;
+  ros::Time last_status_publish_time_;
 
   ros::NodeHandle *cur_node_;
   rosbag::Bag *bag_;

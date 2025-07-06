@@ -1,0 +1,7 @@
+# Request
+string broadcast_code    # LiDAR broadcast code (empty for all connected LiDARs)
+uint8 mode              # Target mode (1:Normal, 2:PowerSaving, 3:Standby)
+---
+# Response
+bool success            # Operation success status
+string message          # Response message 

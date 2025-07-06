@@ -39,7 +39,14 @@ find_package(PCL REQUIRED)
 add_message_files(FILES
 	CustomPoint.msg
 	CustomMsg.msg
+	LidarStatus.msg
 #   Message2.msg
+	)
+
+## Generate services in the 'srv' folder
+add_service_files(FILES
+	LidarModeControl.srv
+	PointCloudReturnModeControl.srv
 	)
 
 ## Generate added messages and services with any dependencies listed here

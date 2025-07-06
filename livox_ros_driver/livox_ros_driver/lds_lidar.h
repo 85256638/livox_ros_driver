@@ -30,6 +30,8 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <queue>
+#include <functional>
 
 #include "lds.h"
 #include "livox_sdk.h"
@@ -37,6 +39,9 @@
 #include "timesync.h"
 
 namespace livox_ros {
+
+// Forward declaration
+class Lddc;
 
 /**
  * LiDAR data source, data from dependent lidar.
@@ -51,6 +56,25 @@ class LdsLidar : public Lds {
   int InitLdsLidar(std::vector<std::string> &broadcast_code_strs,
                    const char *user_config_path);
   int DeInitLdsLidar(void);
+
+  // 新增：设置LDDC指针，用于状态发布
+  void SetLddc(Lddc* lddc) { lddc_ = lddc; }
+
+  // 新增：控制激光雷达工作模式
+  bool SetLidarMode(const std::string& broadcast_code, LidarMode mode);
+  bool SetAllLidarMode(LidarMode mode);
+
+  // 新增：控制点云回波模式
+  bool SetPointCloudReturnMode(const std::string& broadcast_code, PointCloudReturnMode return_mode);
+  bool SetAllPointCloudReturnMode(PointCloudReturnMode return_mode);
+
+  // 新增：获取激光雷达状态
+  std::vector<std::string> GetConnectedLidarBroadcastCodes();
+  bool IsLidarConnected(const std::string& broadcast_code);
+  LidarState GetLidarState(const std::string& broadcast_code);
+
+  // 新增：处理命令队列
+  void ProcessCommandQueue();
 
  private:
   LdsLidar(uint32_t interval_ms);
@@ -91,6 +115,10 @@ class LdsLidar : public Lds {
                                    DeviceParameterResponse *response,
                                    void *clent_data);
 
+  // 新增：模式设置回调
+  static void SetLidarModeCb(livox_status status, uint8_t handle,
+                             uint8_t response, void *client_data);
+
   void ResetLdsLidar(void);
   int AddBroadcastCodeToWhitelist(const char *broadcast_code);
   bool IsBroadcastCodeExistInWhitelist(const char *broadcast_code);
@@ -104,6 +132,11 @@ class LdsLidar : public Lds {
   bool IsExistInRawConfig(const char *broadcast_code);
   int GetRawConfig(const char *broadcast_code, UserRawConfig &config);
 
+  // 新增：内部辅助方法
+  uint8_t GetHandleByBroadcastCode(const std::string& broadcast_code);
+  void PublishLidarStatus(uint8_t handle);
+  void PublishAllLidarStatus();
+
   bool auto_connect_mode_;
   uint32_t whitelist_count_;
   volatile bool is_initialized_;
@@ -114,6 +147,23 @@ class LdsLidar : public Lds {
   TimeSync *timesync_;
   TimeSyncConfig timesync_config_;
   std::mutex config_mutex_;
+
+  // 新增：状态管理相关成员
+  Lddc* lddc_;  // 指向LDDC的指针，用于状态发布
+  std::mutex status_mutex_;
+  std::mutex command_queue_mutex_;
+  
+  // 命令队列结构
+  struct CommandRequest {
+    uint8_t handle;
+    LidarMode mode;
+    std::function<void(livox_status, uint8_t, uint8_t)> callback;
+    std::chrono::steady_clock::time_point timestamp;
+  };
+  
+  std::queue<CommandRequest> command_queue_;
+  std::chrono::steady_clock::time_point last_command_time_;
+  static constexpr int kCommandIntervalMs = 100;  // 命令间隔100ms
 };
 
 }  // namespace livox_ros

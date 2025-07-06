@@ -29,11 +29,14 @@
 #include <csignal>
 
 #include <ros/ros.h>
+#include <std_srvs/Empty.h>
 #include "lddc.h"
 #include "lds_hub.h"
 #include "lds_lidar.h"
 #include "lds_lvx.h"
 #include "livox_sdk.h"
+#include "livox_ros_driver/LidarModeControl.h"
+#include "livox_ros_driver/PointCloudReturnModeControl.h"
 
 using namespace livox_ros;
 
@@ -44,6 +47,54 @@ inline void SignalHandler(int signum) {
   ros::shutdown();
   exit(signum);
 }
+
+// 新增：全局变量，用于服务回调
+LdsLidar* g_lidar_instance = nullptr;
+
+// 新增：服务回调函数
+bool LidarModeControlCallback(livox_ros_driver::LidarModeControl::Request &req,
+                              livox_ros_driver::LidarModeControl::Response &res) {
+  if (!g_lidar_instance) {
+    res.success = false;
+    res.message = "LiDAR instance not available";
+    return true;
+  }
+
+  if (req.broadcast_code.empty()) {
+    // 设置所有激光雷达模式
+    res.success = g_lidar_instance->SetAllLidarMode(static_cast<LidarMode>(req.mode));
+    res.message = res.success ? "Set all LiDARs mode successfully" : "Failed to set all LiDARs mode";
+  } else {
+    // 设置指定激光雷达模式
+    res.success = g_lidar_instance->SetLidarMode(req.broadcast_code, static_cast<LidarMode>(req.mode));
+    res.message = res.success ? "Set LiDAR mode successfully" : "Failed to set LiDAR mode";
+  }
+
+  return true;
+}
+
+bool PointCloudReturnModeControlCallback(livox_ros_driver::PointCloudReturnModeControl::Request &req,
+                                         livox_ros_driver::PointCloudReturnModeControl::Response &res) {
+  if (!g_lidar_instance) {
+    res.success = false;
+    res.message = "LiDAR instance not available";
+    return true;
+  }
+
+  if (req.broadcast_code.empty()) {
+    // 设置所有激光雷达点云回波模式
+    res.success = g_lidar_instance->SetAllPointCloudReturnMode(static_cast<PointCloudReturnMode>(req.return_mode));
+    res.message = res.success ? "Set all LiDARs point cloud return mode successfully" : "Failed to set all LiDARs point cloud return mode";
+  } else {
+    // 设置指定激光雷达点云回波模式
+    res.success = g_lidar_instance->SetPointCloudReturnMode(req.broadcast_code, static_cast<PointCloudReturnMode>(req.return_mode));
+    res.message = res.success ? "Set LiDAR point cloud return mode successfully" : "Failed to set LiDAR point cloud return mode";
+  }
+
+  return true;
+}
+
+
 
 int main(int argc, char **argv) {
   /** Ros related */
@@ -112,6 +163,11 @@ int main(int argc, char **argv) {
 
     LdsLidar *read_lidar = LdsLidar::GetInstance(1000 / publish_freq);
     lddc->RegisterLds(static_cast<Lds *>(read_lidar));
+    
+    // 新增：设置LDDC指针和全局变量
+    read_lidar->SetLddc(lddc);
+    g_lidar_instance = read_lidar;
+    
     ret = read_lidar->InitLdsLidar(bd_code_list, user_config_path.c_str());
     if (!ret) {
       ROS_INFO("Init lds lidar success!");
@@ -168,9 +224,30 @@ int main(int argc, char **argv) {
     } while (0);
   }
 
+  // 新增：创建服务
+  ros::ServiceServer mode_control_service = 
+      livox_node.advertiseService("livox/lidar_mode_control", LidarModeControlCallback);
+  ROS_INFO("LiDAR mode control service started");
+
+  ros::ServiceServer return_mode_control_service = 
+      livox_node.advertiseService("livox/point_cloud_return_mode_control", PointCloudReturnModeControlCallback);
+  ROS_INFO("Point cloud return mode control service started");
+
+
+
   ros::Time::init();
+  ros::Rate rate(100);  // 100Hz循环频率，用于处理命令队列
+  
   while (ros::ok()) {
     lddc->DistributeLidarData();
+    
+    // 新增：处理命令队列
+    if (g_lidar_instance) {
+      g_lidar_instance->ProcessCommandQueue();
+    }
+    
+    ros::spinOnce();
+    rate.sleep();
   }
 
   return 0;

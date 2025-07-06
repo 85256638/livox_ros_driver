@@ -1,0 +1,7 @@
+# Request
+string broadcast_code    # LiDAR broadcast code (empty for all connected LiDARs)
+uint8 return_mode        # Point cloud return mode (0:FirstReturn, 1:StrongestReturn, 2:DualReturn, 3:TripleReturn)
+---
+# Response
+bool success            # Operation success status
+string message          # Response message 

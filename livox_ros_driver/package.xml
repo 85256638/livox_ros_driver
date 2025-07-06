@@ -71,6 +71,7 @@
   <exec_depend>pcl_ros</exec_depend>
 
   <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>git</depend>
   <depend>apr</depend>
   

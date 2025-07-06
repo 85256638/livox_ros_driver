@@ -23,6 +23,7 @@
 //
 
 #include "lds_lidar.h"
+#include "lddc.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -53,6 +54,10 @@ LdsLidar::LdsLidar(uint32_t interval_ms) : Lds(interval_ms, kSourceRawLidar) {
   memset(broadcast_code_whitelist_, 0, sizeof(broadcast_code_whitelist_));
 
   ResetLdsLidar();
+
+  // 新增：初始化状态管理相关成员
+  lddc_ = nullptr;
+  last_command_time_ = std::chrono::steady_clock::now();
 }
 
 LdsLidar::~LdsLidar() {}
@@ -304,6 +309,9 @@ void LdsLidar::OnDeviceChange(const DeviceInfo *info, DeviceEvent type) {
       p_lidar->connect_state = kConnectStateConfig;
     }
   }
+
+  // 新增：发布状态更新
+  g_lds_ldiar->PublishLidarStatus(handle);
 }
 
 /** Query the firmware version of Livox LiDAR. */
@@ -775,6 +783,234 @@ int LdsLidar::GetRawConfig(const char *broadcast_code, UserRawConfig &config) {
   }
 
   return -1;
+}
+
+// 新增：模式设置回调函数
+void LdsLidar::SetLidarModeCb(livox_status status, uint8_t handle,
+                               uint8_t response, void *client_data) {
+  LdsLidar *lds_lidar = static_cast<LdsLidar *>(client_data);
+
+  if (handle >= kMaxLidarCount) {
+    return;
+  }
+
+  if (status == kStatusSuccess) {
+    printf("Set lidar[%d] mode success!\n", handle);
+  } else {
+    printf("Set lidar[%d] mode failed: %d\n", handle, status);
+  }
+
+  // 发布状态更新
+  lds_lidar->PublishLidarStatus(handle);
+}
+
+// 新增：根据广播码获取handle
+uint8_t LdsLidar::GetHandleByBroadcastCode(const std::string& broadcast_code) {
+  for (uint8_t handle = 0; handle < kMaxLidarCount; handle++) {
+    if (lidars_[handle].connect_state != kConnectStateOff) {
+      if (strcmp(lidars_[handle].info.broadcast_code, broadcast_code.c_str()) == 0) {
+        return handle;
+      }
+    }
+  }
+  return kMaxLidarCount;  // 无效handle
+}
+
+// 新增：设置单个激光雷达模式
+bool LdsLidar::SetLidarMode(const std::string& broadcast_code, LidarMode mode) {
+  uint8_t handle = GetHandleByBroadcastCode(broadcast_code);
+  if (handle >= kMaxLidarCount) {
+    printf("LiDAR with broadcast code %s not found or not connected\n", broadcast_code.c_str());
+    return false;
+  }
+
+  // 检查当前状态
+  if (lidars_[handle].connect_state != kConnectStateSampling) {
+    printf("LiDAR %s is not in sampling state, cannot change mode\n", broadcast_code.c_str());
+    return false;
+  }
+
+  // 添加到命令队列
+  std::lock_guard<std::mutex> lock(command_queue_mutex_);
+  CommandRequest request;
+  request.handle = handle;
+  request.mode = mode;
+  request.callback = [this](livox_status status, uint8_t handle, uint8_t response) {
+    SetLidarModeCb(status, handle, response, this);
+  };
+  request.timestamp = std::chrono::steady_clock::now();
+  
+  command_queue_.push(request);
+  printf("Added mode change request for LiDAR %s to queue\n", broadcast_code.c_str());
+  
+  return true;
+}
+
+// 新增：设置所有激光雷达模式
+bool LdsLidar::SetAllLidarMode(LidarMode mode) {
+  bool success = true;
+  std::vector<std::string> connected_codes = GetConnectedLidarBroadcastCodes();
+  
+  for (const auto& broadcast_code : connected_codes) {
+    if (!SetLidarMode(broadcast_code, mode)) {
+      success = false;
+    }
+  }
+  
+  return success;
+}
+
+// 新增：获取已连接的激光雷达广播码列表
+std::vector<std::string> LdsLidar::GetConnectedLidarBroadcastCodes() {
+  std::vector<std::string> codes;
+  std::lock_guard<std::mutex> lock(status_mutex_);
+  
+  for (uint8_t handle = 0; handle < kMaxLidarCount; handle++) {
+    if (lidars_[handle].connect_state != kConnectStateOff) {
+      codes.push_back(std::string(lidars_[handle].info.broadcast_code));
+    }
+  }
+  
+  return codes;
+}
+
+// 新增：检查激光雷达是否连接
+bool LdsLidar::IsLidarConnected(const std::string& broadcast_code) {
+  uint8_t handle = GetHandleByBroadcastCode(broadcast_code);
+  if (handle >= kMaxLidarCount) {
+    return false;
+  }
+  
+  std::lock_guard<std::mutex> lock(status_mutex_);
+  return lidars_[handle].connect_state != kConnectStateOff;
+}
+
+// 新增：获取激光雷达状态
+LidarState LdsLidar::GetLidarState(const std::string& broadcast_code) {
+  uint8_t handle = GetHandleByBroadcastCode(broadcast_code);
+  if (handle >= kMaxLidarCount) {
+    return kLidarStateUnknown;
+  }
+  
+  std::lock_guard<std::mutex> lock(status_mutex_);
+  return lidars_[handle].info.state;
+}
+
+// 新增：处理命令队列
+void LdsLidar::ProcessCommandQueue() {
+  std::lock_guard<std::mutex> lock(command_queue_mutex_);
+  
+  auto now = std::chrono::steady_clock::now();
+  auto time_since_last = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_command_time_);
+  
+  if (time_since_last.count() < kCommandIntervalMs) {
+    return;  // 还未到发送时间
+  }
+  
+  if (command_queue_.empty()) {
+    return;  // 队列为空
+  }
+  
+  CommandRequest request = command_queue_.front();
+  command_queue_.pop();
+  
+  // 检查激光雷达是否仍然连接
+  if (request.handle >= kMaxLidarCount || 
+      lidars_[request.handle].connect_state == kConnectStateOff) {
+    printf("LiDAR handle %d is no longer connected, skipping mode change\n", request.handle);
+    return;
+  }
+  
+  // 发送模式设置命令
+  livox_status status = LidarSetMode(request.handle, request.mode, 
+                                    [](livox_status status, uint8_t handle, uint8_t response, void* client_data) {
+                                      auto callback = static_cast<std::function<void(livox_status, uint8_t, uint8_t)>*>(client_data);
+                                      (*callback)(status, handle, response);
+                                      delete callback;
+                                    }, 
+                                    new std::function<void(livox_status, uint8_t, uint8_t)>(request.callback));
+  
+  if (status == kStatusSuccess) {
+    printf("Sent mode change command for handle %d\n", request.handle);
+    last_command_time_ = now;
+  } else {
+    printf("Failed to send mode change command for handle %d: %d\n", request.handle, status);
+    // 如果发送失败，可以选择重新入队或丢弃
+  }
+}
+
+// 新增：发布单个激光雷达状态
+void LdsLidar::PublishLidarStatus(uint8_t handle) {
+  if (!lddc_ || handle >= kMaxLidarCount) {
+    return;
+  }
+  
+  std::lock_guard<std::mutex> lock(status_mutex_);
+  const LidarDevice& lidar = lidars_[handle];
+  
+  if (lidar.connect_state == kConnectStateOff) {
+    return;  // 未连接，不发布状态
+  }
+  
+  // 调用LDDC的状态发布功能
+  lddc_->PublishLidarStatus(handle);
+}
+
+// 新增：发布所有激光雷达状态
+void LdsLidar::PublishAllLidarStatus() {
+  for (uint8_t handle = 0; handle < kMaxLidarCount; handle++) {
+    if (lidars_[handle].connect_state != kConnectStateOff) {
+      PublishLidarStatus(handle);
+    }
+  }
+}
+
+// 新增：设置单个激光雷达点云回波模式
+bool LdsLidar::SetPointCloudReturnMode(const std::string& broadcast_code, PointCloudReturnMode return_mode) {
+  uint8_t handle = GetHandleByBroadcastCode(broadcast_code);
+  if (handle >= kMaxLidarCount) {
+    printf("LiDAR with broadcast code %s not found or not connected\n", broadcast_code.c_str());
+    return false;
+  }
+
+  // 检查设备类型是否支持
+  if (lidars_[handle].info.type == kDeviceTypeLidarMid40) {
+    printf("LiDAR Mid40 does not support point cloud return mode control\n");
+    return false;
+  }
+
+  // 检查当前状态
+  if (lidars_[handle].connect_state != kConnectStateSampling) {
+    printf("LiDAR %s is not in sampling state, cannot change return mode\n", broadcast_code.c_str());
+    return false;
+  }
+
+  // 直接调用SDK函数设置点云回波模式
+  livox_status status = LidarSetPointCloudReturnMode(handle, return_mode, SetPointCloudReturnModeCb, this);
+  if (status != kStatusSuccess) {
+    printf("Failed to set point cloud return mode for LiDAR %s: %d\n", broadcast_code.c_str(), status);
+    return false;
+  }
+
+  // 更新配置
+  lidars_[handle].config.return_mode = return_mode;
+  printf("Set point cloud return mode for LiDAR %s to %d\n", broadcast_code.c_str(), return_mode);
+  
+  return true;
+}
+
+// 新增：设置所有激光雷达点云回波模式
+bool LdsLidar::SetAllPointCloudReturnMode(PointCloudReturnMode return_mode) {
+  bool success = true;
+  std::vector<std::string> connected_codes = GetConnectedLidarBroadcastCodes();
+  
+  for (const auto& broadcast_code : connected_codes) {
+    if (!SetPointCloudReturnMode(broadcast_code, return_mode)) {
+      success = false;
+    }
+  }
+  
+  return success;
 }
 
 }  // namespace livox_ros
