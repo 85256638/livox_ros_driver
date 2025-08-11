@@ -17,7 +17,7 @@
     <param name="xfer_format" value="$(arg xfer_format)"/>
     <param name="multi_topic" value="$(arg multi_topic)"/>
     
-    <remap from="/livox/lidar_3WEDJA700100021" to="/livox/lidar_farleft_2"/>
+    <remap from="/livox/lidar_3WEDL4H001DW011" to="/livox/lidar_farleft_2"/>
     <remap from="/livox/lidar_3WEDJA600100571" to="/livox/lidar_left_57"/>	
     <remap from="/livox/lidar_1HDDH3200104431" to="/livox/lidar_mid_65"/>
     <remap from="/livox/lidar_3WEDJA600100751" to="/livox/lidar_right_75"/>

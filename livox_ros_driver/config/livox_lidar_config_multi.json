@@ -1,7 +1,7 @@
 {
     "lidar_config": [
         {
-            "broadcast_code": "3WEDJA700100021",
+            "broadcast_code": "3WEDL4H001DW011",
             "enable_connect": true,
             "return_mode": 0,
             "coordinate": 0,
