@@ -1,15 +1,6 @@
 {
     "lidar_config": [
         {
-            "broadcast_code": "3WEDL4H001DW011",
-            "enable_connect": true,
-            "return_mode": 0,
-            "coordinate": 0,
-            "imu_rate": 1,
-            "extrinsic_parameter_source": 1,
-            "enable_high_sensitivity": false
-        },
-        {
             "broadcast_code": "3WEDJA600100571",
             "enable_connect": true,
             "return_mode": 0,
@@ -17,18 +8,7 @@
             "imu_rate": 1,
             "extrinsic_parameter_source": 1,
             "enable_high_sensitivity": false
-        },
-        
-                {
-            "broadcast_code": "1HDDH3200104541",
-            "enable_connect": true,
-            "return_mode": 0,
-            "coordinate": 0,
-            "imu_rate": 1,
-            "extrinsic_parameter_source": 1,
-            "enable_high_sensitivity": false
-        },
-        
+        },     
                 {
             "broadcast_code": "1HDDH3200104431",
             "enable_connect": true,
@@ -38,6 +18,17 @@
             "extrinsic_parameter_source": 1,
             "enable_high_sensitivity": false
         },
+        
+                {
+            "broadcast_code": "3WEDJA700100021",
+            "enable_connect": true,
+            "return_mode": 0,
+            "coordinate": 0,
+            "imu_rate": 1,
+            "extrinsic_parameter_source": 1,
+            "enable_high_sensitivity": false
+        },
+        
                 {
             "broadcast_code": "3WEDJA600100751",
             "enable_connect": true,
