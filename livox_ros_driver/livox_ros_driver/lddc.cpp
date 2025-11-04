@@ -620,8 +620,12 @@ int Lddc::RegisterLds(Lds *lds) {
 }
 
 void Lddc::PollingLidarPointCloudData(uint8_t handle, LidarDevice *lidar) {
+  if (lidar == nullptr) {
+    return;
+  }
+  
   LidarDataQueue *p_queue = &lidar->data;
-  if (p_queue->storage_packet == nullptr) {
+  if (p_queue == nullptr || p_queue->storage_packet == nullptr) {
     return;
   }
 
@@ -643,8 +647,12 @@ void Lddc::PollingLidarPointCloudData(uint8_t handle, LidarDevice *lidar) {
 }
 
 void Lddc::PollingLidarImuData(uint8_t handle, LidarDevice *lidar) {
+  if (lidar == nullptr) {
+    return;
+  }
+  
   LidarDataQueue *p_queue = &lidar->imu_data;
-  if (p_queue->storage_packet == nullptr) {
+  if (p_queue == nullptr || p_queue->storage_packet == nullptr) {
     return;
   }
 
