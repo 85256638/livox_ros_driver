@@ -1,11 +1,234 @@
-![img_v3_02hn_14358272-a33b-4c0b-a01e-f7d5159aa04g](https://github.com/user-attachments/assets/bdbd4048-2a49-4711-98eb-e0780367fe17)
-![image](https://github.com/user-attachments/assets/33d7e3f8-ee40-4d72-862b-4690bf0b3d70)
-CHANGES were made in lddc.cpp file
-![img_v3_02hn_fb25c693-4f3b-4e11-8ed1-5098043fcc8g](https://github.com/user-attachments/assets/2d8284a2-b5cf-475a-accf-4ce6acaf72fd)
+# Livox ROS Driver（钛兴科技定制版）
 
+本分支基于官方 [livox_ros_driver v2.6.0](https://github.com/Livox-SDK/livox_ros_driver) 修改，新增以下功能：
 
+1. **在线工作模式切换** — 运行时通过 ROS Service 切换 LiDAR 工作模式（Normal / PowerSaving / Standby）
+2. **可配置点云距离过滤** — 通过 launch 参数设置最大发布距离，无需重新编译
 
+---
 
+## 快速开始
+
+### 前置条件
+
+- Ubuntu 20.04 + ROS Noetic
+- **必须使用修改版 Livox SDK**（见下方"Livox SDK 修改"章节）
+
+### 编译
+
+```bash
+cd ~/catkin_ws
+catkin_make
+source devel/setup.bash
+```
+
+### 启动
+
+```bash
+# 单雷达
+roslaunch livox_ros_driver livox_lidar.launch
+
+# 多雷达
+roslaunch livox_ros_driver livox_lidar_multi.launch
+```
+
+---
+
+## 新增功能一：在线工作模式切换
+
+### 使用方法
+
+启动驱动后，在另一个终端执行：
+
+```bash
+# 切换到节电模式（电机停转，低功耗）
+rosservice call /livox_lidar_mode "{handle: 0, mode: 2}"
+
+# 切回正常模式（电机启动，正常出点）
+rosservice call /livox_lidar_mode "{handle: 0, mode: 1}"
+
+# 切换到待机模式
+rosservice call /livox_lidar_mode "{handle: 0, mode: 3}"
+
+# 所有雷达同时切换（handle 设为 255）
+rosservice call /livox_lidar_mode "{handle: 255, mode: 2}"
+```
+
+### 参数说明
+
+| 参数 | 取值 | 说明 |
+|------|------|------|
+| `handle` | 0~31 | 单个雷达的设备句柄（启动日志中 `Lidar[X]` 的 X 即为 handle）|
+| `handle` | 255 | 广播模式，对所有已连接的雷达同时生效 |
+| `mode` | 1 | Normal — 正常工作，电机旋转，输出点云 |
+| `mode` | 2 | PowerSaving — 节电模式，电机停转 |
+| `mode` | 3 | Standby — 待机模式，电机停转 |
+
+### 返回值
+
+| `ret_code` | 含义 |
+|------------|------|
+| 0 | 请求已接受 |
+| 非 0 | 错误（详见终端日志）|
+
+### 断线行为
+
+| 场景 | 行为 |
+|------|------|
+| Normal 模式下断线 | 3 秒检测到，重连后自动恢复采样 |
+| PowerSaving / Standby 下断线 | 15 秒检测到，重连后恢复 Normal 模式 |
+| 切换 Normal 时通信失败 | 自动等待重连后重试 |
+
+---
+
+## 新增功能二：可配置点云距离过滤
+
+发布前过滤超出指定距离的点，减少下游处理数据量。
+
+### 使用方法
+
+```bash
+# 只发布 5 米以内的点
+roslaunch livox_ros_driver livox_lidar.launch max_distance:=5.0
+
+# 只发布 2 米以内的点
+roslaunch livox_ros_driver livox_lidar.launch max_distance:=2.0
+
+# 禁用过滤，发布所有点（默认）
+roslaunch livox_ros_driver livox_lidar.launch max_distance:=0
+```
+
+也可在 launch 文件中修改默认值：
+
+```xml
+<arg name="max_distance" default="5.0"/>
+```
+
+### 参数说明
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `max_distance` | double | 0.0 | 最大发布距离（米），0 表示禁用过滤 |
+
+启动时终端会输出确认信息：
+```
+[ INFO] Distance filter enabled: max_distance = 5.00 m
+```
+
+### 三种点云格式均支持
+
+距离过滤对以下三种输出格式都生效（`xfer_format` 参数）：
+- `0` — PointCloud2 (PointXYZRTL)
+- `1` — Livox CustomMsg
+- `2` — PCL PointXYZI
+
+---
+
+## Livox SDK 修改（重要）
+
+**本驱动需要配合修改版的 Livox SDK 使用。** 如果使用未修改的 SDK，模式切换将无法正常工作（切到节电后会立即自动恢复 Normal）。
+
+### 修改内容
+
+修改了 `Livox-SDK/sdk_core/src/command_handler/` 下的两个文件：
+
+#### 1. `command_channel.h`
+
+新增成员变量：
+```cpp
+uint8_t last_work_state_ = 0;  /**< Last known work state from heartbeat */
+```
+
+#### 2. `command_channel.cpp`
+
+**修改 `OnHeartbeatAck()`** — 记录心跳 ACK 中的设备状态：
+```cpp
+void CommandChannel::OnHeartbeatAck(const CommPacket &packet) {
+  last_heartbeat_ = steady_clock::now();
+  if (packet.data != NULL && packet.data_len >= sizeof(HeartbeatResponse)) {
+    last_work_state_ = reinterpret_cast<HeartbeatResponse *>(packet.data)->state;
+  }
+}
+```
+
+**修改 `OnTimer()`** — 心跳超时从固定 3 秒改为状态感知（Normal=3s，PowerSaving/Standby=15s）：
+```cpp
+auto heartbeat_timeout = std::chrono::seconds(3);
+if (last_work_state_ == 2 || last_work_state_ == 3) {
+  heartbeat_timeout = std::chrono::seconds(15);
+}
+if (now - last_heartbeat_ > heartbeat_timeout) {
+  DeviceDisconnect(handle_);
+} else {
+  HeartBeat(now);
+}
+```
+
+### 为什么需要修改 SDK
+
+官方 SDK 的心跳超时固定为 3 秒。LiDAR 切换工作模式时（例如电机减速停转），固件响应会短暂延迟，超过 3 秒后 SDK 误判设备断线，触发重连，固件在重连时自动恢复 Normal 模式——导致模式切换失败。
+
+延长超时至 15 秒可确保模式过渡期间会话保持存活。
+
+### SDK 编译安装
+
+```bash
+cd ~/Livox-SDK/build
+cmake ..
+make -j$(nproc)
+sudo make install
+```
+
+> 安装后静态库位于 `/usr/local/lib/liblivox_sdk_static.a`
+
+---
+
+## 修改文件清单
+
+### Livox SDK（2 个文件）
+
+| 文件 | 改动 |
+|------|------|
+| `sdk_core/src/command_handler/command_channel.h` | 新增 `last_work_state_` 字段 |
+| `sdk_core/src/command_handler/command_channel.cpp` | 状态感知心跳超时 + 记录 work_state |
+
+### ROS Driver（7 个文件）
+
+| 文件 | 改动 |
+|------|------|
+| `srv/LidarMode.srv` | **新增** — ROS Service 定义 |
+| `CMakeLists.txt` | 新增 `add_service_files` |
+| `livox_ros_driver/lds_lidar.h` | 新增 `ModeChangeRequest` 结构体和模式切换方法声明 |
+| `livox_ros_driver/lds_lidar.cpp` | 完整模式切换实现（含断连重试逻辑） |
+| `livox_ros_driver/livox_ros_driver.cpp` | 新增 ROS Service、AsyncSpinner、max_distance 参数 |
+| `livox_ros_driver/lddc.h` | 新增 `max_distance_` 成员和 `SetMaxDistance()` |
+| `livox_ros_driver/lddc.cpp` | 三种点云格式的距离过滤逻辑 |
+
+---
+
+## 常见问题
+
+### Q: 切到节电模式后立即自动恢复 Normal？
+确认使用的是修改版 Livox SDK。重新编译 SDK 后需要 `sudo make install` 安装，然后重新 `catkin_make` ROS Driver。
+
+### Q: handle 值怎么确定？
+启动驱动时观察终端日志 `Lidar[X] status_code[...] working state[...] feature[...]`，其中 X 就是 handle。单雷达通常为 0。
+
+### Q: 距离过滤设置了但 RViz 还显示远处的点？
+确认 launch 文件中包含 `max_distance` 参数定义和传递，并确认修改的是被编译的源文件（不是副本）。
+
+### Q: 多雷达场景下能否只让部分雷达进入节电？
+可以。分别对不同 handle 调用 service 即可：
+```bash
+rosservice call /livox_lidar_mode "{handle: 0, mode: 2}"  # 0 号进入节电
+rosservice call /livox_lidar_mode "{handle: 1, mode: 1}"  # 1 号保持正常
+```
+
+---
+
+## 以下为官方原始文档
+
+---
 
 # Livox ROS Driver([览沃ROS驱动程序中文说明](https://github.com/Livox-SDK/livox_ros_driver/blob/master/README_CN.md))
 
