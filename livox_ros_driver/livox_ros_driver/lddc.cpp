@@ -60,6 +60,7 @@ Lddc::Lddc(int format, int multi_topic, int data_src, int output_type,
   global_imu_pub_ = nullptr;
   cur_node_ = nullptr;
   bag_ = nullptr;
+  max_distance_ = 0.0f;
 };
 
 Lddc::~Lddc() {
@@ -238,36 +239,20 @@ uint32_t Lddc::PublishPointcloud2(LidarDataQueue *queue, uint32_t packet_num,
   cloud.is_dense     = true;
   cloud.data.resize(cloud.row_step); /** Adjust to the real size */
 
-// ADDED FOR DISTANCE FILTERING
-  // Filter out points beyond X meters before publishing
-  {
+  if (max_distance_ > 0.0f) {
     LivoxPointXyzrtl *all_points = reinterpret_cast<LivoxPointXyzrtl *>(cloud.data.data());
-    size_t total_points = cloud.width;
     size_t keep_count = 0;
-    const float max_distance = 25.0f;
-    // Filter out points beyond 25.0 meters before publishing
-
-    for (size_t i = 0; i < total_points; ++i) {
-      float x = all_points[i].x;
-      float y = all_points[i].y;
-      float z = all_points[i].z;
-      float dist = std::sqrt(x*x + y*y + z*z);
-      if (dist <= max_distance) {
-        if (keep_count != i) {
-          all_points[keep_count] = all_points[i]; 
-        }
+    for (size_t i = 0; i < cloud.width; ++i) {
+      float x = all_points[i].x, y = all_points[i].y, z = all_points[i].z;
+      if (x*x + y*y + z*z <= max_distance_ * max_distance_) {
+        if (keep_count != i) all_points[keep_count] = all_points[i];
         keep_count++;
       }
     }
-
-    cloud.width = static_cast<uint32_t>(keep_count);
+    cloud.width    = static_cast<uint32_t>(keep_count);
     cloud.row_step = cloud.width * cloud.point_step;
     cloud.data.resize(cloud.row_step);
   }
-  // END DISTANCE FILTERING
-
-
-
 
   ros::Publisher *p_publisher = Lddc::GetCurrentPublisher(handle);
   if (kOutputToRos == output_type_) {
@@ -370,24 +355,18 @@ uint32_t Lddc::PublishPointcloudData(LidarDataQueue *queue, uint32_t packet_num,
     last_timestamp = timestamp;
   }
 
-  // ADDED FOR DISTANCE FILTERING
-  {
-    const float max_distance = 25.0f;
+  if (max_distance_ > 0.0f) {
     size_t keep_count = 0;
     for (size_t i = 0; i < cloud->points.size(); ++i) {
       const auto &pt = cloud->points[i];
-      float dist = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
-      if (dist <= max_distance) {
-        if (keep_count != i) {
-          cloud->points[keep_count] = cloud->points[i];
-        }
+      if (pt.x*pt.x + pt.y*pt.y + pt.z*pt.z <= max_distance_ * max_distance_) {
+        if (keep_count != i) cloud->points[keep_count] = cloud->points[i];
         keep_count++;
       }
     }
     cloud->points.resize(keep_count);
     cloud->width = static_cast<uint32_t>(keep_count);
   }
-  // END DISTANCE FILTERING
 
   ros::Publisher *p_publisher = Lddc::GetCurrentPublisher(handle);
   if (kOutputToRos == output_type_) {
@@ -513,25 +492,18 @@ uint32_t Lddc::PublishCustomPointcloud(LidarDataQueue *queue,
     ++published_packet;
   }
 
- // ADDED FOR DISTANCE FILTERING
-  {
-    const float max_distance = 25.0f;
+  if (max_distance_ > 0.0f) {
     size_t keep_count = 0;
     for (size_t i = 0; i < livox_msg.points.size(); ++i) {
       const auto &pt = livox_msg.points[i];
-      float dist = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
-      if (dist <= max_distance) {
-        if (keep_count != i) {
-          livox_msg.points[keep_count] = livox_msg.points[i];
-        }
+      if (pt.x*pt.x + pt.y*pt.y + pt.z*pt.z <= max_distance_ * max_distance_) {
+        if (keep_count != i) livox_msg.points[keep_count] = livox_msg.points[i];
         keep_count++;
       }
     }
     livox_msg.points.resize(keep_count);
     livox_msg.point_num = static_cast<uint32_t>(keep_count);
   }
-  // END DISTANCE FILTERING
-
 
   ros::Publisher *p_publisher = Lddc::GetCurrentPublisher(handle);
   if (kOutputToRos == output_type_) {

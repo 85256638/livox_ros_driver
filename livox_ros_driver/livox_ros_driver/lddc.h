@@ -61,6 +61,7 @@ class Lddc {
 
   void SetRosPub(ros::Publisher *pub) { global_pub_ = pub; };
   void SetPublishFrq(uint32_t frq) { publish_frq_ = frq; }
+  void SetMaxDistance(float d) { max_distance_ = d; }
 
   Lds *lds_;
 
@@ -96,6 +97,7 @@ class Lddc {
   std::string frame_id_;
   bool enable_lidar_bag_;
   bool enable_imu_bag_;
+  float max_distance_;  /**< Max publish distance in meters, 0 = disabled */
   ros::Publisher *private_pub_[kMaxSourceLidar];
   ros::Publisher *global_pub_;
   ros::Publisher *private_imu_pub_[kMaxSourceLidar];

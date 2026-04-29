@@ -38,6 +38,29 @@ using namespace std;
 
 namespace livox_ros {
 
+namespace {
+
+LidarState ModeToState(LidarMode mode) {
+  switch (mode) {
+    case kLidarModeNormal:
+      return kLidarStateNormal;
+    case kLidarModePowerSaving:
+      return kLidarStatePowerSaving;
+    case kLidarModeStandby:
+      return kLidarStateStandBy;
+    default:
+      return kLidarStateUnknown;
+  }
+}
+
+bool ShouldWaitForReconnect(livox_status status) {
+  return status == kStatusTimeout || status == kStatusNotConnected ||
+         status == kStatusSendFailed || status == kStatusInvalidHandle ||
+         status == kStatusChannelNotExist;
+}
+
+}  // namespace
+
 /** Const varible ------------------------------------------------------------*/
 /** For callback use only */
 LdsLidar *g_lds_ldiar = nullptr;
@@ -57,7 +80,166 @@ LdsLidar::LdsLidar(uint32_t interval_ms) : Lds(interval_ms, kSourceRawLidar) {
 
 LdsLidar::~LdsLidar() {}
 
-void LdsLidar::ResetLdsLidar(void) { ResetLds(kSourceRawLidar); }
+void LdsLidar::ResetLdsLidar(void) {
+  ResetLds(kSourceRawLidar);
+
+  lock_guard<mutex> lock(mode_mutex_);
+  for (auto &request : mode_requests_) {
+    request = ModeChangeRequest();
+  }
+}
+
+livox_status LdsLidar::RequestLidarModeChange(const char *broadcast_code,
+                                              LidarMode mode) {
+  if (broadcast_code == nullptr) {
+    return kStatusFailure;
+  }
+
+  uint8_t handle = 0;
+  livox_status status = AddLidarToConnect(broadcast_code, &handle);
+  if (status != kStatusSuccess) {
+    return status;
+  }
+
+  SetDataCallback(handle, OnLidarDataCb, (void *)this);
+  RememberBroadcastCode(handle, broadcast_code);
+  return RequestLidarModeChange(handle, mode);
+}
+
+livox_status LdsLidar::RequestLidarModeChange(uint8_t handle, LidarMode mode) {
+  return SendModeChangeRequest(handle, mode, false);
+}
+
+void LdsLidar::RememberBroadcastCode(uint8_t handle, const char *broadcast_code) {
+  if (handle >= kMaxLidarCount || broadcast_code == nullptr ||
+      broadcast_code[0] == '\0') {
+    return;
+  }
+
+  lock_guard<mutex> lock(mode_mutex_);
+  strncpy(mode_requests_[handle].broadcast_code, broadcast_code,
+          sizeof(mode_requests_[handle].broadcast_code) - 1);
+  mode_requests_[handle]
+      .broadcast_code[sizeof(mode_requests_[handle].broadcast_code) - 1] = '\0';
+}
+
+void LdsLidar::ResetModeRequest(uint8_t handle) {
+  if (handle >= kMaxLidarCount) {
+    return;
+  }
+
+  lock_guard<mutex> lock(mode_mutex_);
+  char broadcast_code[kBroadcastCodeSize] = {0};
+  strncpy(broadcast_code, mode_requests_[handle].broadcast_code,
+          sizeof(broadcast_code) - 1);
+  mode_requests_[handle] = ModeChangeRequest();
+  if (broadcast_code[0] != '\0') {
+    strncpy(mode_requests_[handle].broadcast_code, broadcast_code,
+            sizeof(mode_requests_[handle].broadcast_code) - 1);
+    mode_requests_[handle]
+        .broadcast_code[sizeof(mode_requests_[handle].broadcast_code) - 1] =
+        '\0';
+  }
+}
+
+void LdsLidar::MarkModeRequestDisconnected(uint8_t handle) {
+  if (handle >= kMaxLidarCount) {
+    return;
+  }
+
+  lock_guard<mutex> lock(mode_mutex_);
+  ModeChangeRequest &request = mode_requests_[handle];
+  request.command_inflight = false;
+  if (request.active && request.desired_mode == kLidarModeNormal) {
+    request.waiting_for_reconnect = true;
+  }
+}
+
+livox_status LdsLidar::SendModeChangeRequest(uint8_t handle, LidarMode mode,
+                                             bool from_reconnect) {
+  if (handle >= kMaxLidarCount) {
+    return kStatusInvalidHandle;
+  }
+
+  LidarDevice *p_lidar = &(lidars_[handle]);
+  {
+    lock_guard<mutex> lock(mode_mutex_);
+    ModeChangeRequest &request = mode_requests_[handle];
+    if (!from_reconnect) {
+      request.active = true;
+      request.waiting_for_reconnect = false;
+      request.command_inflight = false;
+      request.desired_mode = mode;
+    }
+    if (p_lidar->info.broadcast_code[0] != '\0') {
+      strncpy(request.broadcast_code, p_lidar->info.broadcast_code,
+              sizeof(request.broadcast_code) - 1);
+      request.broadcast_code[sizeof(request.broadcast_code) - 1] = '\0';
+    }
+  }
+
+  if (p_lidar->connect_state == kConnectStateOff || p_lidar->handle != handle) {
+    if (mode == kLidarModeNormal) {
+      lock_guard<mutex> lock(mode_mutex_);
+      ModeChangeRequest &request = mode_requests_[handle];
+      request.active = true;
+      request.desired_mode = mode;
+      request.waiting_for_reconnect = true;
+      request.command_inflight = false;
+      printf("Queue lidar[%d] normal-mode recovery until broadcast reconnect.\n",
+             handle);
+      return kStatusSuccess;
+    }
+    ResetModeRequest(handle);
+    return kStatusNotConnected;
+  }
+
+  livox_status status = LidarSetMode(handle, mode, SetModeCb, this);
+
+  lock_guard<mutex> lock(mode_mutex_);
+  ModeChangeRequest &request = mode_requests_[handle];
+  if (status == kStatusSuccess) {
+    request.command_inflight = true;
+    request.waiting_for_reconnect = false;
+  } else if (mode == kLidarModeNormal && ShouldWaitForReconnect(status)) {
+    request.active = true;
+    request.desired_mode = mode;
+    request.command_inflight = false;
+    request.waiting_for_reconnect = true;
+    printf("Lidar[%d] normal-mode request deferred until reconnect: %d\n",
+           handle, status);
+    return kStatusSuccess;
+  } else {
+    request.command_inflight = false;
+    request.waiting_for_reconnect = false;
+    request.active = false;
+  }
+
+  return status;
+}
+
+void LdsLidar::MaybeRetryPendingModeRequest(uint8_t handle) {
+  if (handle >= kMaxLidarCount) {
+    return;
+  }
+
+  bool retry = false;
+  {
+    lock_guard<mutex> lock(mode_mutex_);
+    const ModeChangeRequest &request = mode_requests_[handle];
+    retry = request.active && request.desired_mode == kLidarModeNormal &&
+            request.waiting_for_reconnect && !request.command_inflight;
+  }
+
+  if (retry) {
+    livox_status status =
+        SendModeChangeRequest(handle, kLidarModeNormal, true);
+    if (status != kStatusSuccess) {
+      printf("Retry lidar[%d] normal-mode recovery failed immediately: %d\n",
+             handle, status);
+    }
+  }
+}
 
 int LdsLidar::InitLdsLidar(std::vector<std::string> &broadcast_code_strs,
                            const char *user_config_path) {
@@ -196,6 +378,7 @@ void LdsLidar::OnDeviceBroadcast(const BroadcastDeviceInfo *info) {
   result = AddLidarToConnect(info->broadcast_code, &handle);
   if (result == kStatusSuccess && handle < kMaxLidarCount) {
     SetDataCallback(handle, OnLidarDataCb, (void *)g_lds_ldiar);
+    g_lds_ldiar->RememberBroadcastCode(handle, info->broadcast_code);
 
     LidarDevice *p_lidar = &(g_lds_ldiar->lidars_[handle]);
     p_lidar->handle = handle;
@@ -237,16 +420,31 @@ void LdsLidar::OnDeviceChange(const DeviceInfo *info, DeviceEvent type) {
 
   LidarDevice *p_lidar = &(g_lds_ldiar->lidars_[handle]);
   if (type == kEventConnect) {
+    g_lds_ldiar->RememberBroadcastCode(handle, info->broadcast_code);
     QueryDeviceInformation(handle, DeviceInformationCb, g_lds_ldiar);
     if (p_lidar->connect_state == kConnectStateOff) {
       p_lidar->connect_state = kConnectStateOn;
       p_lidar->info = *info;
     }
+    g_lds_ldiar->MaybeRetryPendingModeRequest(handle);
   } else if (type == kEventDisconnect) {
     printf("Lidar[%s] disconnect!\n", info->broadcast_code);
+    g_lds_ldiar->RememberBroadcastCode(handle, info->broadcast_code);
+    g_lds_ldiar->MarkModeRequestDisconnected(handle);
     ResetLidar(p_lidar, kSourceRawLidar);
   } else if (type == kEventStateChange) {
+    LidarState old_state = p_lidar->info.state;
     p_lidar->info = *info;
+    /** When LiDAR recovers from power-saving/standby to normal,
+     *  reset connect_state so the config+sampling logic below re-triggers */
+    if (old_state != kLidarStateNormal && info->state == kLidarStateNormal
+        && p_lidar->connect_state == kConnectStateSampling) {
+      p_lidar->connect_state = kConnectStateOn;
+    }
+
+    if (info->state == ModeToState(kLidarModeNormal)) {
+      g_lds_ldiar->ResetModeRequest(handle);
+    }
   }
 
   if (p_lidar->connect_state == kConnectStateOn) {
@@ -346,6 +544,62 @@ void LdsLidar::LidarErrorStatusCb(livox_status status, uint8_t handle,
 
 void LdsLidar::ControlFanCb(livox_status status, uint8_t handle,
                             uint8_t response, void *clent_data) {}
+
+void LdsLidar::SetModeCb(livox_status status, uint8_t handle, uint8_t response,
+                         void *client_data) {
+  LdsLidar *lds_lidar = static_cast<LdsLidar *>(client_data);
+  if (lds_lidar == nullptr || handle >= kMaxLidarCount) {
+    return;
+  }
+
+  bool clear_request = false;
+  bool wait_for_reconnect = false;
+  LidarMode desired_mode = kLidarModeNormal;
+  {
+    lock_guard<mutex> lock(lds_lidar->mode_mutex_);
+    ModeChangeRequest &request = lds_lidar->mode_requests_[handle];
+    desired_mode = request.desired_mode;
+    request.command_inflight = false;
+
+    if (!request.active) {
+      return;
+    }
+
+    if (status == kStatusSuccess) {
+      if (desired_mode == kLidarModeNormal) {
+        if (response == 0) {
+          printf("Lidar[%d] set mode Normal accepted, waiting for state change\n", handle);
+          request.waiting_for_reconnect = false;
+        } else if (response == 2) {
+          printf("Lidar[%d] set mode Normal: spinning up, waiting...\n", handle);
+          request.waiting_for_reconnect = false;
+        } else {
+          printf("Lidar[%d] set mode Normal FAILED, response[%d]\n", handle, response);
+          clear_request = true;
+        }
+      } else {
+        printf("Lidar[%d] set mode[%d] success\n", handle, desired_mode);
+        clear_request = true;
+      }
+    } else {
+      printf("Lidar[%d] set mode[%d] status[%d] response[%d]\n", handle,
+             desired_mode, status, response);
+      if (desired_mode == kLidarModeNormal && ShouldWaitForReconnect(status)) {
+        request.waiting_for_reconnect = true;
+        wait_for_reconnect = true;
+      } else {
+        clear_request = true;
+      }
+    }
+  }
+
+  if (clear_request) {
+    lds_lidar->ResetModeRequest(handle);
+  } else if (wait_for_reconnect) {
+    printf("Lidar[%d] will retry normal-mode recovery after reconnect.\n",
+           handle);
+  }
+}
 
 void LdsLidar::SetPointCloudReturnModeCb(livox_status status, uint8_t handle,
                                          uint8_t response, void *clent_data) {

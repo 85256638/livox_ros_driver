@@ -1,0 +1,8 @@
+# Set Livox LiDAR working mode
+# handle: lidar device handle (0-31)
+# mode:   1 = Normal, 2 = PowerSaving, 3 = Standby
+uint8 handle
+uint8 mode
+---
+# ret_code: 0 = success, non-zero = error (maps to livox_status)
+int32 ret_code

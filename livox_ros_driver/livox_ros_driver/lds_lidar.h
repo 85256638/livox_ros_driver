@@ -27,6 +27,8 @@
 #ifndef LIVOX_ROS_DRIVER_LDS_LIDAR_H_
 #define LIVOX_ROS_DRIVER_LDS_LIDAR_H_
 
+#include <cstring>
+#include <array>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -51,8 +53,27 @@ class LdsLidar : public Lds {
   int InitLdsLidar(std::vector<std::string> &broadcast_code_strs,
                    const char *user_config_path);
   int DeInitLdsLidar(void);
+  livox_status RequestLidarModeChange(const char *broadcast_code,
+                                      LidarMode mode);
+  livox_status RequestLidarModeChange(uint8_t handle, LidarMode mode);
 
  private:
+  struct ModeChangeRequest {
+    ModeChangeRequest() {
+      active = false;
+      waiting_for_reconnect = false;
+      command_inflight = false;
+      desired_mode = kLidarModeNormal;
+      memset(broadcast_code, 0, sizeof(broadcast_code));
+    }
+
+    bool active;
+    bool waiting_for_reconnect;
+    bool command_inflight;
+    LidarMode desired_mode;
+    char broadcast_code[kBroadcastCodeSize];
+  };
+
   LdsLidar(uint32_t interval_ms);
   LdsLidar(const LdsLidar &) = delete;
   ~LdsLidar();
@@ -90,10 +111,18 @@ class LdsLidar : public Lds {
   static void SetHighSensitivityCb(livox_status status, uint8_t handle,
                                    DeviceParameterResponse *response,
                                    void *clent_data);
+  static void SetModeCb(livox_status status, uint8_t handle, uint8_t response,
+                        void *client_data);
 
   void ResetLdsLidar(void);
   int AddBroadcastCodeToWhitelist(const char *broadcast_code);
   bool IsBroadcastCodeExistInWhitelist(const char *broadcast_code);
+  void RememberBroadcastCode(uint8_t handle, const char *broadcast_code);
+  void ResetModeRequest(uint8_t handle);
+  void MarkModeRequestDisconnected(uint8_t handle);
+  livox_status SendModeChangeRequest(uint8_t handle, LidarMode mode,
+                                     bool from_reconnect);
+  void MaybeRetryPendingModeRequest(uint8_t handle);
 
   void EnableAutoConnectMode(void) { auto_connect_mode_ = true; }
   void DisableAutoConnectMode(void) { auto_connect_mode_ = false; }
@@ -114,6 +143,8 @@ class LdsLidar : public Lds {
   TimeSync *timesync_;
   TimeSyncConfig timesync_config_;
   std::mutex config_mutex_;
+  std::mutex mode_mutex_;
+  std::array<ModeChangeRequest, kMaxLidarCount> mode_requests_;
 };
 
 }  // namespace livox_ros

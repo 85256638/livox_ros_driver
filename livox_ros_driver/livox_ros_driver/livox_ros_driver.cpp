@@ -34,10 +34,57 @@
 #include "lds_lidar.h"
 #include "lds_lvx.h"
 #include "livox_sdk.h"
+#include "livox_ros_driver/LidarMode.h"
 
 using namespace livox_ros;
 
 const int32_t kSdkVersionMajorLimit = 2;
+
+/** Pointer to LdsLidar for service callback, only valid when data_src == raw lidar */
+static LdsLidar *g_read_lidar = nullptr;
+
+bool LidarModeServiceCb(livox_ros_driver::LidarMode::Request &req,
+                        livox_ros_driver::LidarMode::Response &res) {
+  if (g_read_lidar == nullptr) {
+    ROS_ERROR("LiDAR mode service: data source is not raw lidar");
+    res.ret_code = -1;
+    return true;
+  }
+
+  if (req.mode < 1 || req.mode > 3) {
+    ROS_ERROR("LiDAR mode service: invalid mode %d (1=Normal, 2=PowerSaving, 3=Standby)", req.mode);
+    res.ret_code = -1;
+    return true;
+  }
+
+  if (req.handle == 255) {
+    /** Broadcast to all connected LiDARs */
+    ROS_INFO("LiDAR mode service: ALL lidars -> mode=%d", req.mode);
+    livox_status last_status = kStatusSuccess;
+    for (uint8_t h = 0; h < kMaxLidarCount; h++) {
+      livox_status s = g_read_lidar->RequestLidarModeChange(
+          h, static_cast<LidarMode>(req.mode));
+      if (s != kStatusSuccess && s != kStatusNotConnected) {
+        ROS_WARN("LiDAR mode change failed for handle=%d: %d", h, s);
+        last_status = s;
+      }
+    }
+    res.ret_code = last_status;
+    return true;
+  }
+
+  ROS_INFO("LiDAR mode service: handle=%d mode=%d", req.handle, req.mode);
+  livox_status status = g_read_lidar->RequestLidarModeChange(
+      req.handle, static_cast<LidarMode>(req.mode));
+  res.ret_code = status;
+
+  if (status == kStatusSuccess) {
+    ROS_INFO("LiDAR mode change request accepted");
+  } else {
+    ROS_WARN("LiDAR mode change request returned: %d", status);
+  }
+  return true;
+}
 
 inline void SignalHandler(int signum) {
   printf("livox ros driver will exit\r\n");
@@ -74,6 +121,7 @@ int main(int argc, char **argv) {
   std::string frame_id = "livox_frame";
   bool lidar_bag = true;
   bool imu_bag   = false;
+  double max_distance  = 0.0; /* meters, 0 = disabled */
 
   livox_node.getParam("xfer_format", xfer_format);
   livox_node.getParam("multi_topic", multi_topic);
@@ -83,6 +131,7 @@ int main(int argc, char **argv) {
   livox_node.getParam("frame_id", frame_id);
   livox_node.getParam("enable_lidar_bag", lidar_bag);
   livox_node.getParam("enable_imu_bag", imu_bag);
+  livox_node.getParam("max_distance", max_distance);
   if (publish_freq > 100.0) {
     publish_freq = 100.0;
   } else if (publish_freq < 0.1) {
@@ -95,6 +144,12 @@ int main(int argc, char **argv) {
   Lddc *lddc = new Lddc(xfer_format, multi_topic, data_src, output_type,
                         publish_freq, frame_id, lidar_bag, imu_bag);
   lddc->SetRosNode(&livox_node);
+  if (max_distance > 0.0) {
+    lddc->SetMaxDistance(static_cast<float>(max_distance));
+    ROS_INFO("Distance filter enabled: max_distance = %.2f m", max_distance);
+  } else {
+    ROS_INFO("Distance filter disabled");
+  }
 
   int ret = 0;
   if (data_src == kSourceRawLidar) {
@@ -115,6 +170,7 @@ int main(int argc, char **argv) {
     ret = read_lidar->InitLdsLidar(bd_code_list, user_config_path.c_str());
     if (!ret) {
       ROS_INFO("Init lds lidar success!");
+      g_read_lidar = read_lidar;
     } else {
       ROS_ERROR("Init lds lidar fail!");
     }
@@ -168,10 +224,21 @@ int main(int argc, char **argv) {
     } while (0);
   }
 
+  /** Advertise lidar mode service */
+  ros::ServiceServer mode_srv =
+      livox_node.advertiseService("livox_lidar_mode", LidarModeServiceCb);
+  ROS_INFO("Advertised service: livox_lidar_mode");
+
+  /** Use async spinner so service callbacks are processed in a separate thread,
+   *  while the main thread keeps distributing lidar data */
+  ros::AsyncSpinner spinner(1);
+  spinner.start();
+
   ros::Time::init();
   while (ros::ok()) {
     lddc->DistributeLidarData();
   }
 
+  spinner.stop();
   return 0;
 }

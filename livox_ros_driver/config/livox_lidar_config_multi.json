@@ -1,7 +1,7 @@
 {
     "lidar_config": [
         {
-            "broadcast_code": "3WEDJA600100571",
+            "broadcast_code": "3WEDH7600119641",
             "enable_connect": true,
             "return_mode": 0,
             "coordinate": 0,
@@ -11,6 +11,16 @@
         },     
                 {
             "broadcast_code": "1HDDH3200104431",
+            "enable_connect": true,
+            "return_mode": 0,
+            "coordinate": 0,
+            "imu_rate": 1,
+            "extrinsic_parameter_source": 1,
+            "enable_high_sensitivity": false
+        },
+        
+                        {
+            "broadcast_code": "3WEDH5900101321",
             "enable_connect": true,
             "return_mode": 0,
             "coordinate": 0,
