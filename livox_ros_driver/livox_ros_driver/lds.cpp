@@ -661,8 +661,52 @@ void Lds::UpdateLidarInfoByEthPacket(LidarDevice *p_lidar,
   }
 }
 
+void Lds::ReportPacketStatistic(uint8_t handle) {
+  if (handle >= kMaxSourceLidar) {
+    return;
+  }
+  LidarDevice *p_lidar = &lidars_[handle];
+  LidarPacketStatistic *st = &p_lidar->statistic_info;
+
+  int64_t now_ns =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  if (st->last_report_ns == 0) {
+    st->last_report_ns = now_ns;
+    return;
+  }
+  const int64_t kReportPeriodNs = 5LL * 1000000000LL;  /** 5 seconds */
+  if (now_ns - st->last_report_ns < kReportPeriodNs) {
+    return;
+  }
+
+  uint32_t w_recv = st->win_recv;
+  uint32_t w_loss = st->win_loss;
+  uint32_t w_drop = st->win_drop;
+  uint32_t expected = w_recv + w_loss;
+  double net_loss_pct = expected ? (100.0 * w_loss / expected) : 0.0;
+  double drop_pct = w_recv ? (100.0 * w_drop / w_recv) : 0.0;
+
+  printf("[LivoxStats] Lidar[%d][%s] 5s: recv=%u net_loss=%u(%.2f%%) "
+         "queue_drop=%u(%.2f%%) | total recv=%u net_loss=%u drop=%u\n",
+         handle, p_lidar->info.broadcast_code, w_recv, w_loss, net_loss_pct,
+         w_drop, drop_pct, st->receive_packet_count, st->loss_packet_count,
+         st->queue_drop_count);
+
+  st->win_recv = 0;
+  st->win_loss = 0;
+  st->win_drop = 0;
+  st->last_report_ns = now_ns;
+}
+
 void Lds::StorageRawPacket(uint8_t handle, LivoxEthPacket* eth_packet) {
   if (handle >= kMaxSourceLidar) {
+    return;
+  }
+  /** Reject unknown/corrupt data types before they are used to index the
+   *  fixed-size lookup tables (GetEthPacketLen/GetPointsPerPacket/...). A
+   *  malformed packet with data_type >= kMaxPointDataType would otherwise
+   *  cause an out-of-bounds table read -> bogus length -> heap overflow. */
+  if (eth_packet->data_type >= kMaxPointDataType) {
     return;
   }
   LidarDevice *p_lidar = &lidars_[handle];
@@ -692,27 +736,54 @@ void Lds::StorageRawPacket(uint8_t handle, LivoxEthPacket* eth_packet) {
     }
     packet_statistic->last_timestamp = cur_timestamp.stamp;
 
-    /** Guard queue alloc/push against concurrent ResetLidar (disconnect) */
-    std::lock_guard<std::mutex> lk(data_lock_[handle]);
-    LidarDataQueue *p_queue = &p_lidar->data;
-    if (nullptr == p_queue->storage_packet) {
-      uint32_t queue_size = CalculatePacketQueueSize(
-          buffer_time_ms_, p_lidar->info.type, eth_packet->data_type);
-      InitQueue(p_queue, queue_size);
-      printf("Lidar[%d][%s] storage queue size : %d %d\n", p_lidar->handle,
-             p_lidar->info.broadcast_code, queue_size, p_queue->size);
-    }
-    if (!QueueIsFull(p_queue)) {
-      QueuePushAny(p_queue, (uint8_t *)eth_packet,
-          GetEthPacketLen(eth_packet->data_type),
-          packet_statistic->timebase,
-          GetPointsPerPacket(eth_packet->data_type));
-      if (QueueUsedSize(p_queue) > p_lidar->onetime_publish_packets) {
-        if (semaphore_.GetCount() <= 0) {
-          semaphore_.Signal();
+    /** Packet statistics: receive count + network-loss estimate based on the
+     *  timestamp gap (a lost packet makes the next ts jump by ~N intervals). */
+    packet_statistic->receive_packet_count++;
+    packet_statistic->win_recv++;
+    if (p_lidar->data_is_pubulished && p_lidar->packet_interval > 0 &&
+        packet_statistic->last_recv_ts_ns > 0) {
+      int64_t gap = (int64_t)timestamp - packet_statistic->last_recv_ts_ns;
+      int64_t interval = (int64_t)p_lidar->packet_interval;
+      if (gap > (int64_t)p_lidar->packet_interval_max) {
+        int64_t missed = gap / interval - 1;
+        if (missed > 0 && missed < 1000) {
+          /** cap ignores reconnect / PPS-sync jumps (not single losses) */
+          packet_statistic->loss_packet_count += (uint32_t)missed;
+          packet_statistic->win_loss += (uint32_t)missed;
         }
       }
     }
+    packet_statistic->last_recv_ts_ns = (int64_t)timestamp;
+
+    /** Guard queue alloc/push against concurrent ResetLidar (disconnect) */
+    {
+      std::lock_guard<std::mutex> lk(data_lock_[handle]);
+      LidarDataQueue *p_queue = &p_lidar->data;
+      if (nullptr == p_queue->storage_packet) {
+        uint32_t queue_size = CalculatePacketQueueSize(
+            buffer_time_ms_, p_lidar->info.type, eth_packet->data_type);
+        InitQueue(p_queue, queue_size);
+        printf("Lidar[%d][%s] storage queue size : %d %d\n", p_lidar->handle,
+               p_lidar->info.broadcast_code, queue_size, p_queue->size);
+      }
+      if (!QueueIsFull(p_queue)) {
+        QueuePushAny(p_queue, (uint8_t *)eth_packet,
+            GetEthPacketLen(eth_packet->data_type),
+            packet_statistic->timebase,
+            GetPointsPerPacket(eth_packet->data_type));
+        if (QueueUsedSize(p_queue) > p_lidar->onetime_publish_packets) {
+          if (semaphore_.GetCount() <= 0) {
+            semaphore_.Signal();
+          }
+        }
+      } else {
+        /** consumer can't keep up -> packet silently dropped here. Count it. */
+        packet_statistic->queue_drop_count++;
+        packet_statistic->win_drop++;
+      }
+    }
+
+    ReportPacketStatistic(handle);
   } else {
     if (eth_packet->timestamp_type == kTimestampTypePps) {
       /** Whether a new sync frame */

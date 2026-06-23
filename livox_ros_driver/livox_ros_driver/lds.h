@@ -121,6 +121,12 @@ typedef struct {
   int64_t last_imu_timestamp;
   int64_t imu_timebase; /**< unit:ns */
   uint32_t timebase_state;
+  uint32_t queue_drop_count; /**< packets dropped because the queue was full */
+  int64_t last_recv_ts_ns;   /**< last received pointcloud ts, for loss estimate */
+  int64_t last_report_ns;    /**< steady-clock ns of last stats report */
+  uint32_t win_recv;         /**< received pkts in current report window */
+  uint32_t win_loss;         /**< estimated lost pkts in current window */
+  uint32_t win_drop;         /**< queue-full drops in current window */
 } LidarPacketStatistic;
 
 /** 8bytes stamp to uint64_t stamp */
@@ -458,6 +464,9 @@ class Lds {
   uint8_t data_src_;
 
  private:
+  /** Throttled (every 5s) per-lidar packet-loss / drop report to stdout. */
+  void ReportPacketStatistic(uint8_t handle);
+
   volatile bool request_exit_;
 };
 
