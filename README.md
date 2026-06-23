@@ -216,10 +216,10 @@ rosrun livox_ros_driver livox_stats_monitor.py
 看板效果（掉线的雷达会明确标 `DISCONNECTED`，不会从看板上消失）：
 ```
 ===== Livox LiDAR Stats (1Hz) =====
-handle  broadcast_code   state         recv/s  loss/s  drop/s   total_loss  total_drop
-0       1PQDH5B00100041  Normal          2496       0       0          152          10
-1       0TFDG3U99101431  DISCONNECTED       -       -       -           -           -
-2       3WEDH5900103621  Normal          2498       2       0           31           0
+handle  broadcast_code   state         recv/s  loss/s  drop/s   disc  last_drop   uptime
+0       1PQDH5B00100041  Normal          2496       0       0      0         --    2h13m
+1       0TFDG3U99101431  Normal          2498       2       0      7      3m12s    3m12s
+2       3WEDH5900103621  DISCONNECTED       -       -       -      2        45s       --
 (updated: 1718000000.0)
 ```
 
@@ -231,7 +231,20 @@ handle  broadcast_code   state         recv/s  loss/s  drop/s   total_loss  tota
 | `recv/s` | 每秒收到的点云包数（应稳定，多台 Horizon 约 2500/s）|
 | `loss/s` | 每秒网络丢包数（>0 说明网络/接头/散热在劣化，掉线前兆）|
 | `drop/s` | 每秒队列丢包数（>0 说明主机/下游消费不过来）|
-| `total_loss / total_drop` | 自连接以来累计 |
+| `disc` | **累计掉线次数**（长期跑下来哪台最不稳，一眼看出）|
+| `last_drop` | 上次掉线距今多久（`--` = 从未掉过）|
+| `uptime` | 本次连接已稳定多久 |
+
+> **判断哪台最该换**：`disc` 高 + `uptime` 短（反复掉、刚回来）的雷达，比偶尔丢几个包的更需要优先处理。
+
+#### 掉线/重连事件日志
+
+每次掉线或重连，驱动终端会打印一条带时间戳的事件，方便回头对照"几点掉的、当时温度/负载如何"：
+```
+[LivoxEvent] 14:32:07 Lidar[1][0TFDG3U99100671] DISCONNECTED
+[LivoxEvent] 14:32:19 Lidar[1][0TFDG3U99100671] RECONNECTED (down 12s)
+```
+过滤查看：`roslaunch ... 2>&1 | grep LivoxEvent`
 
 > **某台 `loss/s` 持续 >0 → 重点排查那台的网线/接头/散热；某台 `DISCONNECTED` → 已掉线，可远程重启 `rosservice call /livox_lidar_reboot "{handle: N}"`。**
 

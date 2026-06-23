@@ -26,6 +26,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -37,6 +39,52 @@
 using namespace std;
 
 namespace livox_ros {
+
+namespace {
+/** Print a wall-clock timestamped link event line. */
+void PrintLidarEvent(uint8_t handle, const char *bcode, const char *what) {
+  time_t t = time(nullptr);
+  struct tm tmv;
+  localtime_r(&t, &tmv);
+  char ts[16];
+  strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
+  printf("[LivoxEvent] %s Lidar[%d][%s] %s\n", ts, handle,
+         (bcode && bcode[0]) ? bcode : "?", what);
+}
+}  // namespace
+
+void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
+  if (handle >= kMaxLidarCount) {
+    return;
+  }
+  LinkStat &s = link_stat_[handle];
+  if (s.connect_since_ns != 0) {
+    return;  /** already counted as connected */
+  }
+  int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+  s.connect_since_ns = now;
+  if (s.last_disconnect_ns != 0) {
+    long long down_s = (now - s.last_disconnect_ns) / 1000000000LL;
+    char buf[48];
+    snprintf(buf, sizeof(buf), "RECONNECTED (down %llds)", down_s);
+    PrintLidarEvent(handle, broadcast_code, buf);
+  } else {
+    PrintLidarEvent(handle, broadcast_code, "CONNECTED");
+  }
+}
+
+void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
+                                      const char *broadcast_code) {
+  if (handle >= kMaxLidarCount) {
+    return;
+  }
+  LinkStat &s = link_stat_[handle];
+  s.disconnect_count++;
+  s.last_disconnect_ns =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  s.connect_since_ns = 0;
+  PrintLidarEvent(handle, broadcast_code, "DISCONNECTED");
+}
 
 namespace {
 
@@ -441,6 +489,7 @@ void LdsLidar::OnDeviceChange(const DeviceInfo *info, DeviceEvent type) {
   LidarDevice *p_lidar = &(g_lds_ldiar->lidars_[handle]);
   if (type == kEventConnect) {
     g_lds_ldiar->RememberBroadcastCode(handle, info->broadcast_code);
+    g_lds_ldiar->OnLidarConnectEvent(handle, info->broadcast_code);
     QueryDeviceInformation(handle, DeviceInformationCb, g_lds_ldiar);
     if (p_lidar->connect_state == kConnectStateOff) {
       p_lidar->connect_state = kConnectStateOn;
@@ -450,6 +499,7 @@ void LdsLidar::OnDeviceChange(const DeviceInfo *info, DeviceEvent type) {
   } else if (type == kEventDisconnect) {
     printf("Lidar[%s] disconnect!\n", info->broadcast_code);
     g_lds_ldiar->RememberBroadcastCode(handle, info->broadcast_code);
+    g_lds_ldiar->OnLidarDisconnectEvent(handle, info->broadcast_code);
     g_lds_ldiar->MarkModeRequestDisconnected(handle);
     /** Guard against concurrent data-thread access while the queue is freed.
      *  Without this lock the SDK's data callback can write into the just-freed

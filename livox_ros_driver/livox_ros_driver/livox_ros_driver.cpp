@@ -139,6 +139,21 @@ static const char *LidarStateStr(uint8_t state) {
   }
 }
 
+/** Format a steady-clock duration (ns) as a short human string. */
+static std::string FmtDur(int64_t ns) {
+  if (ns < 0) ns = 0;
+  long long s = ns / 1000000000LL;
+  char buf[24];
+  if (s < 60) {
+    snprintf(buf, sizeof(buf), "%llds", s);
+  } else if (s < 3600) {
+    snprintf(buf, sizeof(buf), "%lldm%llds", s / 60, s % 60);
+  } else {
+    snprintf(buf, sizeof(buf), "%lldh%lldm", s / 3600, (s % 3600) / 60);
+  }
+  return std::string(buf);
+}
+
 /** Timer callback (runs on the AsyncSpinner thread, independent of the data
  *  loop so it keeps updating even if a lidar stops sending). Publishes a
  *  preformatted dashboard of all connected lidars. */
@@ -152,10 +167,12 @@ void StatsTimerCb(const ros::TimerEvent &) {
   static bool ever_seen[kMaxLidarCount] = {false};
   static char last_bcode[kMaxLidarCount][kBdCodeSize + 1] = {{0}};
 
+  int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+
   std::ostringstream ss;
   ss << "===== Livox LiDAR Stats (1Hz) =====\n";
   ss << "handle  broadcast_code   state         recv/s  loss/s  drop/s   "
-        "total_loss  total_drop\n";
+        "disc  last_drop   uptime\n";
   bool any = false;
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
     LidarDevice *l = &g_read_lidar->lidars_[h];
@@ -173,6 +190,13 @@ void StatsTimerCb(const ros::TimerEvent &) {
     }
     any = true;
     LidarPacketStatistic &st = l->statistic_info;
+    LdsLidar::LinkStat &ls = g_read_lidar->link_stat_[h];
+    uint32_t disc = ls.disconnect_count;
+    std::string last_drop =
+        ls.last_disconnect_ns ? FmtDur(now_ns - ls.last_disconnect_ns) : "--";
+    std::string uptime = (connected && ls.connect_since_ns)
+                             ? FmtDur(now_ns - ls.connect_since_ns)
+                             : "--";
     char line[256];
     if (connected) {
       uint32_t d_recv = st.receive_packet_count - prev_recv[h];
@@ -182,14 +206,15 @@ void StatsTimerCb(const ros::TimerEvent &) {
       prev_loss[h] = st.loss_packet_count;
       prev_drop[h] = st.queue_drop_count;
       snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-12s  %6u  %6u  %6u   %10u  %10u\n",
+               "%-6d  %-15s  %-12s  %6u  %6u  %6u   %4u  %9s  %7s\n",
                h, last_bcode[h], LidarStateStr(l->info.state), d_recv, d_loss,
-               d_drop, st.loss_packet_count, st.queue_drop_count);
+               d_drop, disc, last_drop.c_str(), uptime.c_str());
     } else {
       prev_recv[h] = prev_loss[h] = prev_drop[h] = 0;
       snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-12s  %6s  %6s  %6s   %10s  %10s\n",
-               h, last_bcode[h], "DISCONNECTED", "-", "-", "-", "-", "-");
+               "%-6d  %-15s  %-12s  %6s  %6s  %6s   %4u  %9s  %7s\n",
+               h, last_bcode[h], "DISCONNECTED", "-", "-", "-", disc,
+               last_drop.c_str(), uptime.c_str());
     }
     ss << line;
   }

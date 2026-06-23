@@ -58,7 +58,20 @@ class LdsLidar : public Lds {
   livox_status RequestLidarModeChange(uint8_t handle, LidarMode mode);
   livox_status RequestLidarReboot(uint8_t handle, uint16_t timeout_ms = 100);
 
+  /** Per-lidar connection history. Lives outside LidarDevice (which ResetLidar
+   *  memsets on disconnect) so it survives disconnect/reconnect cycles. Read by
+   *  the stats dashboard. */
+  struct LinkStat {
+    uint32_t disconnect_count = 0;
+    int64_t last_disconnect_ns = 0;  /**< steady_clock ns, 0 = never */
+    int64_t connect_since_ns = 0;    /**< steady_clock ns, 0 = not connected */
+  };
+  LinkStat link_stat_[kMaxLidarCount];
+
  private:
+  void OnLidarConnectEvent(uint8_t handle, const char *broadcast_code);
+  void OnLidarDisconnectEvent(uint8_t handle, const char *broadcast_code);
+
   struct ModeChangeRequest {
     ModeChangeRequest() {
       active = false;
