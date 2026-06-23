@@ -252,6 +252,15 @@ void LdsLidar::MaybeRetryPendingModeRequest(uint8_t handle) {
   }
 }
 
+bool LdsLidar::HasActiveNormalRequest(uint8_t handle) {
+  if (handle >= kMaxLidarCount) {
+    return false;
+  }
+  lock_guard<mutex> lock(mode_mutex_);
+  const ModeChangeRequest &request = mode_requests_[handle];
+  return request.active && request.desired_mode == kLidarModeNormal;
+}
+
 int LdsLidar::InitLdsLidar(std::vector<std::string> &broadcast_code_strs,
                            const char *user_config_path) {
   if (is_initialized_) {
@@ -452,10 +461,19 @@ void LdsLidar::OnDeviceChange(const DeviceInfo *info, DeviceEvent type) {
   } else if (type == kEventStateChange) {
     LidarState old_state = p_lidar->info.state;
     p_lidar->info = *info;
-    /** When LiDAR recovers from power-saving/standby to normal,
-     *  reset connect_state so the config+sampling logic below re-triggers */
-    if (old_state != kLidarStateNormal && info->state == kLidarStateNormal
-        && p_lidar->connect_state == kConnectStateSampling) {
+    /** Re-run config+sampling ONLY when the lidar genuinely resumes from a
+     *  low-power state (motor was stopped, sampling halted) or when a
+     *  Normal-mode switch we requested is completing. Restricting the trigger
+     *  this way prevents transient Error/Init -> Normal state flaps (e.g.
+     *  temperature/motor warnings in the field) from needlessly tearing down
+     *  and reconfiguring an already-sampling lidar, which caused intermittent
+     *  topic stalls. */
+    bool resumed_from_lowpower =
+        (old_state == kLidarStatePowerSaving || old_state == kLidarStateStandBy);
+    if (info->state == kLidarStateNormal &&
+        p_lidar->connect_state == kConnectStateSampling &&
+        (resumed_from_lowpower ||
+         g_lds_ldiar->HasActiveNormalRequest(handle))) {
       p_lidar->connect_state = kConnectStateOn;
     }
 

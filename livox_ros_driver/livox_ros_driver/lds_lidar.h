@@ -126,6 +126,7 @@ class LdsLidar : public Lds {
   livox_status SendModeChangeRequest(uint8_t handle, LidarMode mode,
                                      bool from_reconnect);
   void MaybeRetryPendingModeRequest(uint8_t handle);
+  bool HasActiveNormalRequest(uint8_t handle);
 
   void EnableAutoConnectMode(void) { auto_connect_mode_ = true; }
   void DisableAutoConnectMode(void) { auto_connect_mode_ = false; }
