@@ -216,10 +216,10 @@ rosrun livox_ros_driver livox_stats_monitor.py
 看板效果（掉线的雷达会明确标 `DISCONNECTED`，不会从看板上消失）：
 ```
 ===== Livox LiDAR Stats (1Hz) =====
-handle  broadcast_code   state         recv/s  loss/s  drop/s   disc  last_drop   uptime
-0       1PQDH5B00100041  Normal          2496       0       0      0         --    2h13m
-1       0TFDG3U99101431  Normal          2498       2       0      7      3m12s    3m12s
-2       3WEDH5900103621  DISCONNECTED       -       -       -      2        45s       --
+handle  broadcast_code   state         temp  fan   recv/s  loss/s  drop/s   disc  last_drop   uptime
+0       1PQDH5B00100041  Normal        OK    OK      2496       0       0      0         --    2h13m
+1       0TFDG3U99101431  Normal        WARN  OK      2498       2       0      7      3m12s    3m12s
+2       3WEDH5900103621  DISCONNECTED  -     -          -       -       -      2        45s       --
 (updated: 1718000000.0)
 ```
 
@@ -228,6 +228,8 @@ handle  broadcast_code   state         recv/s  loss/s  drop/s   disc  last_drop 
 | 列 | 含义 |
 |----|------|
 | `state` | `Normal` 正常 / `DISCONNECTED` 掉线 / `PowerSaving` 节电 / `Error` 故障 |
+| `temp` | 温度状态 `OK` / `WARN`(偏高偏低) / `HOT!`(极端)。⚠️ 是状态码，**不是具体℃**（见下方说明）|
+| `fan` | 风扇状态 `OK` 正常 / `WARN` **故障**（注意：WARN 是风扇坏了，不是"在转"）|
 | `recv/s` | 每秒收到的点云包数（应稳定，多台 Horizon 约 2500/s）|
 | `loss/s` | 每秒网络丢包数（>0 说明网络/接头/散热在劣化，掉线前兆）|
 | `drop/s` | 每秒队列丢包数（>0 说明主机/下游消费不过来）|
@@ -237,14 +239,25 @@ handle  broadcast_code   state         recv/s  loss/s  drop/s   disc  last_drop 
 
 > **判断哪台最该换**：`disc` 高 + `uptime` 短（反复掉、刚回来）的雷达，比偶尔丢几个包的更需要优先处理。
 
-#### 掉线/重连事件日志
+#### 关于温度与风扇（重要说明）
 
-每次掉线或重连，驱动终端会打印一条带时间戳的事件，方便回头对照"几点掉的、当时温度/负载如何"：
+Livox SDK **不暴露具体温度数值**（如 62℃），那个 60℃ 风扇启动阈值是固件内部的。能拿到的只有粗粒度状态码：
+- `temp`：`OK`=正常 / `WARN`=偏高或偏低 / `HOT!`=极高或极低
+- `fan`：`OK`=正常 / `WARN`=**风扇故障告警**（拿不到转速，也拿不到"现在转没转"）
+
+所以你能监控的是"**温度是否进入告警区 / 风扇是否报故障**"，而不是精确温度曲线。`temp=WARN` 大致对应雷达发热升高，可作为散热吃紧的间接信号。
+
+#### 事件日志（掉线/重连 + 健康变化）
+
+驱动终端在**状态发生变化时**打印带时间戳的事件（不刷屏）：
 ```
-[LivoxEvent] 14:32:07 Lidar[1][0TFDG3U99100671] DISCONNECTED
-[LivoxEvent] 14:32:19 Lidar[1][0TFDG3U99100671] RECONNECTED (down 12s)
+[LivoxEvent]  14:32:07 Lidar[1][0TFDG3U99100671] DISCONNECTED
+[LivoxEvent]  14:32:19 Lidar[1][0TFDG3U99100671] RECONNECTED (down 12s)
+[LivoxHealth] 14:35:02 Lidar[0] temp=WARN fan=OK motor=OK volt=OK dirty=0 firmware=0 self_heating=0 system=WARN
 ```
-过滤查看：`roslaunch ... 2>&1 | grep LivoxEvent`
+过滤查看：`roslaunch ... 2>&1 | grep -E "LivoxEvent|LivoxHealth"`
+
+> `[LivoxHealth]` 只在 temp/fan/motor 等健康字段**变化时**才打印一行，所以正常时安静，一旦温度进告警区或风扇报故障会立刻看到。
 
 > **某台 `loss/s` 持续 >0 → 重点排查那台的网线/接头/散热；某台 `DISCONNECTED` → 已掉线，可远程重启 `rosservice call /livox_lidar_reboot "{handle: N}"`。**
 

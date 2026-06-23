@@ -41,13 +41,18 @@ using namespace std;
 namespace livox_ros {
 
 namespace {
-/** Print a wall-clock timestamped link event line. */
-void PrintLidarEvent(uint8_t handle, const char *bcode, const char *what) {
+/** Fill buf with the current wall-clock time as HH:MM:SS. */
+void NowHms(char *buf, size_t len) {
   time_t t = time(nullptr);
   struct tm tmv;
   localtime_r(&t, &tmv);
+  strftime(buf, len, "%H:%M:%S", &tmv);
+}
+
+/** Print a wall-clock timestamped link event line. */
+void PrintLidarEvent(uint8_t handle, const char *bcode, const char *what) {
   char ts[16];
-  strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
+  NowHms(ts, sizeof(ts));
   printf("[LivoxEvent] %s Lidar[%d][%s] %s\n", ts, handle,
          (bcode && bcode[0]) ? bcode : "?", what);
 }
@@ -83,6 +88,7 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
   s.last_disconnect_ns =
       std::chrono::steady_clock::now().time_since_epoch().count();
   s.connect_since_ns = 0;
+  s.health_code = 0;  /** stale once disconnected */
   PrintLidarEvent(handle, broadcast_code, "DISCONNECTED");
 }
 
@@ -603,28 +609,48 @@ void LdsLidar::DeviceInformationCb(livox_status status, uint8_t handle,
   }
 }
 
-/** Callback function of Lidar error message. */
+namespace {
+const char *TempStr(uint32_t s) {
+  return (s == 0) ? "OK" : (s == 1) ? "WARN" : "HOT!";
+}
+const char *FanStr(uint32_t s) { return (s == 0) ? "OK" : "WARN"; }
+const char *Lvl3Str(uint32_t s) {
+  return (s == 0) ? "OK" : (s == 1) ? "WARN" : "ERROR";
+}
+}  // namespace
+
+/** Callback function of Lidar error message. Stores the latest health bits for
+ *  the dashboard and prints a decoded line only when the status CHANGES, so a
+ *  thermal/fan/motor event is loud and timestamped instead of buried. */
 void LdsLidar::LidarErrorStatusCb(livox_status status, uint8_t handle,
                                   ErrorMessage *message) {
-  static uint32_t error_message_count = 0;
-  if (message != NULL) {
-    ++error_message_count;
-    if (0 == (error_message_count % 100)) {
-      printf("handle: %u\n", handle);
-      printf("temp_status : %u\n", message->lidar_error_code.temp_status);
-      printf("volt_status : %u\n", message->lidar_error_code.volt_status);
-      printf("motor_status : %u\n", message->lidar_error_code.motor_status);
-      printf("dirty_warn : %u\n", message->lidar_error_code.dirty_warn);
-      printf("firmware_err : %u\n", message->lidar_error_code.firmware_err);
-      printf("pps_status : %u\n", message->lidar_error_code.device_status);
-      printf("fan_status : %u\n", message->lidar_error_code.fan_status);
-      printf("self_heating : %u\n", message->lidar_error_code.self_heating);
-      printf("ptp_status : %u\n", message->lidar_error_code.ptp_status);
-      printf("time_sync_status : %u\n",
-             message->lidar_error_code.time_sync_status);
-      printf("system_status : %u\n", message->lidar_error_code.system_status);
-    }
+  if (message == NULL || handle >= kMaxLidarCount || g_lds_ldiar == nullptr) {
+    return;
   }
+  LidarErrorCode ec = message->lidar_error_code;
+  g_lds_ldiar->link_stat_[handle].health_code = message->error_code;
+
+  /** Only print when one of the fields worth alerting on changes (ignore
+   *  pps/ptp/time-sync churn that would otherwise spam every message). */
+  uint32_t watch = (ec.temp_status) | (ec.volt_status << 2) |
+                   (ec.motor_status << 4) | (ec.dirty_warn << 6) |
+                   (ec.firmware_err << 7) | (ec.fan_status << 8) |
+                   (ec.self_heating << 9) | (ec.system_status << 10);
+  static uint32_t last_watch[kMaxLidarCount] = {0};
+  static bool seen[kMaxLidarCount] = {false};
+  if (seen[handle] && watch == last_watch[handle]) {
+    return;
+  }
+  seen[handle] = true;
+  last_watch[handle] = watch;
+
+  char ts[16];
+  NowHms(ts, sizeof(ts));
+  printf("[LivoxHealth] %s Lidar[%d] temp=%s fan=%s motor=%s volt=%s dirty=%u "
+         "firmware=%u self_heating=%u system=%s\n",
+         ts, handle, TempStr(ec.temp_status), FanStr(ec.fan_status),
+         Lvl3Str(ec.motor_status), Lvl3Str(ec.volt_status), ec.dirty_warn,
+         ec.firmware_err, ec.self_heating, Lvl3Str(ec.system_status));
 }
 
 void LdsLidar::ControlFanCb(livox_status status, uint8_t handle,

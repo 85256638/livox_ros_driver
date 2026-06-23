@@ -65,6 +65,7 @@ class LdsLidar : public Lds {
     uint32_t disconnect_count = 0;
     int64_t last_disconnect_ns = 0;  /**< steady_clock ns, 0 = never */
     int64_t connect_since_ns = 0;    /**< steady_clock ns, 0 = not connected */
+    uint32_t health_code = 0;        /**< latest LidarErrorCode bits (temp/fan/...) */
   };
   LinkStat link_stat_[kMaxLidarCount];
 

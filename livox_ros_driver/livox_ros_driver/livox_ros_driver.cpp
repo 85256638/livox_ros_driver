@@ -139,6 +139,11 @@ static const char *LidarStateStr(uint8_t state) {
   }
 }
 
+static const char *TempStr(uint32_t s) {
+  return (s == 0) ? "OK" : (s == 1) ? "WARN" : "HOT!";
+}
+static const char *FanStr(uint32_t s) { return (s == 0) ? "OK" : "WARN"; }
+
 /** Format a steady-clock duration (ns) as a short human string. */
 static std::string FmtDur(int64_t ns) {
   if (ns < 0) ns = 0;
@@ -171,8 +176,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
 
   std::ostringstream ss;
   ss << "===== Livox LiDAR Stats (1Hz) =====\n";
-  ss << "handle  broadcast_code   state         recv/s  loss/s  drop/s   "
-        "disc  last_drop   uptime\n";
+  ss << "handle  broadcast_code   state         temp  fan   recv/s  loss/s  "
+        "drop/s   disc  last_drop   uptime\n";
   bool any = false;
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
     LidarDevice *l = &g_read_lidar->lidars_[h];
@@ -197,6 +202,10 @@ void StatsTimerCb(const ros::TimerEvent &) {
     std::string uptime = (connected && ls.connect_since_ns)
                              ? FmtDur(now_ns - ls.connect_since_ns)
                              : "--";
+    ErrorMessage em;
+    em.error_code = ls.health_code;
+    const char *temp = TempStr(em.lidar_error_code.temp_status);
+    const char *fan = FanStr(em.lidar_error_code.fan_status);
     char line[256];
     if (connected) {
       uint32_t d_recv = st.receive_packet_count - prev_recv[h];
@@ -206,14 +215,15 @@ void StatsTimerCb(const ros::TimerEvent &) {
       prev_loss[h] = st.loss_packet_count;
       prev_drop[h] = st.queue_drop_count;
       snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-12s  %6u  %6u  %6u   %4u  %9s  %7s\n",
-               h, last_bcode[h], LidarStateStr(l->info.state), d_recv, d_loss,
-               d_drop, disc, last_drop.c_str(), uptime.c_str());
+               "%-6d  %-15s  %-12s  %-4s  %-4s  %6u  %6u  %6u   %4u  %9s  %7s\n",
+               h, last_bcode[h], LidarStateStr(l->info.state), temp, fan,
+               d_recv, d_loss, d_drop, disc, last_drop.c_str(),
+               uptime.c_str());
     } else {
       prev_recv[h] = prev_loss[h] = prev_drop[h] = 0;
       snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-12s  %6s  %6s  %6s   %4u  %9s  %7s\n",
-               h, last_bcode[h], "DISCONNECTED", "-", "-", "-", disc,
+               "%-6d  %-15s  %-12s  %-4s  %-4s  %6s  %6s  %6s   %4u  %9s  %7s\n",
+               h, last_bcode[h], "DISCONNECTED", "-", "-", "-", "-", "-", disc,
                last_drop.c_str(), uptime.c_str());
     }
     ss << line;
