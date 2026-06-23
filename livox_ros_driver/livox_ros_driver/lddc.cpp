@@ -27,6 +27,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <stdint.h>
+#include <mutex>
 
 #include <pcl_ros/point_cloud.h>
 #include <ros/ros.h>
@@ -620,6 +621,14 @@ void Lddc::DistributeLidarData(void) {
     LidarDataQueue *p_queue = &lidar->data;
     if ((kConnectStateSampling != lidar->connect_state) ||
         (p_queue == nullptr)) {
+      continue;
+    }
+    /** Hold the per-lidar lock across the whole poll so a concurrent
+     *  ResetLidar (disconnect, runs on the SDK callback thread) cannot free
+     *  the queue / clear lidar fields while we read them. */
+    std::lock_guard<std::mutex> lk(lds_->data_lock_[lidar_id]);
+    if (kConnectStateSampling != lidar->connect_state) {
+      /** state may have changed to Off while acquiring the lock */
       continue;
     }
     PollingLidarPointCloudData(lidar_id, lidar);

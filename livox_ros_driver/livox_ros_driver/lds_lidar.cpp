@@ -431,7 +431,13 @@ void LdsLidar::OnDeviceChange(const DeviceInfo *info, DeviceEvent type) {
     printf("Lidar[%s] disconnect!\n", info->broadcast_code);
     g_lds_ldiar->RememberBroadcastCode(handle, info->broadcast_code);
     g_lds_ldiar->MarkModeRequestDisconnected(handle);
-    ResetLidar(p_lidar, kSourceRawLidar);
+    /** Guard against concurrent data-thread access while the queue is freed.
+     *  Without this lock the SDK's data callback can write into the just-freed
+     *  queue -> use-after-free crash (the original upstream bug). */
+    {
+      std::lock_guard<std::mutex> lk(g_lds_ldiar->data_lock_[handle]);
+      ResetLidar(p_lidar, kSourceRawLidar);
+    }
   } else if (type == kEventStateChange) {
     LidarState old_state = p_lidar->info.state;
     p_lidar->info = *info;

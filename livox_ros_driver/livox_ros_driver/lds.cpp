@@ -605,6 +605,7 @@ void Lds::SetLidarDataSrc(LidarDevice *lidar, uint8_t data_src) {
 void Lds::ResetLds(uint8_t data_src) {
   lidar_count_ = kMaxSourceLidar;
   for (uint32_t i = 0; i < kMaxSourceLidar; i++) {
+    std::lock_guard<std::mutex> lk(data_lock_[i]);
     ResetLidar(&lidars_[i], data_src);
   }
 }
@@ -661,6 +662,9 @@ void Lds::UpdateLidarInfoByEthPacket(LidarDevice *p_lidar,
 }
 
 void Lds::StorageRawPacket(uint8_t handle, LivoxEthPacket* eth_packet) {
+  if (handle >= kMaxSourceLidar) {
+    return;
+  }
   LidarDevice *p_lidar = &lidars_[handle];
   LidarPacketStatistic *packet_statistic = &p_lidar->statistic_info;
   LdsStamp cur_timestamp;
@@ -688,6 +692,8 @@ void Lds::StorageRawPacket(uint8_t handle, LivoxEthPacket* eth_packet) {
     }
     packet_statistic->last_timestamp = cur_timestamp.stamp;
 
+    /** Guard queue alloc/push against concurrent ResetLidar (disconnect) */
+    std::lock_guard<std::mutex> lk(data_lock_[handle]);
     LidarDataQueue *p_queue = &p_lidar->data;
     if (nullptr == p_queue->storage_packet) {
       uint32_t queue_size = CalculatePacketQueueSize(
@@ -720,6 +726,8 @@ void Lds::StorageRawPacket(uint8_t handle, LivoxEthPacket* eth_packet) {
     }
     packet_statistic->last_imu_timestamp = cur_timestamp.stamp;
 
+    /** Guard queue alloc/push against concurrent ResetLidar (disconnect) */
+    std::lock_guard<std::mutex> lk(data_lock_[handle]);
     LidarDataQueue *p_queue = &p_lidar->imu_data;
     if (nullptr == p_queue->storage_packet) {
       uint32_t queue_size = 256;  /* fixed imu data queue size */

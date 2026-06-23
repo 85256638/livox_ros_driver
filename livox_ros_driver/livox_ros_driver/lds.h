@@ -447,6 +447,11 @@ class Lds {
   uint8_t lidar_count_;                 /**< Lidar access handle. */
   LidarDevice lidars_[kMaxSourceLidar]; /**< The index is the handle */
   Semaphore semaphore_;
+  /** Per-lidar lock guarding the data/imu queue lifecycle (alloc in
+   *  StorageRawPacket, free in ResetLidar) against concurrent read in
+   *  DistributeLidarData. Fixes the use-after-free that can crash the node
+   *  when a lidar disconnects during multi-lidar operation. */
+  std::mutex data_lock_[kMaxSourceLidar];
 
  protected:
   uint32_t buffer_time_ms_; /**< Buffer time before data in queue is read */

@@ -59,6 +59,7 @@ int DeInitQueue(LidarDataQueue *queue) {
 
   if (queue->storage_packet) {
     delete[] queue->storage_packet;
+    queue->storage_packet = nullptr;  /**< avoid dangling pointer */
   }
 
   queue->rd_idx = 0;
@@ -75,6 +76,11 @@ void ResetQueue(LidarDataQueue *queue) {
 }
 
 void QueuePrePop(LidarDataQueue *queue, StoragePacket *storage_packet) {
+  if (queue == nullptr || queue->storage_packet == nullptr) {
+    /** queue freed concurrently (disconnect); return a zeroed packet */
+    memset(storage_packet, 0, sizeof(StoragePacket));
+    return;
+  }
   uint32_t rd_idx = queue->rd_idx & queue->mask;
 
   memcpy(storage_packet, &(queue->storage_packet[rd_idx]),
@@ -107,6 +113,9 @@ uint32_t QueueIsEmpty(LidarDataQueue *queue) {
 }
 
 uint32_t QueuePush(LidarDataQueue *queue, StoragePacket *storage_packet) {
+  if (queue == nullptr || queue->storage_packet == nullptr) {
+    return 0;
+  }
   uint32_t wr_idx = queue->wr_idx & queue->mask;
 
   memcpy((void *)(&(queue->storage_packet[wr_idx])), (void *)(storage_packet),
@@ -119,6 +128,9 @@ uint32_t QueuePush(LidarDataQueue *queue, StoragePacket *storage_packet) {
 
 uint32_t QueuePushAny(LidarDataQueue *queue, uint8_t *data, uint32_t length,
                       uint64_t time_rcv, uint32_t point_num) {
+  if (queue == nullptr || queue->storage_packet == nullptr) {
+    return 0;
+  }
   uint32_t wr_idx = queue->wr_idx & queue->mask;
 
   queue->storage_packet[wr_idx].time_rcv = time_rcv;
