@@ -27,8 +27,10 @@
 #include <chrono>
 #include <vector>
 #include <csignal>
+#include <sstream>
 
 #include <ros/ros.h>
+#include <std_msgs/String.h>
 #include "lddc.h"
 #include "lds_hub.h"
 #include "lds_lidar.h"
@@ -120,6 +122,67 @@ bool LidarRebootServiceCb(livox_ros_driver::LidarReboot::Request &req,
     ROS_WARN("LiDAR reboot request returned: %d", status);
   }
   return true;
+}
+
+/** Publisher for the per-second stats dashboard (std_msgs/String). */
+static ros::Publisher g_stats_pub;
+
+static const char *LidarStateStr(uint8_t state) {
+  switch (state) {
+    case kLidarStateInit:        return "Init";
+    case kLidarStateNormal:      return "Normal";
+    case kLidarStatePowerSaving:  return "PowerSaving";
+    case kLidarStateStandBy:     return "StandBy";
+    case kLidarStateError:       return "Error";
+    default:                     return "?";
+  }
+}
+
+/** Timer callback (runs on the AsyncSpinner thread, independent of the data
+ *  loop so it keeps updating even if a lidar stops sending). Publishes a
+ *  preformatted dashboard of all connected lidars. */
+void StatsTimerCb(const ros::TimerEvent &) {
+  if (g_read_lidar == nullptr) {
+    return;
+  }
+  static uint32_t prev_recv[kMaxLidarCount] = {0};
+  static uint32_t prev_loss[kMaxLidarCount] = {0};
+  static uint32_t prev_drop[kMaxLidarCount] = {0};
+
+  std::ostringstream ss;
+  ss << "===== Livox LiDAR Stats (1Hz) =====\n";
+  ss << "handle  broadcast_code   state        recv/s  loss/s  drop/s   "
+        "total_loss  total_drop\n";
+  bool any = false;
+  for (uint8_t h = 0; h < kMaxLidarCount; h++) {
+    LidarDevice *l = &g_read_lidar->lidars_[h];
+    if (l->connect_state == kConnectStateOff) {
+      prev_recv[h] = prev_loss[h] = prev_drop[h] = 0;
+      continue;
+    }
+    any = true;
+    LidarPacketStatistic &st = l->statistic_info;
+    uint32_t d_recv = st.receive_packet_count - prev_recv[h];
+    uint32_t d_loss = st.loss_packet_count - prev_loss[h];
+    uint32_t d_drop = st.queue_drop_count - prev_drop[h];
+    prev_recv[h] = st.receive_packet_count;
+    prev_loss[h] = st.loss_packet_count;
+    prev_drop[h] = st.queue_drop_count;
+
+    char line[256];
+    snprintf(line, sizeof(line),
+             "%-6d  %-15s  %-11s  %6u  %6u  %6u   %10u  %10u\n",
+             h, l->info.broadcast_code, LidarStateStr(l->info.state), d_recv,
+             d_loss, d_drop, st.loss_packet_count, st.queue_drop_count);
+    ss << line;
+  }
+  if (!any) {
+    ss << "(no connected lidar)\n";
+  }
+
+  std_msgs::String msg;
+  msg.data = ss.str();
+  g_stats_pub.publish(msg);
 }
 
 inline void SignalHandler(int signum) {
@@ -269,6 +332,15 @@ int main(int argc, char **argv) {
   ros::ServiceServer reboot_srv =
       livox_node.advertiseService("livox_lidar_reboot", LidarRebootServiceCb);
   ROS_INFO("Advertised service: livox_lidar_reboot");
+
+  /** Per-second stats dashboard topic (view with scripts/livox_stats_monitor.py
+   *  in a separate terminal for an always-current, isolated panel) */
+  ros::Timer stats_timer;
+  if (data_src == kSourceRawLidar) {
+    g_stats_pub = livox_node.advertise<std_msgs::String>("livox/lidar_stats", 1);
+    stats_timer = livox_node.createTimer(ros::Duration(1.0), StatsTimerCb);
+    ROS_INFO("Publishing stats topic: livox/lidar_stats (1Hz)");
+  }
 
   /** Use async spinner so service callbacks are processed in a separate thread,
    *  while the main thread keeps distributing lidar data */

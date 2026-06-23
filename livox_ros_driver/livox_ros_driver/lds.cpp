@@ -682,15 +682,19 @@ void Lds::ReportPacketStatistic(uint8_t handle) {
   uint32_t w_recv = st->win_recv;
   uint32_t w_loss = st->win_loss;
   uint32_t w_drop = st->win_drop;
-  uint32_t expected = w_recv + w_loss;
-  double net_loss_pct = expected ? (100.0 * w_loss / expected) : 0.0;
-  double drop_pct = w_recv ? (100.0 * w_drop / w_recv) : 0.0;
 
-  printf("[LivoxStats] Lidar[%d][%s] 5s: recv=%u net_loss=%u(%.2f%%) "
-         "queue_drop=%u(%.2f%%) | total recv=%u net_loss=%u drop=%u\n",
-         handle, p_lidar->info.broadcast_code, w_recv, w_loss, net_loss_pct,
-         w_drop, drop_pct, st->receive_packet_count, st->loss_packet_count,
-         st->queue_drop_count);
+  /** Only emit a line when there is an anomaly (loss or drop) in this window,
+   *  so a healthy run keeps the log clean. */
+  if (w_loss > 0 || w_drop > 0) {
+    uint32_t expected = w_recv + w_loss;
+    double net_loss_pct = expected ? (100.0 * w_loss / expected) : 0.0;
+    double drop_pct = w_recv ? (100.0 * w_drop / w_recv) : 0.0;
+    printf("[LivoxStats][WARN] Lidar[%d][%s] 5s: recv=%u net_loss=%u(%.2f%%) "
+           "queue_drop=%u(%.2f%%) | total recv=%u net_loss=%u drop=%u\n",
+           handle, p_lidar->info.broadcast_code, w_recv, w_loss, net_loss_pct,
+           w_drop, drop_pct, st->receive_packet_count, st->loss_packet_count,
+           st->queue_drop_count);
+  }
 
   st->win_recv = 0;
   st->win_loss = 0;

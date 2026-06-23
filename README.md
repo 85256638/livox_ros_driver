@@ -7,7 +7,7 @@
 3. **可配置点云距离过滤** — 通过 launch 参数设置最大发布距离，无需重新编译
 4. **掉线崩溃修复（UAF）** — 修复官方驱动在雷达掉线时的 use-after-free 竞态崩溃
 5. **状态抖动断流修复** — 避免温度/电机告警等瞬时状态抖动导致话题断流
-6. **丢包可视化** — 每 5 秒打印每台雷达的网络丢包率与队列丢包率
+6. **丢包可视化** — 异常时日志告警 + `livox/lidar_stats` 实时看板（独立终端原地刷新）
 7. **畸形包硬化** — 拒绝非法 `data_type`，堵住缓冲区溢出
 
 > 功能 1/2 需配套修改版 SDK；功能 3~7 为纯 ROS 驱动层改动，配任意 SDK 均可用。详见各章节。
@@ -170,30 +170,43 @@ roslaunch livox_ros_driver livox_lidar.launch max_distance:=0
 
 ## 新增功能四：丢包可视化
 
-启动后驱动**每 5 秒为每台雷达打印一行统计**（在 `roslaunch` 的终端，与其它驱动日志同处）：
+提供两种查看方式，按需选用。
+
+### 方式 A：日志告警（仅异常时输出）
+
+驱动每 5 秒检查一次，**只有在该窗口内发生丢包时才打印一行**，健康运行时日志保持干净：
 
 ```
-[LivoxStats] Lidar[0][1PQDH5B00100041] 5s: recv=12480 net_loss=8(0.06%) queue_drop=0(0.00%) | total recv=998400 net_loss=152 drop=0
+[LivoxStats][WARN] Lidar[0][1PQDH5B00100041] 5s: recv=12480 net_loss=8(0.06%) queue_drop=3(0.02%) | total recv=998400 net_loss=152 drop=10
 ```
-
-### 字段含义
 
 | 字段 | 含义 | 指向 |
 |------|------|------|
 | `recv` | 最近 5 秒收到的点云包数 | 速率是否稳定 |
-| `net_loss=8(0.06%)` | **网络丢包**（包未到达驱动，按时间戳间隔估算）| 网线 / 交换机 / 雷达硬件 / 散热 |
-| `queue_drop=0(0.00%)` | **队列丢包**（驱动消费不过来）| 下游订阅者慢 / CPU 瓶颈 |
+| `net_loss` | **网络丢包**（包未到达驱动，按时间戳间隔估算）| 网线 / 交换机 / 雷达硬件 / 散热 |
+| `queue_drop` | **队列丢包**（驱动消费不过来）| 下游订阅者慢 / CPU 瓶颈 |
 | `total ...` | 自启动以来累计 | 长期趋势 |
 
-### 长期记录 / 过滤
+> 出现 `[LivoxStats][WARN]` 就代表有丢包；持续没有，说明一切正常。
+
+### 方式 B：实时看板（独立终端，原地刷新，互不干扰）
+
+驱动每秒发布 `livox/lidar_stats` topic。在**另一个终端**运行看板脚本，它会原地刷新（像 `htop`），永远显示当前值，且与驱动日志完全隔离：
 
 ```bash
-# 只看统计行
-roslaunch livox_ros_driver livox_lidar_multi.launch 2>&1 | grep --line-buffered LivoxStats
-
-# 存到文件长期追踪
-roslaunch livox_ros_driver livox_lidar_multi.launch 2>&1 | grep --line-buffered LivoxStats >> ~/lidar_stats.log
+python3 $(rospack find livox_ros_driver)/scripts/livox_stats_monitor.py
 ```
+
+显示效果：
+```
+===== Livox LiDAR Stats (1Hz) =====
+handle  broadcast_code   state        recv/s  loss/s  drop/s   total_loss  total_drop
+0       1PQDH5B00100041  Normal         2496       0       0          152          10
+1       0TFDG3U99101431  Normal         2498       2       0           31           0
+(updated: 1718000000.0)
+```
+
+> **为什么不是"置顶在同一个终端"**：终端是线性滚动流，roscpp 日志和驱动 printf 都往同一个 stdout 写，无法稳定地把某几行钉在顶部（ANSI 滚动区域会被其它日志冲掉，重定向到文件还会变乱码）。独立终端的原地刷新看板是更可靠、更清晰的方案。
 
 > 网络丢包按时间戳间隔估算（丢一个包，下一个包时间戳跳约 N 个间隔），并对重连 / PPS 同步的大跳变做了上限保护，避免误报。
 
@@ -275,10 +288,11 @@ sudo make install
 | `srv/LidarReboot.srv` | **新增** — 重启 Service 定义 |
 | `CMakeLists.txt` | 注册两个 srv |
 | `livox_ros_driver/lds_lidar.h/.cpp` | 模式切换 + 重启 + 状态机抖动修复 |
-| `livox_ros_driver/livox_ros_driver.cpp` | 模式/重启 Service、AsyncSpinner、max_distance 参数 |
+| `livox_ros_driver/livox_ros_driver.cpp` | 模式/重启 Service、AsyncSpinner、max_distance 参数、`livox/lidar_stats` 看板发布 |
 | `livox_ros_driver/lddc.h/.cpp` | 距离过滤 + 读取端 UAF 加锁 |
-| `livox_ros_driver/lds.h/.cpp` | 每雷达锁、丢包统计、`data_type` 硬化、写入端 UAF 加锁 |
+| `livox_ros_driver/lds.h/.cpp` | 每雷达锁、丢包统计（仅异常打印）、`data_type` 硬化、写入端 UAF 加锁 |
 | `livox_ros_driver/ldq.cpp` | 队列释放置空 + 操作空指针兜底 |
+| `scripts/livox_stats_monitor.py` | **新增** — 独立终端的实时丢包看板 |
 
 ---
 
