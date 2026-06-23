@@ -1,9 +1,16 @@
 # Livox ROS Driver（钛兴科技定制版）
 
-本分支基于官方 [livox_ros_driver v2.6.0](https://github.com/Livox-SDK/livox_ros_driver) 修改，新增以下功能：
+本分支基于官方 [livox_ros_driver v2.6.0](https://github.com/Livox-SDK/livox_ros_driver) 修改，面向**多雷达 + 工业环境长时间运行**场景，新增以下功能与可靠性修复：
 
 1. **在线工作模式切换** — 运行时通过 ROS Service 切换 LiDAR 工作模式（Normal / PowerSaving / Standby）
-2. **可配置点云距离过滤** — 通过 launch 参数设置最大发布距离，无需重新编译
+2. **远程重启** — 通过 ROS Service 软重启雷达，无需现场断电
+3. **可配置点云距离过滤** — 通过 launch 参数设置最大发布距离，无需重新编译
+4. **掉线崩溃修复（UAF）** — 修复官方驱动在雷达掉线时的 use-after-free 竞态崩溃
+5. **状态抖动断流修复** — 避免温度/电机告警等瞬时状态抖动导致话题断流
+6. **丢包可视化** — 每 5 秒打印每台雷达的网络丢包率与队列丢包率
+7. **畸形包硬化** — 拒绝非法 `data_type`，堵住缓冲区溢出
+
+> 功能 1/2 需配套修改版 SDK；功能 3~7 为纯 ROS 驱动层改动，配任意 SDK 均可用。详见各章节。
 
 ---
 
@@ -143,6 +150,55 @@ roslaunch livox_ros_driver livox_lidar.launch max_distance:=0
 
 ---
 
+## 新增功能三：可靠性修复（多雷达长时间运行）
+
+> 以下为纯 ROS 驱动层修复，不需要改 SDK。
+
+### 1. 掉线崩溃（use-after-free）修复
+
+**官方 bug**：雷达掉线时，`ResetLidar` 在 SDK 设备状态线程上释放数据队列，而 SDK 数据接收线程仍可能往同一队列写入——两者无任何锁同步，导致 **use-after-free / 堆损坏**，在多雷达偶发掉线时崩溃或话题假死。
+
+**修复**：为每台雷达引入一把 `std::mutex`，把**写入（StorageRawPacket）/ 读取（DistributeLidarData）/ 释放（ResetLidar）** 三条路径互斥；并在 `DeInitQueue` 释放后置空指针、各队列操作加空指针兜底。从根上消除竞态（区别于裸 null 检查的临时补丁）。
+
+### 2. 状态抖动导致话题断流修复
+
+**问题**：早期版本在雷达状态从「任意非 Normal → Normal」时都会重置 `connect_state` 重跑配置，于是**温度/电机告警等瞬时 Error→Normal 抖动**也会触发完整重配置 → 话题断流几百 ms。工业现场高温、震动环境下频繁发生。
+
+**修复**：仅在「确实从节电/待机恢复」或「我们主动请求的 Normal 切换正在完成」时才重配置，瞬时告警抖动不再打断已在采样的雷达。
+
+---
+
+## 新增功能四：丢包可视化
+
+启动后驱动**每 5 秒为每台雷达打印一行统计**（在 `roslaunch` 的终端，与其它驱动日志同处）：
+
+```
+[LivoxStats] Lidar[0][1PQDH5B00100041] 5s: recv=12480 net_loss=8(0.06%) queue_drop=0(0.00%) | total recv=998400 net_loss=152 drop=0
+```
+
+### 字段含义
+
+| 字段 | 含义 | 指向 |
+|------|------|------|
+| `recv` | 最近 5 秒收到的点云包数 | 速率是否稳定 |
+| `net_loss=8(0.06%)` | **网络丢包**（包未到达驱动，按时间戳间隔估算）| 网线 / 交换机 / 雷达硬件 / 散热 |
+| `queue_drop=0(0.00%)` | **队列丢包**（驱动消费不过来）| 下游订阅者慢 / CPU 瓶颈 |
+| `total ...` | 自启动以来累计 | 长期趋势 |
+
+### 长期记录 / 过滤
+
+```bash
+# 只看统计行
+roslaunch livox_ros_driver livox_lidar_multi.launch 2>&1 | grep --line-buffered LivoxStats
+
+# 存到文件长期追踪
+roslaunch livox_ros_driver livox_lidar_multi.launch 2>&1 | grep --line-buffered LivoxStats >> ~/lidar_stats.log
+```
+
+> 网络丢包按时间戳间隔估算（丢一个包，下一个包时间戳跳约 N 个间隔），并对重连 / PPS 同步的大跳变做了上限保护，避免误报。
+
+---
+
 ## Livox SDK 修改（重要）
 
 **本驱动需要配合修改版的 Livox SDK 使用。** 如果使用未修改的 SDK，模式切换将无法正常工作（切到节电后会立即自动恢复 Normal）。
@@ -211,17 +267,18 @@ sudo make install
 | `sdk_core/src/command_handler/command_channel.h` | 新增 `last_work_state_` 字段 |
 | `sdk_core/src/command_handler/command_channel.cpp` | 状态感知心跳超时 + 记录 work_state |
 
-### ROS Driver（7 个文件）
+### ROS Driver
 
 | 文件 | 改动 |
 |------|------|
-| `srv/LidarMode.srv` | **新增** — ROS Service 定义 |
-| `CMakeLists.txt` | 新增 `add_service_files` |
-| `livox_ros_driver/lds_lidar.h` | 新增 `ModeChangeRequest` 结构体和模式切换方法声明 |
-| `livox_ros_driver/lds_lidar.cpp` | 完整模式切换实现（含断连重试逻辑） |
-| `livox_ros_driver/livox_ros_driver.cpp` | 新增 ROS Service、AsyncSpinner、max_distance 参数 |
-| `livox_ros_driver/lddc.h` | 新增 `max_distance_` 成员和 `SetMaxDistance()` |
-| `livox_ros_driver/lddc.cpp` | 三种点云格式的距离过滤逻辑 |
+| `srv/LidarMode.srv` | **新增** — 模式切换 Service 定义 |
+| `srv/LidarReboot.srv` | **新增** — 重启 Service 定义 |
+| `CMakeLists.txt` | 注册两个 srv |
+| `livox_ros_driver/lds_lidar.h/.cpp` | 模式切换 + 重启 + 状态机抖动修复 |
+| `livox_ros_driver/livox_ros_driver.cpp` | 模式/重启 Service、AsyncSpinner、max_distance 参数 |
+| `livox_ros_driver/lddc.h/.cpp` | 距离过滤 + 读取端 UAF 加锁 |
+| `livox_ros_driver/lds.h/.cpp` | 每雷达锁、丢包统计、`data_type` 硬化、写入端 UAF 加锁 |
+| `livox_ros_driver/ldq.cpp` | 队列释放置空 + 操作空指针兜底 |
 
 ---
 
@@ -242,6 +299,12 @@ sudo make install
 rosservice call /livox_lidar_mode "{handle: 0, mode: 2}"  # 0 号进入节电
 rosservice call /livox_lidar_mode "{handle: 1, mode: 1}"  # 1 号保持正常
 ```
+
+### Q: 怎么判断丢包是网络问题还是驱动问题？
+看 `[LivoxStats]` 日志：`net_loss` 高 → 网络/雷达硬件（查网线、交换机、散热）；`queue_drop` 高 → 下游消费太慢（订阅者慢 / CPU 瓶颈）。
+
+### Q: 雷达长时间运行后无响应 / 丢包严重，怎么远程恢复？
+不用现场断电，调用重启 service：`rosservice call /livox_lidar_reboot "{handle: 255}"`（255 = 全部）。
 
 ---
 
