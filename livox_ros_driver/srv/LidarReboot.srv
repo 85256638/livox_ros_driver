@@ -1,0 +1,6 @@
+# Reboot Livox LiDAR
+# handle: lidar device handle (0-31), 255 = all connected lidars
+uint8 handle
+---
+# ret_code: 0 = success, non-zero = error (maps to livox_status)
+int32 ret_code

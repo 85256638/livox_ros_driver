@@ -79,6 +79,25 @@ rosservice call /livox_lidar_mode "{handle: 255, mode: 2}"
 | PowerSaving / Standby 下断线 | 15 秒检测到，重连后恢复 Normal 模式 |
 | 切换 Normal 时通信失败 | 自动等待重连后重试 |
 
+### 远程重启
+
+当雷达进入异常状态（如长时间运行后丢包/无响应），可以远程软重启，无需现场断电：
+
+```bash
+# 重启单台雷达
+rosservice call /livox_lidar_reboot "{handle: 0}"
+
+# 重启所有已连接雷达
+rosservice call /livox_lidar_reboot "{handle: 255}"
+```
+
+| 参数 | 取值 | 说明 |
+|------|------|------|
+| `handle` | 0~31 | 单个雷达句柄 |
+| `handle` | 255 | 所有已连接雷达 |
+
+> 调用 SDK 的 `RebootDevice()`，雷达会断开并在数秒后重新上线，驱动的重连逻辑会自动恢复采样。Horizon 支持；Mid40/100 需固件 ≥ 03.07。
+
 ---
 
 ## 新增功能二：可配置点云距离过滤

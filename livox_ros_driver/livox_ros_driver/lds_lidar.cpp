@@ -110,6 +110,17 @@ livox_status LdsLidar::RequestLidarModeChange(uint8_t handle, LidarMode mode) {
   return SendModeChangeRequest(handle, mode, false);
 }
 
+livox_status LdsLidar::RequestLidarReboot(uint8_t handle, uint16_t timeout_ms) {
+  if (handle >= kMaxLidarCount) {
+    return kStatusInvalidHandle;
+  }
+  LidarDevice *p_lidar = &lidars_[handle];
+  if (p_lidar->connect_state == kConnectStateOff) {
+    return kStatusNotConnected;
+  }
+  return RebootDevice(handle, timeout_ms, RebootCb, this);
+}
+
 void LdsLidar::RememberBroadcastCode(uint8_t handle, const char *broadcast_code) {
   if (handle >= kMaxLidarCount || broadcast_code == nullptr ||
       broadcast_code[0] == '\0') {
@@ -605,6 +616,12 @@ void LdsLidar::SetModeCb(livox_status status, uint8_t handle, uint8_t response,
     printf("Lidar[%d] will retry normal-mode recovery after reconnect.\n",
            handle);
   }
+}
+
+void LdsLidar::RebootCb(livox_status status, uint8_t handle, uint8_t response,
+                        void *client_data) {
+  printf("Lidar[%d] reboot command status[%d] response[%d]\n", handle, status,
+         response);
 }
 
 void LdsLidar::SetPointCloudReturnModeCb(livox_status status, uint8_t handle,

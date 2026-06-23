@@ -56,6 +56,7 @@ class LdsLidar : public Lds {
   livox_status RequestLidarModeChange(const char *broadcast_code,
                                       LidarMode mode);
   livox_status RequestLidarModeChange(uint8_t handle, LidarMode mode);
+  livox_status RequestLidarReboot(uint8_t handle, uint16_t timeout_ms = 100);
 
  private:
   struct ModeChangeRequest {
@@ -113,6 +114,8 @@ class LdsLidar : public Lds {
                                    void *clent_data);
   static void SetModeCb(livox_status status, uint8_t handle, uint8_t response,
                         void *client_data);
+  static void RebootCb(livox_status status, uint8_t handle, uint8_t response,
+                       void *client_data);
 
   void ResetLdsLidar(void);
   int AddBroadcastCodeToWhitelist(const char *broadcast_code);

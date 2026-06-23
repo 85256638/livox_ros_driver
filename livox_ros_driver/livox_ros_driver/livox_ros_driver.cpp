@@ -35,6 +35,7 @@
 #include "lds_lvx.h"
 #include "livox_sdk.h"
 #include "livox_ros_driver/LidarMode.h"
+#include "livox_ros_driver/LidarReboot.h"
 
 using namespace livox_ros;
 
@@ -82,6 +83,41 @@ bool LidarModeServiceCb(livox_ros_driver::LidarMode::Request &req,
     ROS_INFO("LiDAR mode change request accepted");
   } else {
     ROS_WARN("LiDAR mode change request returned: %d", status);
+  }
+  return true;
+}
+
+bool LidarRebootServiceCb(livox_ros_driver::LidarReboot::Request &req,
+                          livox_ros_driver::LidarReboot::Response &res) {
+  if (g_read_lidar == nullptr) {
+    ROS_ERROR("LiDAR reboot service: data source is not raw lidar");
+    res.ret_code = -1;
+    return true;
+  }
+
+  if (req.handle == 255) {
+    /** Reboot all connected LiDARs */
+    ROS_INFO("LiDAR reboot service: ALL lidars");
+    livox_status last_status = kStatusSuccess;
+    for (uint8_t h = 0; h < kMaxLidarCount; h++) {
+      livox_status s = g_read_lidar->RequestLidarReboot(h);
+      if (s != kStatusSuccess && s != kStatusNotConnected) {
+        ROS_WARN("LiDAR reboot failed for handle=%d: %d", h, s);
+        last_status = s;
+      }
+    }
+    res.ret_code = last_status;
+    return true;
+  }
+
+  ROS_INFO("LiDAR reboot service: handle=%d", req.handle);
+  livox_status status = g_read_lidar->RequestLidarReboot(req.handle);
+  res.ret_code = status;
+
+  if (status == kStatusSuccess) {
+    ROS_INFO("LiDAR reboot request accepted");
+  } else {
+    ROS_WARN("LiDAR reboot request returned: %d", status);
   }
   return true;
 }
@@ -228,6 +264,11 @@ int main(int argc, char **argv) {
   ros::ServiceServer mode_srv =
       livox_node.advertiseService("livox_lidar_mode", LidarModeServiceCb);
   ROS_INFO("Advertised service: livox_lidar_mode");
+
+  /** Advertise lidar reboot service */
+  ros::ServiceServer reboot_srv =
+      livox_node.advertiseService("livox_lidar_reboot", LidarRebootServiceCb);
+  ROS_INFO("Advertised service: livox_lidar_reboot");
 
   /** Use async spinner so service callbacks are processed in a separate thread,
    *  while the main thread keeps distributing lidar data */
