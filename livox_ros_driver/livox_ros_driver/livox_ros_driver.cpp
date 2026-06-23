@@ -28,6 +28,7 @@
 #include <vector>
 #include <csignal>
 #include <sstream>
+#include <cstring>
 
 #include <ros/ros.h>
 #include <std_msgs/String.h>
@@ -148,36 +149,52 @@ void StatsTimerCb(const ros::TimerEvent &) {
   static uint32_t prev_recv[kMaxLidarCount] = {0};
   static uint32_t prev_loss[kMaxLidarCount] = {0};
   static uint32_t prev_drop[kMaxLidarCount] = {0};
+  static bool ever_seen[kMaxLidarCount] = {false};
+  static char last_bcode[kMaxLidarCount][kBdCodeSize + 1] = {{0}};
 
   std::ostringstream ss;
   ss << "===== Livox LiDAR Stats (1Hz) =====\n";
-  ss << "handle  broadcast_code   state        recv/s  loss/s  drop/s   "
+  ss << "handle  broadcast_code   state         recv/s  loss/s  drop/s   "
         "total_loss  total_drop\n";
   bool any = false;
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
     LidarDevice *l = &g_read_lidar->lidars_[h];
-    if (l->connect_state == kConnectStateOff) {
-      prev_recv[h] = prev_loss[h] = prev_drop[h] = 0;
+    bool connected = (l->connect_state != kConnectStateOff);
+    if (connected) {
+      ever_seen[h] = true;
+      strncpy(last_bcode[h], l->info.broadcast_code, kBdCodeSize);
+      last_bcode[h][kBdCodeSize] = '\0';
+    }
+    /** Skip handles that have never connected; but keep showing a lidar once
+     *  seen, so a disconnect is loudly visible (DISCONNECTED) instead of the
+     *  row silently vanishing. */
+    if (!ever_seen[h]) {
       continue;
     }
     any = true;
     LidarPacketStatistic &st = l->statistic_info;
-    uint32_t d_recv = st.receive_packet_count - prev_recv[h];
-    uint32_t d_loss = st.loss_packet_count - prev_loss[h];
-    uint32_t d_drop = st.queue_drop_count - prev_drop[h];
-    prev_recv[h] = st.receive_packet_count;
-    prev_loss[h] = st.loss_packet_count;
-    prev_drop[h] = st.queue_drop_count;
-
     char line[256];
-    snprintf(line, sizeof(line),
-             "%-6d  %-15s  %-11s  %6u  %6u  %6u   %10u  %10u\n",
-             h, l->info.broadcast_code, LidarStateStr(l->info.state), d_recv,
-             d_loss, d_drop, st.loss_packet_count, st.queue_drop_count);
+    if (connected) {
+      uint32_t d_recv = st.receive_packet_count - prev_recv[h];
+      uint32_t d_loss = st.loss_packet_count - prev_loss[h];
+      uint32_t d_drop = st.queue_drop_count - prev_drop[h];
+      prev_recv[h] = st.receive_packet_count;
+      prev_loss[h] = st.loss_packet_count;
+      prev_drop[h] = st.queue_drop_count;
+      snprintf(line, sizeof(line),
+               "%-6d  %-15s  %-12s  %6u  %6u  %6u   %10u  %10u\n",
+               h, last_bcode[h], LidarStateStr(l->info.state), d_recv, d_loss,
+               d_drop, st.loss_packet_count, st.queue_drop_count);
+    } else {
+      prev_recv[h] = prev_loss[h] = prev_drop[h] = 0;
+      snprintf(line, sizeof(line),
+               "%-6d  %-15s  %-12s  %6s  %6s  %6s   %10s  %10s\n",
+               h, last_bcode[h], "DISCONNECTED", "-", "-", "-", "-", "-");
+    }
     ss << line;
   }
   if (!any) {
-    ss << "(no connected lidar)\n";
+    ss << "(no lidar seen yet)\n";
   }
 
   std_msgs::String msg;

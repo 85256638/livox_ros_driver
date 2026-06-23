@@ -197,16 +197,19 @@ roslaunch livox_ros_driver livox_lidar.launch max_distance:=0
 python3 $(rospack find livox_ros_driver)/scripts/livox_stats_monitor.py
 ```
 
-显示效果：
+显示效果（掉线的雷达会明确标 `DISCONNECTED`，不会从看板上消失）：
 ```
 ===== Livox LiDAR Stats (1Hz) =====
-handle  broadcast_code   state        recv/s  loss/s  drop/s   total_loss  total_drop
-0       1PQDH5B00100041  Normal         2496       0       0          152          10
-1       0TFDG3U99101431  Normal         2498       2       0           31           0
+handle  broadcast_code   state         recv/s  loss/s  drop/s   total_loss  total_drop
+0       1PQDH5B00100041  Normal          2496       0       0          152          10
+1       0TFDG3U99101431  DISCONNECTED       -       -       -           -           -
+2       3WEDH5900103621  Normal          2498       2       0           31           0
 (updated: 1718000000.0)
 ```
 
 > **为什么不是"置顶在同一个终端"**：终端是线性滚动流，roscpp 日志和驱动 printf 都往同一个 stdout 写，无法稳定地把某几行钉在顶部（ANSI 滚动区域会被其它日志冲掉，重定向到文件还会变乱码）。独立终端的原地刷新看板是更可靠、更清晰的方案。
+
+> **统计与连接状态挂钩**：点云数据（UDP）和心跳是两条独立通道，一台雷达可能"心跳掉线"但数据还在流。驱动判定某台雷达 `connect_state==Off` 后即**不再统计其数据**，因此看板的 `DISCONNECTED` 与驱动的掉线判定始终一致，不会出现"已断开却仍显示正常"的矛盾。
 
 > 网络丢包按时间戳间隔估算（丢一个包，下一个包时间戳跳约 N 个间隔），并对重连 / PPS 同步的大跳变做了上限保护，避免误报。
 

@@ -714,6 +714,13 @@ void Lds::StorageRawPacket(uint8_t handle, LivoxEthPacket* eth_packet) {
     return;
   }
   LidarDevice *p_lidar = &lidars_[handle];
+  /** Ignore data for a lidar the driver considers disconnected. The point-cloud
+   *  UDP stream and the heartbeat are separate channels, so a lidar can keep
+   *  streaming data after a heartbeat-timeout disconnect. Counting it would make
+   *  the stats look healthy while the driver reports the lidar disconnected. */
+  if (p_lidar->connect_state == kConnectStateOff) {
+    return;
+  }
   LidarPacketStatistic *packet_statistic = &p_lidar->statistic_info;
   LdsStamp cur_timestamp;
   uint64_t timestamp;
