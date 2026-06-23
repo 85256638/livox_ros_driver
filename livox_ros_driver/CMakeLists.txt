@@ -73,6 +73,12 @@ catkin_package(CATKIN_DEPENDS
 	pcl_ros
 	)
 
+## Install python scripts so they are runnable via `rosrun livox_ros_driver <name>`
+catkin_install_python(PROGRAMS
+	livox_ros_driver/scripts/livox_stats_monitor.py
+	DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
 #---------------------------------------------------------------------------------------
 # Set default build to release
 #---------------------------------------------------------------------------------------

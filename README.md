@@ -207,8 +207,11 @@ roslaunch livox_ros_driver livox_lidar_multi.launch
 
 **③ 终端 2 — 打开看板**（原地刷新，不受驱动日志干扰）：
 ```bash
-python3 $(rospack find livox_ros_driver)/scripts/livox_stats_monitor.py
+rosrun livox_ros_driver livox_stats_monitor.py
 ```
+> 若提示找不到（旧编译缓存），重新 `catkin_make && source devel/setup.bash` 即可；
+> 或直接用绝对路径运行：`python3 $(rospack find livox_ros_driver)/livox_ros_driver/scripts/livox_stats_monitor.py`
+> （注意本仓库源码目录多嵌套一层 `livox_ros_driver`）。
 
 看板效果（掉线的雷达会明确标 `DISCONNECTED`，不会从看板上消失）：
 ```
