@@ -8,39 +8,32 @@
     <arg name="data_src" default="0"/>
     <arg name="publish_freq" default="10.0"/>
     <arg name="output_type" default="0"/>
-    <arg name="rviz_enable" default="true"/>
+    <arg name="rviz_enable" default="false"/>
     <arg name="rosbag_enable" default="false"/>
     <arg name="lidar_bag" default="false"/>
     <arg name="imu_bag" default="false"/>
-    <arg name="max_distance" default="4.0"/>
-    
+    <arg name="max_distance" default="25.0"/>
+
 
     <!-- Livox Configuration -->
     <param name="xfer_format" value="$(arg xfer_format)"/>
     <param name="multi_topic" value="$(arg multi_topic)"/>
-    
-    <remap from="/livox/lidar_3WEDH5900101321" to="/livox/lidar_farleft_2"/>
-    <remap from="/livox/lidar_3WEDJA600100571" to="/livox/lidar_left_57"/>	
-    <remap from="/livox/lidar_1HDDH3200104431" to="/livox/lidar_mid_65"/>
-    <remap from="/livox/lidar_3WEDJA600100751" to="/livox/lidar_right_75"/>
-    <remap from="/livox/lidar_1HDDH3200104541" to="/livox/lidar_test_54"/>	
-    <remap from="/livox/lidar_3WEDH7600119641" to="/livox/lidar_CDTX_1"/>
-    
-    
-    <remap from="/livox/imu_3WEDH5900101321" to="/livox/imu_farleft_2"/>
-    <remap from="/livox/imu_3WEDJA600100571" to="/livox/imu_left_57"/>	
-    <remap from="/livox/imu_1HDDH3200104431" to="/livox/imu_mid_65"/>
-    <remap from="/livox/imu_3WEDJA600100751" to="/livox/imu_right_75"/>
-    <remap from="/livox/imu_1HDDH3200104541" to="/livox/imu_test_54"/>
-    <remap from="/livox/imu_3WEDH7600119641" to="/livox/imu_CDTX_1"/>	
-        
-    <remap from="/livox/status_3WEDJA700100021" to="/livox/status_farleft_2"/>
-    <remap from="/livox/status_3WEDJA600100571" to="/livox/status_left_57"/>	
-    <remap from="/livox/status_1HDDH3200104431" to="/livox/status_mid_65"/>
-    <remap from="/livox/status_3WEDJA600100751" to="/livox/status_right_75"/>
-    <remap from="/livox/status_1HDDH3200104541" to="/livox/status_test_54"/>
-    <remap from="/livox/status_3WEDH7600119641" to="/livox/status_CDTX_1"/>
-    
+
+    <remap from="/livox/lidar_3WEDH7600111191" to="/livox/lidar_farleft_2"/>
+    <remap from="/livox/lidar_3WEDH5900103621" to="/livox/lidar_left_57"/>
+    <remap from="/livox/lidar_3WEDH5900100671" to="/livox/lidar_mid_65"/>
+    <remap from="/livox/lidar_3WEDH7600103661" to="/livox/lidar_right_75"/>
+
+    <remap from="/livox/imu_3WEDH7600111191" to="/livox/imu_farleft_2"/>
+    <remap from="/livox/imu_3WEDH5900103621" to="/livox/imu_left_57"/>
+    <remap from="/livox/imu_3WEDH5900100671" to="/livox/imu_mid_65"/>
+    <remap from="/livox/imu_3WEDH7600103661" to="/livox/imu_right_75"/>
+
+    <remap from="/livox/status_3WEDH7600111191" to="/livox/status_farleft_2"/>
+    <remap from="/livox/status_3WEDH5900103621" to="/livox/status_left_57"/>
+    <remap from="/livox/status_3WEDH5900100671" to="/livox/status_mid_65"/>
+    <remap from="/livox/status_3WEDH7600103661" to="/livox/status_right_75"/>
+
     <param name="data_src" value="$(arg data_src)"/>
     <param name="publish_freq" type="double" value="$(arg publish_freq)"/>
     <param name="output_data_type" value="$(arg output_type)"/>
@@ -48,20 +41,20 @@
     <!-- param name="frame_id" type="string" value="$(arg msg_frame_id)"/ -->
     <param name="enable_lidar_bag" type="bool" value="$(arg lidar_bag)"/>
     <param name="enable_imu_bag" type="bool" value="$(arg imu_bag)"/>
-    <param name="max_distance" type="double" value="$(arg max_distance)"/>
+    <param name="max_distance" type="double" value="$(arg max_distance)"/>   <!-- 加这行 -->
 
 
     <!-- Add TF Transformations for 4 LiDARs -->
     <node pkg="tf" type="static_transform_publisher" name="base_to_livox_lidar"
           args="0 0 0 0 0 0 /base_link /livox_frame 5"/>
-          
+
     <!-- Start Livox Driver -->
     <node name="livox_driver" pkg="livox_ros_driver"
           type="livox_ros_driver_node" required="true"
           output="screen"/>
 
-          
-          
+
+
     <!-- Optional: Enable RViz -->
     <group if="$(arg rviz_enable)">
         <node name="rviz" pkg="rviz" type="rviz" respawn="true"
@@ -70,4 +63,3 @@
 
 
 </launch>
-

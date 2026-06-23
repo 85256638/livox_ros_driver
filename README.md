@@ -189,15 +189,28 @@ roslaunch livox_ros_driver livox_lidar.launch max_distance:=0
 
 > 出现 `[LivoxStats][WARN]` 就代表有丢包；持续没有，说明一切正常。
 
-### 方式 B：实时看板（独立终端，原地刷新，互不干扰）
+### 方式 B：实时看板（独立终端，原地刷新，互不干扰）⭐推荐
 
-驱动每秒发布 `livox/lidar_stats` topic。在**另一个终端**运行看板脚本，它会原地刷新（像 `htop`），永远显示当前值，且与驱动日志完全隔离：
+驱动每秒发布 `livox/lidar_stats` topic。在**另一个终端**运行看板脚本，它会原地刷新（像 `htop`），永远显示当前值，且与驱动日志完全隔离。
 
+#### 使用步骤
+
+**① 确保已重新编译**（看板是新功能，旧版本没有）：
+```bash
+cd ~/catkin_ws && catkin_make && source devel/setup.bash
+```
+
+**② 终端 1 — 启动驱动**（日志在这里滚动）：
+```bash
+roslaunch livox_ros_driver livox_lidar_multi.launch
+```
+
+**③ 终端 2 — 打开看板**（原地刷新，不受驱动日志干扰）：
 ```bash
 python3 $(rospack find livox_ros_driver)/scripts/livox_stats_monitor.py
 ```
 
-显示效果（掉线的雷达会明确标 `DISCONNECTED`，不会从看板上消失）：
+看板效果（掉线的雷达会明确标 `DISCONNECTED`，不会从看板上消失）：
 ```
 ===== Livox LiDAR Stats (1Hz) =====
 handle  broadcast_code   state         recv/s  loss/s  drop/s   total_loss  total_drop
@@ -206,6 +219,25 @@ handle  broadcast_code   state         recv/s  loss/s  drop/s   total_loss  tota
 2       3WEDH5900103621  Normal          2498       2       0           31           0
 (updated: 1718000000.0)
 ```
+
+#### 怎么读看板
+
+| 列 | 含义 |
+|----|------|
+| `state` | `Normal` 正常 / `DISCONNECTED` 掉线 / `PowerSaving` 节电 / `Error` 故障 |
+| `recv/s` | 每秒收到的点云包数（应稳定，多台 Horizon 约 2500/s）|
+| `loss/s` | 每秒网络丢包数（>0 说明网络/接头/散热在劣化，掉线前兆）|
+| `drop/s` | 每秒队列丢包数（>0 说明主机/下游消费不过来）|
+| `total_loss / total_drop` | 自连接以来累计 |
+
+> **某台 `loss/s` 持续 >0 → 重点排查那台的网线/接头/散热；某台 `DISCONNECTED` → 已掉线，可远程重启 `rosservice call /livox_lidar_reboot "{handle: N}"`。**
+
+#### 不想用脚本？直接看原始 topic
+
+```bash
+rostopic echo /livox/lidar_stats
+```
+（会滚动刷屏，不如脚本清爽，但不需要任何额外文件。）
 
 > **为什么不是"置顶在同一个终端"**：终端是线性滚动流，roscpp 日志和驱动 printf 都往同一个 stdout 写，无法稳定地把某几行钉在顶部（ANSI 滚动区域会被其它日志冲掉，重定向到文件还会变乱码）。独立终端的原地刷新看板是更可靠、更清晰的方案。
 
