@@ -172,13 +172,17 @@ roslaunch livox_ros_driver livox_lidar.launch max_distance:=0
 
 提供两种查看方式，按需选用。
 
-### 方式 A：日志告警（仅异常时输出）
+### 方式 A：日志告警（仅明显异常时输出）
 
-驱动每 5 秒检查一次，**只有在该窗口内发生丢包时才打印一行**，健康运行时日志保持干净：
+驱动每 5 秒检查一次，**只有在该窗口内丢包达到一定程度时才打印一行**，健康运行时日志保持干净：
 
 ```
-[LivoxStats][WARN] Lidar[0][1PQDH5B00100041] 5s: recv=12480 net_loss=8(0.06%) queue_drop=3(0.02%) | total recv=998400 net_loss=152 drop=10
+[LivoxStats][WARN] Lidar[0][1PQDH5B00100041] 5s: recv=12480 net_loss=80(0.64%) queue_drop=3(0.02%) | total recv=998400 net_loss=152 drop=10
 ```
+
+触发条件：**窗口网络丢包率 ≥ 0.5%**，或**出现任何队列丢包**（消费跟不上，总是值得知道）。
+
+> ⚠️ 早期版本只要丢 1 个包（0.01%）就报 WARN，导致 UDP 正常抖动也刷屏、看着像出问题。现在提高了门槛：偶发的 1~2 个包丢失（~0.01%）属于正常抖动，**不再报警**；但这些小丢包仍会累积到看板的 `loss%` 列里，长期趋势照样看得到。
 
 | 字段 | 含义 | 指向 |
 |------|------|------|
@@ -186,8 +190,6 @@ roslaunch livox_ros_driver livox_lidar.launch max_distance:=0
 | `net_loss` | **网络丢包**（包未到达驱动，按时间戳间隔估算）| 网线 / 交换机 / 雷达硬件 / 散热 |
 | `queue_drop` | **队列丢包**（驱动消费不过来）| 下游订阅者慢 / CPU 瓶颈 |
 | `total ...` | 自启动以来累计 | 长期趋势 |
-
-> 出现 `[LivoxStats][WARN]` 就代表有丢包；持续没有，说明一切正常。
 
 ### 方式 B：实时看板（独立终端，原地刷新，互不干扰）⭐推荐
 
@@ -227,39 +229,33 @@ rosrun livox_ros_driver livox_stats_monitor.py
 > （注意本仓库源码目录多嵌套一层 `livox_ros_driver`）。
 
 看板效果（掉线的雷达会明确标 `DISCONNECTED`，不会从看板上消失）：
-正常情况（温度从没变过）：
 ```
 ===== Livox LiDAR Stats (1Hz) =====
-handle  broadcast_code   state         temp  fan   recv/s  loss/s  drop/s   disc  last_drop   uptime
-0       1PQDH5B00100041  Normal        OK    OK      2496       0       0      0         --    2h13m
-1       0TFDG3U99101431  Normal        OK    OK      2498       0       0      0         --    2h13m
+handle  broadcast_code   state         temp  fan   recv/s  loss/s  loss%    drop/s   disc  last_drop   uptime
+0       3WEDH7600111191  Normal        OK    OK      2496       0   0.00%        0      0         --    2h13m
+1       3WEDH7600103661  Normal        OK    OK      2498       0   2.24%        0      3      8m05s    8m05s
+2       3WEDH5900100671  Normal        OK    OK      2497       0   0.00%        0      0         --    2h13m
 Temp changes: none (all lidars normal since start)
 (updated: 1718000000.0)
 ```
-
-某台温度进过告警区时，底部才会列出来（只列出真有变化的）：
-```
-1       0TFDG3U99101431  Normal        WARN  OK      2498       2       0      7      3m12s    3m12s
-Temp changes:  lidar 1: 1 time(s), last at 09:12:44
-```
-
-> 平时就是一句 `none`；一旦出现 `lidar X: N time(s), last at ...`，说明那台真的进过温度告警区，配合驱动终端的 `[LivoxHealth]` 行能看到具体变成了 WARN 还是 HOT!。
+上例 1 号 `loss% = 2.24%` 明显高于其它（其它 0.00%）——说明它**累计**丢得多（历史上有过一段网络差的时期），是最该排查的那台。
 
 #### 怎么读看板
 
 | 列 | 含义 |
 |----|------|
 | `state` | `Normal` 正常 / `DISCONNECTED` 掉线 / `PowerSaving` 节电 / `Error` 故障 |
-| `temp` | 温度状态 `OK` / `WARN`(偏高偏低) / `HOT!`(极端)。⚠️ 是状态码，**不是具体℃**（见下方说明）|
-| `fan` | 风扇状态 `OK` 正常 / `WARN` **故障**（注意：WARN 是风扇坏了，不是"在转"）|
+| `temp` | 温度状态 `OK` / `WARN`(偏高偏低) / `HOT!`(极端)。⚠️ 是状态码，**不是具体℃** |
+| `fan` | 风扇状态 `OK` 正常 / `WARN` **故障**（WARN 是风扇坏了，不是"在转"）|
 | `recv/s` | 每秒收到的点云包数（应稳定，多台 Horizon 约 2500/s）|
-| `loss/s` | 每秒网络丢包数（>0 说明网络/接头/散热在劣化，掉线前兆）|
+| `loss/s` | **瞬时**每秒网络丢包数（看当下有没有在掉，正常时常为 0）|
+| `loss%` | **累计**网络丢包率（看这台从启动到现在总体掉了多少，哪台不靠谱一眼看出）|
 | `drop/s` | 每秒队列丢包数（>0 说明主机/下游消费不过来）|
-| `disc` | **累计掉线次数**（长期跑下来哪台最不稳，一眼看出）|
+| `disc` | 累计掉线次数 |
 | `last_drop` | 上次掉线距今多久（`--` = 从未掉过）|
 | `uptime` | 本次连接已稳定多久 |
 
-> **判断哪台最该换**：`disc` 高 + `uptime` 短（反复掉、刚回来）的雷达，比偶尔丢几个包的更需要优先处理。
+> **`loss/s` vs `loss%` 的区别**：`loss/s` 是当下这一秒的瞬时值（偶发小抖动会一闪而过、平时是 0）；`loss%` 是从启动累计的总丢包率（小抖动会慢慢累积体现出来）。**判断哪台最该换**就看 `loss%` 高、`disc` 多、`uptime` 短的那台。
 
 #### 关于温度与风扇（重要说明）
 

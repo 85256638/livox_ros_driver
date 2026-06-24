@@ -682,11 +682,15 @@ void Lds::ReportPacketStatistic(uint8_t handle) {
   uint32_t w_recv = st->win_recv;
   uint32_t w_loss = st->win_loss;
   uint32_t w_drop = st->win_drop;
+  uint32_t expected = w_recv + w_loss;
 
-  /** Only emit a line when there is an anomaly (loss or drop) in this window,
-   *  so a healthy run keeps the log clean. */
-  if (w_loss > 0 || w_drop > 0) {
-    uint32_t expected = w_recv + w_loss;
+  /** Warn only on a MEANINGFUL anomaly, not on normal UDP jitter (a stray 1-2
+   *  lost packets per 5s = ~0.01% is noise, not a fault). Trigger when window
+   *  net loss >= 0.5% of expected, or any queue drop occurs (consumer falling
+   *  behind is always worth knowing). Cumulative loss still accrues for the
+   *  dashboard's loss% column regardless. */
+  bool loss_significant = (expected > 0) && (w_loss * 200 >= expected);
+  if (loss_significant || w_drop > 0) {
     double net_loss_pct = expected ? (100.0 * w_loss / expected) : 0.0;
     double drop_pct = w_recv ? (100.0 * w_drop / w_recv) : 0.0;
     printf("[LivoxStats][WARN] Lidar[%d][%s] 5s: recv=%u net_loss=%u(%.2f%%) "

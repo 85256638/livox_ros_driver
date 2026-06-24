@@ -191,7 +191,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
   std::ostringstream ss;
   ss << "===== Livox LiDAR Stats (1Hz) =====\n";
   ss << "handle  broadcast_code   state         temp  fan   recv/s  loss/s  "
-        "drop/s   disc  last_drop   uptime\n";
+        "loss%    drop/s   disc  last_drop   uptime\n";
   bool any = false;
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
     LidarDevice *l = &g_read_lidar->lidars_[h];
@@ -220,6 +220,11 @@ void StatsTimerCb(const ros::TimerEvent &) {
     em.error_code = ls.health_code;
     const char *temp = TempStr(em.lidar_error_code.temp_status);
     const char *fan = FanStr(em.lidar_error_code.fan_status);
+    /** cumulative loss% since connect: total_loss / (total_recv + total_loss) */
+    uint64_t tot = (uint64_t)st.receive_packet_count + st.loss_packet_count;
+    char losspct[12];
+    snprintf(losspct, sizeof(losspct), "%.2f%%",
+             tot ? (100.0 * st.loss_packet_count / tot) : 0.0);
     char line[256];
     if (connected) {
       uint32_t d_recv = st.receive_packet_count - prev_recv[h];
@@ -229,16 +234,16 @@ void StatsTimerCb(const ros::TimerEvent &) {
       prev_loss[h] = st.loss_packet_count;
       prev_drop[h] = st.queue_drop_count;
       snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-12s  %-4s  %-4s  %6u  %6u  %6u   %4u  %9s  %7s\n",
+               "%-6d  %-15s  %-12s  %-4s  %-4s  %6u  %6u  %7s  %6u   %4u  %9s  %7s\n",
                h, last_bcode[h], LidarStateStr(l->info.state), temp, fan,
-               d_recv, d_loss, d_drop, disc, last_drop.c_str(),
+               d_recv, d_loss, losspct, d_drop, disc, last_drop.c_str(),
                uptime.c_str());
     } else {
       prev_recv[h] = prev_loss[h] = prev_drop[h] = 0;
       snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-12s  %-4s  %-4s  %6s  %6s  %6s   %4u  %9s  %7s\n",
-               h, last_bcode[h], "DISCONNECTED", "-", "-", "-", "-", "-", disc,
-               last_drop.c_str(), uptime.c_str());
+               "%-6d  %-15s  %-12s  %-4s  %-4s  %6s  %6s  %7s  %6s   %4u  %9s  %7s\n",
+               h, last_bcode[h], "DISCONNECTED", "-", "-", "-", "-", losspct,
+               "-", disc, last_drop.c_str(), uptime.c_str());
     }
     ss << line;
   }
