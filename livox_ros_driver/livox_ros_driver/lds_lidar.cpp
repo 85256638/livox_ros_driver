@@ -630,6 +630,16 @@ void LdsLidar::LidarErrorStatusCb(livox_status status, uint8_t handle,
   LidarErrorCode ec = message->lidar_error_code;
   g_lds_ldiar->link_stat_[handle].health_code = message->error_code;
 
+  /** Track temp_status transitions (count + wall-clock time of last change). */
+  static uint8_t prev_temp[kMaxLidarCount] = {0};
+  static bool temp_seen[kMaxLidarCount] = {false};
+  if (temp_seen[handle] && ec.temp_status != prev_temp[handle]) {
+    g_lds_ldiar->link_stat_[handle].temp_change_count++;
+    g_lds_ldiar->link_stat_[handle].temp_change_wall_s = (int64_t)time(nullptr);
+  }
+  temp_seen[handle] = true;
+  prev_temp[handle] = ec.temp_status;
+
   /** Only print when one of the fields worth alerting on changes (ignore
    *  pps/ptp/time-sync churn that would otherwise spam every message). */
   uint32_t watch = (ec.temp_status) | (ec.volt_status << 2) |

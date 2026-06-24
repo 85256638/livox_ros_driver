@@ -220,8 +220,15 @@ handle  broadcast_code   state         temp  fan   recv/s  loss/s  drop/s   disc
 0       1PQDH5B00100041  Normal        OK    OK      2496       0       0      0         --    2h13m
 1       0TFDG3U99101431  Normal        WARN  OK      2498       2       0      7      3m12s    3m12s
 2       3WEDH5900103621  DISCONNECTED  -     -          -       -       -      2        45s       --
+temp_status changes:  L0:0@--  L1:1@09:12:44  L2:0@--
 (updated: 1718000000.0)
 ```
+
+底部 `temp_status changes` 行记录每台雷达**温度状态变化的次数和最近一次时间**：
+- `L0:0@--` → 0 号自启动以来温度状态从未变过（一直 OK）
+- `L1:1@09:12:44` → 1 号变过 1 次，最近一次在 09:12:44（此刻 temp 列显示的就是变化后的值）
+
+> 正常情况下全是 `:0@--`——这是对的，说明温度一直在正常区。一旦某台开始 `:1@时间`，就是它真的进过告警区，配合驱动终端的 `[LivoxHealth]` 行能看到具体变成了 WARN 还是 HOT!。
 
 #### 怎么读看板
 

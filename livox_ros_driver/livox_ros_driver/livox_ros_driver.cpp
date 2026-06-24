@@ -29,6 +29,7 @@
 #include <csignal>
 #include <sstream>
 #include <cstring>
+#include <ctime>
 
 #include <ros/ros.h>
 #include <std_msgs/String.h>
@@ -144,6 +145,19 @@ static const char *TempStr(uint32_t s) {
 }
 static const char *FanStr(uint32_t s) { return (s == 0) ? "OK" : "WARN"; }
 
+/** Format a wall-clock time_t as HH:MM:SS, or "--" when 0 (never). */
+static std::string FmtWall(int64_t t) {
+  if (t == 0) {
+    return "--";
+  }
+  time_t tt = (time_t)t;
+  struct tm tmv;
+  localtime_r(&tt, &tmv);
+  char buf[16];
+  strftime(buf, sizeof(buf), "%H:%M:%S", &tmv);
+  return std::string(buf);
+}
+
 /** Format a steady-clock duration (ns) as a short human string. */
 static std::string FmtDur(int64_t ns) {
   if (ns < 0) ns = 0;
@@ -231,6 +245,22 @@ void StatsTimerCb(const ros::TimerEvent &) {
   if (!any) {
     ss << "(no lidar seen yet)\n";
   }
+
+  /** Temp-status change history footer: per-lidar count + last change time. */
+  ss << "temp_status changes:";
+  bool any_temp_seen = false;
+  for (uint8_t h = 0; h < kMaxLidarCount; h++) {
+    if (!ever_seen[h]) {
+      continue;
+    }
+    any_temp_seen = true;
+    LdsLidar::LinkStat &ls = g_read_lidar->link_stat_[h];
+    char buf[48];
+    snprintf(buf, sizeof(buf), "  L%d:%u@%s", h, ls.temp_change_count,
+             FmtWall(ls.temp_change_wall_s).c_str());
+    ss << buf;
+  }
+  ss << (any_temp_seen ? "\n" : " (none)\n");
 
   std_msgs::String msg;
   msg.data = ss.str();
