@@ -42,6 +42,14 @@
 
 namespace livox_ros {
 
+/** Cap on zero-point packets back-filled into a single published cloud. The
+ *  publisher inserts zero packets to bridge timestamp gaps left by lost
+ *  packets so timestamps stay continuous; without a cap, a long dropout or
+ *  heavy loss would flood downstream with whole clouds of empty points for the
+ *  entire gap duration. Once the cap is reached we resync to the next real
+ *  packet instead of synthesizing more zeros. */
+static const uint32_t kMaxZeroFillPacketPerMsg = 10;
+
 /** Lidar Data Distribute Control--------------------------------------------*/
 Lddc::Lddc(int format, int multi_topic, int data_src, int output_type,
     double frq, std::string &frame_id, bool lidar_bag, bool imu_bag)
@@ -187,6 +195,7 @@ uint32_t Lddc::PublishPointcloud2(LidarDataQueue *queue, uint32_t packet_num,
   uint32_t line_num = GetLaserLineNumber(lidar->info.type);
   uint32_t echo_num = GetEchoNumPerPoint(lidar->raw_data_type);
   uint32_t is_zero_packet = 0;
+  uint32_t zero_packet_count = 0;
   while ((published_packet < packet_num) && !QueueIsEmpty(queue)) {
     QueuePrePop(queue, &storage_packet);
     LivoxEthPacket *raw_packet =
@@ -194,13 +203,15 @@ uint32_t Lddc::PublishPointcloud2(LidarDataQueue *queue, uint32_t packet_num,
     timestamp = GetStoragePacketTimestamp(&storage_packet, data_source);
     int64_t packet_gap = timestamp - last_timestamp;
     if ((packet_gap > lidar->packet_interval_max) &&
-        lidar->data_is_pubulished) {
+        lidar->data_is_pubulished &&
+        (zero_packet_count < kMaxZeroFillPacketPerMsg)) {
       // ROS_INFO("Lidar[%d] packet time interval is %ldns", handle,
       //     packet_gap);
       if (kSourceLvxFile != data_source) {
         timestamp = last_timestamp + lidar->packet_interval;
         ZeroPointDataOfStoragePacket(&storage_packet);
         is_zero_packet = 1;
+        ++zero_packet_count;
       }
     }
     /** Use the first packet timestamp as pointcloud2 msg timestamp */
@@ -305,6 +316,7 @@ uint32_t Lddc::PublishPointcloudData(LidarDataQueue *queue, uint32_t packet_num,
 
   uint8_t point_buf[2048];
   uint32_t is_zero_packet = 0;
+  uint32_t zero_packet_count = 0;
   uint8_t data_source = lidar->data_src;
   uint32_t line_num = GetLaserLineNumber(lidar->info.type);
   uint32_t echo_num = GetEchoNumPerPoint(lidar->raw_data_type);
@@ -315,12 +327,14 @@ uint32_t Lddc::PublishPointcloudData(LidarDataQueue *queue, uint32_t packet_num,
     timestamp = GetStoragePacketTimestamp(&storage_packet, data_source);
     int64_t packet_gap = timestamp - last_timestamp;
     if ((packet_gap > lidar->packet_interval_max) &&
-        lidar->data_is_pubulished) {
+        lidar->data_is_pubulished &&
+        (zero_packet_count < kMaxZeroFillPacketPerMsg)) {
       //ROS_INFO("Lidar[%d] packet time interval is %ldns", handle, packet_gap);
       if (kSourceLvxFile != data_source) {
         timestamp = last_timestamp + lidar->packet_interval;
         ZeroPointDataOfStoragePacket(&storage_packet);
         is_zero_packet = 1;
+        ++zero_packet_count;
       }
     }
     if (!published_packet) {
@@ -435,6 +449,7 @@ uint32_t Lddc::PublishCustomPointcloud(LidarDataQueue *queue,
   uint32_t published_packet = 0;
   uint32_t packet_offset_time = 0;  /** uint:ns */
   uint32_t is_zero_packet = 0;
+  uint32_t zero_packet_count = 0;
   while (published_packet < packet_num) {
     QueuePrePop(queue, &storage_packet);
     LivoxEthPacket *raw_packet =
@@ -442,13 +457,15 @@ uint32_t Lddc::PublishCustomPointcloud(LidarDataQueue *queue,
     timestamp = GetStoragePacketTimestamp(&storage_packet, data_source);
     int64_t packet_gap = timestamp - last_timestamp;
     if ((packet_gap > lidar->packet_interval_max) &&
-        lidar->data_is_pubulished) {
+        lidar->data_is_pubulished &&
+        (zero_packet_count < kMaxZeroFillPacketPerMsg)) {
       // ROS_INFO("Lidar[%d] packet time interval is %ldns", handle,
       // packet_gap);
       if (kSourceLvxFile != data_source) {
         timestamp = last_timestamp + lidar->packet_interval;
         ZeroPointDataOfStoragePacket(&storage_packet);
         is_zero_packet = 1;
+        ++zero_packet_count;
       }
     }
     /** first packet */
