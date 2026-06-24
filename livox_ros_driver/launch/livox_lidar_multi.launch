@@ -13,7 +13,7 @@
     <arg name="lidar_bag" default="false"/>
     <arg name="imu_bag" default="false"/>
     <arg name="max_distance" default="25.0"/>
-    <arg name="monitor" default="false"/>   <!-- true: auto-open the stats dashboard in its own terminal window -->
+    <arg name="monitor" default="true"/>   <!-- auto-open the stats dashboard in its own terminal window; set false on headless/SSH hosts -->
 
 
     <!-- Livox Configuration -->
