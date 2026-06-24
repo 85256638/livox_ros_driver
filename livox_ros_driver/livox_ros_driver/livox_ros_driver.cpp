@@ -246,21 +246,26 @@ void StatsTimerCb(const ros::TimerEvent &) {
     ss << "(no lidar seen yet)\n";
   }
 
-  /** Temp-status change history footer: per-lidar count + last change time. */
-  ss << "temp_status changes:";
-  bool any_temp_seen = false;
+  /** Temp-change footer: only list lidars that actually changed temp state,
+   *  otherwise a single plain "all normal" note. */
+  std::string temp_note;
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
     if (!ever_seen[h]) {
       continue;
     }
-    any_temp_seen = true;
     LdsLidar::LinkStat &ls = g_read_lidar->link_stat_[h];
-    char buf[48];
-    snprintf(buf, sizeof(buf), "  L%d:%u@%s", h, ls.temp_change_count,
-             FmtWall(ls.temp_change_wall_s).c_str());
-    ss << buf;
+    if (ls.temp_change_count > 0) {
+      char buf[80];
+      snprintf(buf, sizeof(buf), "  lidar %d: %u time(s), last at %s", h,
+               ls.temp_change_count, FmtWall(ls.temp_change_wall_s).c_str());
+      temp_note += buf;
+    }
   }
-  ss << (any_temp_seen ? "\n" : " (none)\n");
+  if (temp_note.empty()) {
+    ss << "Temp changes: none (all lidars normal since start)\n";
+  } else {
+    ss << "Temp changes:" << temp_note << "\n";
+  }
 
   std_msgs::String msg;
   msg.data = ss.str();
