@@ -57,6 +57,7 @@ class LdsLidar : public Lds {
                                       LidarMode mode);
   livox_status RequestLidarModeChange(uint8_t handle, LidarMode mode);
   livox_status RequestLidarReboot(uint8_t handle, uint16_t timeout_ms = 100);
+  livox_status RequestRestartSampling(uint8_t handle);
 
   /** Per-lidar connection history. Lives outside LidarDevice (which ResetLidar
    *  memsets on disconnect) so it survives disconnect/reconnect cycles. Read by

@@ -128,6 +128,9 @@ bool LidarRebootServiceCb(livox_ros_driver::LidarReboot::Request &req,
 
 /** Publisher for the per-second stats dashboard (std_msgs/String). */
 static ros::Publisher g_stats_pub;
+/** When true, the stats timer auto-recovers a lidar that is connected/Normal
+ *  but has produced no point cloud for a while (restart sampling, then reboot). */
+static bool g_auto_recover = false;
 
 static const char *LidarStateStr(uint8_t state) {
   switch (state) {
@@ -185,6 +188,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
   static uint32_t prev_drop[kMaxLidarCount] = {0};
   static bool ever_seen[kMaxLidarCount] = {false};
   static char last_bcode[kMaxLidarCount][kBdCodeSize + 1] = {{0}};
+  static uint32_t zero_secs[kMaxLidarCount] = {0};      /**< consecutive 1s ticks with no data while Normal */
+  static uint8_t recover_stage[kMaxLidarCount] = {0};   /**< 0=ok 1=restarted sampling 2=rebooted */
 
   int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
 
@@ -233,13 +238,46 @@ void StatsTimerCb(const ros::TimerEvent &) {
       prev_recv[h] = st.receive_packet_count;
       prev_loss[h] = st.loss_packet_count;
       prev_drop[h] = st.queue_drop_count;
+
+      /** A lidar in Normal state should be streaming; PowerSaving/Standby
+       *  legitimately produce no data, so only watch when state == Normal. */
+      bool should_stream = (l->info.state == kLidarStateNormal);
+      if (should_stream && d_recv == 0) {
+        zero_secs[h]++;
+      } else {
+        zero_secs[h] = 0;
+        recover_stage[h] = 0;
+      }
+
+      /** (B) Two-stage auto-recovery for a "Normal but no data" stall. */
+      if (g_auto_recover && should_stream) {
+        if (recover_stage[h] == 0 && zero_secs[h] >= 5) {
+          g_read_lidar->RequestRestartSampling(h);
+          ROS_WARN("[LivoxRecover] Lidar[%d] no data for 5s -> restart sampling",
+                   h);
+          recover_stage[h] = 1;
+        } else if (recover_stage[h] == 1 && zero_secs[h] >= 15) {
+          g_read_lidar->RequestLidarReboot(h);
+          ROS_WARN("[LivoxRecover] Lidar[%d] still no data for 15s -> reboot", h);
+          recover_stage[h] = 2;
+        } else if (recover_stage[h] == 2 && zero_secs[h] >= 45) {
+          recover_stage[h] = 0;  /** reboot didn't help; allow another cycle */
+        }
+      }
+
+      /** (A) Flag a connected-but-silent lidar loudly instead of "Normal". */
+      const char *st_str = LidarStateStr(l->info.state);
+      if (should_stream && zero_secs[h] >= 3) {
+        st_str = "NO DATA";
+      }
       snprintf(line, sizeof(line),
                "%-6d  %-15s  %-12s  %-4s  %-4s  %6u  %6u  %7s  %6u   %4u  %9s  %7s\n",
-               h, last_bcode[h], LidarStateStr(l->info.state), temp, fan,
-               d_recv, d_loss, losspct, d_drop, disc, last_drop.c_str(),
-               uptime.c_str());
+               h, last_bcode[h], st_str, temp, fan, d_recv, d_loss, losspct,
+               d_drop, disc, last_drop.c_str(), uptime.c_str());
     } else {
       prev_recv[h] = prev_loss[h] = prev_drop[h] = 0;
+      zero_secs[h] = 0;
+      recover_stage[h] = 0;
       snprintf(line, sizeof(line),
                "%-6d  %-15s  %-12s  %-4s  %-4s  %6s  %6s  %7s  %6s   %4u  %9s  %7s\n",
                h, last_bcode[h], "DISCONNECTED", "-", "-", "-", "-", losspct,
@@ -323,6 +361,7 @@ int main(int argc, char **argv) {
   livox_node.getParam("enable_lidar_bag", lidar_bag);
   livox_node.getParam("enable_imu_bag", imu_bag);
   livox_node.getParam("max_distance", max_distance);
+  livox_node.getParam("auto_recover", g_auto_recover);
   if (publish_freq > 100.0) {
     publish_freq = 100.0;
   } else if (publish_freq < 0.1) {
@@ -432,6 +471,8 @@ int main(int argc, char **argv) {
     g_stats_pub = livox_node.advertise<std_msgs::String>("livox/lidar_stats", 1);
     stats_timer = livox_node.createTimer(ros::Duration(1.0), StatsTimerCb);
     ROS_INFO("Publishing stats topic: livox/lidar_stats (1Hz)");
+    ROS_INFO("Auto-recover (Normal-but-no-data watchdog): %s",
+             g_auto_recover ? "ENABLED" : "disabled");
   }
 
   /** Use async spinner so service callbacks are processed in a separate thread,

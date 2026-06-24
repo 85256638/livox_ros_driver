@@ -244,7 +244,7 @@ Temp changes: none (all lidars normal since start)
 
 | 列 | 含义 |
 |----|------|
-| `state` | `Normal` 正常 / `DISCONNECTED` 掉线 / `PowerSaving` 节电 / `Error` 故障 |
+| `state` | `Normal` 正常 / `NO DATA` **连着但收不到点云**（假活，见下方）/ `DISCONNECTED` 掉线 / `PowerSaving` 节电 / `Error` 故障 |
 | `temp` | 温度状态 `OK` / `WARN`(偏高偏低) / `HOT!`(极端)。⚠️ 是状态码，**不是具体℃** |
 | `fan` | 风扇状态 `OK` 正常 / `WARN` **故障**（WARN 是风扇坏了，不是"在转"）|
 | `recv/s` | 每秒收到的点云包数（应稳定，多台 Horizon 约 2500/s）|
@@ -276,6 +276,32 @@ Livox SDK **不暴露具体温度数值**（如 62℃），那个 60℃ 风扇�
 过滤查看：`roslaunch ... 2>&1 | grep -E "LivoxEvent|LivoxHealth"`
 
 > `[LivoxHealth]` 只在 temp/fan/motor 等健康字段**变化时**才打印一行，所以正常时安静，一旦温度进告警区或风扇报故障会立刻看到。
+
+#### "假活"故障：state=Normal 但 recv/s=0
+
+Livox 的**心跳通道和点云数据通道是独立的**。偶尔会出现一台雷达**心跳正常上报 Normal，但点云输出卡死**——驱动以为它好好的，实际一个点都不出。看板会把这种情况标成 **`NO DATA`**（而不是 `Normal`），让它一眼扎眼。
+
+> 原因可能是固件卡住，或采样没真正启动。手动重启那台雷达即可恢复。
+
+#### 可选：自动恢复看门狗（`auto_recover`）
+
+默认关闭。开启后，驱动检测到"**连着 + Normal + 持续无数据**"会**两段式自动恢复**，省去人工重启：
+
+```bash
+roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
+```
+
+| 阶段 | 触发 | 动作 |
+|------|------|------|
+| 1（轻）| 无数据满 5 秒 | 重发 `StartSampling`（几乎无中断）|
+| 2（重）| 仍无数据满 15 秒 | `RebootDevice` 重启该雷达（~10 秒恢复）|
+
+- 只对 `Normal` 状态生效；**节电/待机**模式本就不出数据，不会被误恢复
+- 重启后该台会断开重连，恢复后计数自动清零
+- 每次动作打印 `[LivoxRecover]` 日志（带原因）
+- 启动时日志会显示 `Auto-recover ... : ENABLED / disabled`
+
+> ⚠️ 这是驱动**自主重启硬件**的行为，所以默认关闭、需显式开启。无显示器的机器也能用（它和看板无关）。
 
 > **某台 `loss/s` 持续 >0 → 重点排查那台的网线/接头/散热；某台 `DISCONNECTED` → 已掉线，可远程重启 `rosservice call /livox_lidar_reboot "{handle: N}"`。**
 

@@ -175,6 +175,18 @@ livox_status LdsLidar::RequestLidarReboot(uint8_t handle, uint16_t timeout_ms) {
   return RebootDevice(handle, timeout_ms, RebootCb, this);
 }
 
+livox_status LdsLidar::RequestRestartSampling(uint8_t handle) {
+  if (handle >= kMaxLidarCount) {
+    return kStatusInvalidHandle;
+  }
+  if (lidars_[handle].connect_state == kConnectStateOff) {
+    return kStatusNotConnected;
+  }
+  /** Re-issue start-sampling; harmless if already sampling, and recovers a
+   *  lidar that is Normal/connected but stopped producing point cloud. */
+  return LidarStartSampling(handle, StartSampleCb, this);
+}
+
 void LdsLidar::RememberBroadcastCode(uint8_t handle, const char *broadcast_code) {
   if (handle >= kMaxLidarCount || broadcast_code == nullptr ||
       broadcast_code[0] == '\0') {
