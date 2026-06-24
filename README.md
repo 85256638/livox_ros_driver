@@ -193,7 +193,16 @@ roslaunch livox_ros_driver livox_lidar.launch max_distance:=0
 
 驱动每秒发布 `livox/lidar_stats` topic。在**另一个终端**运行看板脚本，它会原地刷新（像 `htop`），永远显示当前值，且与驱动日志完全隔离。
 
-#### 使用步骤
+#### 用法一：启动驱动时自动弹出看板（一条命令）⭐最省事
+
+```bash
+roslaunch livox_ros_driver livox_lidar_multi.launch monitor:=true
+```
+驱动日志留在当前终端，看板会**自动弹出一个独立窗口**原地刷新，两者互不干扰。
+
+> 需要桌面环境（gnome-terminal + X11）。**无显示器/纯 SSH 的机器**别加 `monitor:=true`（弹不出窗口），改用下面的用法二。
+
+#### 用法二：手动两个终端（无桌面环境用这个）
 
 **① 确保已重新编译**（看板是新功能，旧版本没有）：
 ```bash

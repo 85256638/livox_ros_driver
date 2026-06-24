@@ -13,6 +13,7 @@
     <arg name="lidar_bag" default="false"/>
     <arg name="imu_bag" default="false"/>
     <arg name="max_distance" default="25.0"/>
+    <arg name="monitor" default="false"/>   <!-- true: auto-open the stats dashboard in its own terminal window -->
 
 
     <!-- Livox Configuration -->
@@ -54,6 +55,14 @@
           output="screen"/>
 
 
+
+    <!-- Optional: auto-open the live stats dashboard in its own terminal window.
+         Needs a desktop / gnome-terminal (X11 DISPLAY). Enable with monitor:=true.
+         Kept in a separate window so its in-place redraw never mixes with the
+         driver's scrolling logs. -->
+    <node if="$(arg monitor)" name="livox_stats_monitor" pkg="livox_ros_driver"
+          type="livox_stats_monitor.py" output="screen"
+          launch-prefix="gnome-terminal --wait --"/>
 
     <!-- Optional: Enable RViz -->
     <group if="$(arg rviz_enable)">
