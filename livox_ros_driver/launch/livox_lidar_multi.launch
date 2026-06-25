@@ -61,10 +61,12 @@
     <!-- Optional: auto-open the live stats dashboard in its own terminal window.
          Needs a desktop / gnome-terminal (X11 DISPLAY). Enable with monitor:=true.
          Kept in a separate window so its in-place redraw never mixes with the
-         driver's scrolling logs. -->
+         driver's scrolling logs.
+         --geometry=COLSxROWS sizes the window to fit the dashboard table
+         (112 cols x 12 rows). -->
     <node if="$(arg monitor)" name="livox_stats_monitor" pkg="livox_ros_driver"
           type="livox_stats_monitor.py" output="screen"
-          launch-prefix="gnome-terminal --wait --"/>
+          launch-prefix="gnome-terminal --geometry=112x12 --wait --"/>
 
     <!-- Optional: Enable RViz -->
     <group if="$(arg rviz_enable)">
