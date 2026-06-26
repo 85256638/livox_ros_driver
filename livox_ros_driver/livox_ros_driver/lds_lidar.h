@@ -69,6 +69,11 @@ class LdsLidar : public Lds {
     uint32_t health_code = 0;        /**< latest LidarErrorCode bits (temp/fan/...) */
     uint32_t temp_change_count = 0;  /**< times temp_status changed since start */
     int64_t temp_change_wall_s = 0;  /**< wall-clock (time_t) of last temp change, 0=never */
+    uint32_t fault_count = 0;        /**< times entered a motor/fan/volt/fw/system fault */
+    int64_t fault_wall_s = 0;        /**< wall-clock (time_t) of last fault onset, 0=never */
+    uint32_t fault_code = 0;         /**< health bits captured at last fault onset */
+    uint32_t recover_reboot_count = 0; /**< auto_recover reboots issued for this lidar */
+    int64_t recover_last_wall_s = 0;   /**< wall-clock (time_t) of last auto_recover reboot */
   };
   LinkStat link_stat_[kMaxLidarCount];
 

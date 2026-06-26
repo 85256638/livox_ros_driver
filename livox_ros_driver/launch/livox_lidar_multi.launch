@@ -62,12 +62,13 @@
          Needs a desktop / gnome-terminal (X11 DISPLAY). Enable with monitor:=true.
          Kept in a separate window so its in-place redraw never mixes with the
          driver's scrolling logs.
-         The window geometry is fixed at 118 cols x 12 rows to fit the
-         dashboard table (115 cols wide incl. the motor column) without
-         wrapping (see the geometry option in launch-prefix below). -->
+         The window geometry is fixed at 118 cols x 14 rows: 115 cols wide
+         (incl. the motor column) and tall enough for the table plus the
+         Temp/Fault/Auto-recover footer lines without clipping (see the
+         geometry option in launch-prefix below). -->
     <node if="$(arg monitor)" name="livox_stats_monitor" pkg="livox_ros_driver"
           type="livox_stats_monitor.py" output="screen"
-          launch-prefix="gnome-terminal --geometry=118x12 --wait --"/>
+          launch-prefix="gnome-terminal --geometry=118x14 --wait --"/>
 
     <!-- Optional: Enable RViz -->
     <group if="$(arg rviz_enable)">

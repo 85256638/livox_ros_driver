@@ -151,6 +151,24 @@ static const char *MotorStr(uint32_t s) {
   return (s == 0) ? "OK" : (s == 1) ? "WARN" : "ERR!";
 }
 
+/** Decode a health code into a short "+"-joined tag of the faulted fields
+ *  (e.g. "motor+fan"), for the dashboard's fault-event history. */
+static std::string FaultTags(uint32_t code) {
+  ErrorMessage em;
+  em.error_code = code;
+  const LidarErrorCode &e = em.lidar_error_code;
+  std::string s;
+  auto add = [&](uint32_t bad, const char *tag) {
+    if (bad) { if (!s.empty()) s += "+"; s += tag; }
+  };
+  add(e.motor_status, "motor");
+  add(e.fan_status, "fan");
+  add(e.volt_status, "volt");
+  add(e.firmware_err, "fw");
+  add(e.system_status, "sys");
+  return s.empty() ? "?" : s;
+}
+
 /** Format a wall-clock time_t as HH:MM:SS, or "--" when 0 (never). */
 static std::string FmtWall(int64_t t) {
   if (t == 0) {
@@ -179,6 +197,15 @@ static std::string FmtDur(int64_t ns) {
   return std::string(buf);
 }
 
+/** auto_recover policy for a lidar stuck in Error state (e.g. a motor fault):
+ *  reboot after it has been in Error for kErrorRebootDelaySec, then retry once
+ *  every kErrorRebootCooldownSec, up to kErrorRebootMaxAttempts times. After
+ *  that, stop rebooting and flag for manual intervention -- this avoids
+ *  reboot-looping a physically dead fan/motor that a reboot cannot fix. */
+static const uint32_t kErrorRebootDelaySec    = 5;
+static const uint32_t kErrorRebootCooldownSec = 40;
+static const uint32_t kErrorRebootMaxAttempts = 3;
+
 /** Timer callback (runs on the AsyncSpinner thread, independent of the data
  *  loop so it keeps updating even if a lidar stops sending). Publishes a
  *  preformatted dashboard of all connected lidars. */
@@ -193,6 +220,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
   static char last_bcode[kMaxLidarCount][kBdCodeSize + 1] = {{0}};
   static uint32_t zero_secs[kMaxLidarCount] = {0};      /**< consecutive 1s ticks with no data while Normal */
   static uint8_t recover_stage[kMaxLidarCount] = {0};   /**< 0=ok 1=restarted sampling 2=rebooted */
+  static uint32_t error_secs[kMaxLidarCount] = {0};     /**< consecutive 1s ticks in Error state */
+  static uint8_t error_reboots[kMaxLidarCount] = {0};   /**< reboots attempted this Error episode */
 
   int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
 
@@ -262,10 +291,47 @@ void StatsTimerCb(const ros::TimerEvent &) {
           recover_stage[h] = 1;
         } else if (recover_stage[h] == 1 && zero_secs[h] >= 15) {
           g_read_lidar->RequestLidarReboot(h);
+          ls.recover_reboot_count++;
+          ls.recover_last_wall_s = (int64_t)time(nullptr);
           ROS_WARN("[LivoxRecover] Lidar[%d] still no data for 15s -> reboot", h);
           recover_stage[h] = 2;
         } else if (recover_stage[h] == 2 && zero_secs[h] >= 45) {
           recover_stage[h] = 0;  /** reboot didn't help; allow another cycle */
+        }
+      }
+
+      /** (C) Error-state auto-recovery. A lidar reporting Error (e.g. a
+       *  recoverable motor fault) never counts as "streaming", so path (B)
+       *  above ignores it. Reboot just this lidar on a bounded schedule. */
+      bool in_error = (l->info.state == kLidarStateError);
+      if (in_error) {
+        error_secs[h]++;
+      } else {
+        error_secs[h] = 0;      /** left Error (recovered or other state) */
+        error_reboots[h] = 0;
+      }
+      if (g_auto_recover && in_error) {
+        if (error_reboots[h] < kErrorRebootMaxAttempts) {
+          /** reboot #n is due at delay + n*cooldown seconds in Error
+           *  (5s, 45s, 85s for delay=5, cooldown=40). error_secs is frozen
+           *  while the lidar is disconnected mid-reboot, so the real gap is
+           *  the cooldown plus reconnect time. */
+          uint32_t due = kErrorRebootDelaySec +
+                         error_reboots[h] * kErrorRebootCooldownSec;
+          if (error_secs[h] >= due) {
+            g_read_lidar->RequestLidarReboot(h);
+            ls.recover_reboot_count++;
+            ls.recover_last_wall_s = (int64_t)time(nullptr);
+            error_reboots[h]++;
+            ROS_WARN("[LivoxRecover] Lidar[%d] in Error %us -> reboot "
+                     "(attempt %u/%u)", h, error_secs[h], error_reboots[h],
+                     kErrorRebootMaxAttempts);
+          }
+        } else if ((error_secs[h] % 30) == 0) {
+          /** Exhausted attempts: stop rebooting, warn loudly every 30s. */
+          ROS_ERROR("[LivoxRecover] Lidar[%d] still in Error after %u reboots; "
+                    "manual intervention needed (likely fan/motor hardware "
+                    "fault)", h, kErrorRebootMaxAttempts);
         }
       }
 
@@ -312,6 +378,47 @@ void StatsTimerCb(const ros::TimerEvent &) {
     ss << "Temp changes: none (all lidars normal since start)\n";
   } else {
     ss << "Temp changes:" << temp_note << "\n";
+  }
+
+  /** Fault-event footer: motor/fan/volt/fw/system faults since start, kept
+   *  even after the lidar recovers (live columns only show current state). */
+  std::string fault_note;
+  for (uint8_t h = 0; h < kMaxLidarCount; h++) {
+    if (!ever_seen[h]) {
+      continue;
+    }
+    LdsLidar::LinkStat &ls = g_read_lidar->link_stat_[h];
+    if (ls.fault_count > 0) {
+      char buf[96];
+      snprintf(buf, sizeof(buf), "  lidar %d: %u time(s) (%s), last at %s", h,
+               ls.fault_count, FaultTags(ls.fault_code).c_str(),
+               FmtWall(ls.fault_wall_s).c_str());
+      fault_note += buf;
+    }
+  }
+  if (fault_note.empty()) {
+    ss << "Fault events: none (no motor/fan/volt/fw/system fault since start)\n";
+  } else {
+    ss << "Fault events:" << fault_note << "\n";
+  }
+
+  /** Auto-recover footer: watchdog reboots issued (only shown when non-zero,
+   *  so it stays hidden unless auto_recover actually acted). */
+  std::string rec_note;
+  for (uint8_t h = 0; h < kMaxLidarCount; h++) {
+    if (!ever_seen[h]) {
+      continue;
+    }
+    LdsLidar::LinkStat &ls = g_read_lidar->link_stat_[h];
+    if (ls.recover_reboot_count > 0) {
+      char buf[80];
+      snprintf(buf, sizeof(buf), "  lidar %d: %u reboot(s), last at %s", h,
+               ls.recover_reboot_count, FmtWall(ls.recover_last_wall_s).c_str());
+      rec_note += buf;
+    }
+  }
+  if (!rec_note.empty()) {
+    ss << "Auto-recover:" << rec_note << "\n";
   }
 
   std_msgs::String msg;

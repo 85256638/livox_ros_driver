@@ -652,6 +652,19 @@ void LdsLidar::LidarErrorStatusCb(livox_status status, uint8_t handle,
   temp_seen[handle] = true;
   prev_temp[handle] = ec.temp_status;
 
+  /** Track fault onsets (motor/fan/volt/firmware/system going bad) so the
+   *  dashboard keeps a record even after the lidar recovers -- the live
+   *  columns only ever show the current state. Count the rising edge only. */
+  static bool prev_fault[kMaxLidarCount] = {false};
+  bool fault = (ec.motor_status || ec.fan_status || ec.volt_status ||
+                ec.firmware_err || ec.system_status);
+  if (fault && !prev_fault[handle]) {
+    g_lds_ldiar->link_stat_[handle].fault_count++;
+    g_lds_ldiar->link_stat_[handle].fault_wall_s = (int64_t)time(nullptr);
+    g_lds_ldiar->link_stat_[handle].fault_code = message->error_code;
+  }
+  prev_fault[handle] = fault;
+
   /** Only print when one of the fields worth alerting on changes (ignore
    *  pps/ptp/time-sync churn that would otherwise spam every message). */
   uint32_t watch = (ec.temp_status) | (ec.volt_status << 2) |

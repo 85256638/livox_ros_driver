@@ -7,10 +7,12 @@
 3. **可配置点云距离过滤** — 通过 launch 参数设置最大发布距离，无需重新编译
 4. **掉线崩溃修复（UAF）** — 修复官方驱动在雷达掉线时的 use-after-free 竞态崩溃
 5. **状态抖动断流修复** — 避免温度/电机告警等瞬时状态抖动导致话题断流
-6. **丢包可视化** — 异常时日志告警 + `livox/lidar_stats` 实时看板（独立终端原地刷新）
+6. **健康与丢包监控** — 异常日志告警 + `livox/lidar_stats` 实时看板（温度/风扇/**电机**状态、丢包、掉线，独立终端原地刷新，底部含**故障/自动恢复历史**）
 7. **畸形包硬化** — 拒绝非法 `data_type`，堵住缓冲区溢出
+8. **零点洪泛防护** — 大丢包/掉线时限制零点回填，避免整片假点污染融合点云
+9. **自动恢复看门狗（可选）** — 检测到假活（`Normal` 但无数据）或 `Error`（如电机故障）时自动重启该雷达，带重试上限防死循环
 
-> 功能 1/2 需配套修改版 SDK；功能 3~7 为纯 ROS 驱动层改动，配任意 SDK 均可用。详见各章节。
+> 功能 1/2 需配套修改版 SDK；功能 3~9 为纯 ROS 驱动层改动，配任意 SDK 均可用。详见各章节。
 
 ---
 
@@ -166,6 +168,12 @@ roslaunch livox_ros_driver livox_lidar.launch max_distance:=0
 
 **修复**：仅在「确实从节电/待机恢复」或「我们主动请求的 Normal 切换正在完成」时才重配置，瞬时告警抖动不再打断已在采样的雷达。
 
+### 3. 零点洪泛防护（大丢包/掉线时）
+
+**官方行为**：检测到时间戳缺口（丢包或短暂掉线）时，驱动会用**零点包**（点全在原点 0,0,0）回填以保持时间戳连续。但回填**无上限**——长掉线或重丢包时会把整个发布预算耗在零点包上，导致下游连续多帧收到整片原点假点，污染多雷达融合点云、浪费 CPU/带宽，还会掩盖真正在退化的雷达。
+
+**修复**：每帧点云的零点回填**最多 10 个包**（`kMaxZeroFillPacketPerMsg`），到上限即停止补零、转去处理真实包并重同步时间戳。三处发布路径（`PublishPointcloud2` / `PublishPointcloudData` / `PublishCustomPointcloud`）一致生效。正常无缺口时计数恒为 0、**行为完全不变**；只在病态丢包下从"无底洞灌假点"变成"补几个就回到真数据"。保留了小丢包（1~2 包）补零以维持时间戳连续的合理用途。
+
 ---
 
 ## 新增功能四：丢包可视化
@@ -231,14 +239,16 @@ rosrun livox_ros_driver livox_stats_monitor.py
 看板效果（掉线的雷达会明确标 `DISCONNECTED`，不会从看板上消失）：
 ```
 ===== Livox LiDAR Stats (1Hz) =====
-handle  broadcast_code   state         temp  fan   recv/s  loss/s  loss%    drop/s   disc  last_drop   uptime
-0       3WEDH7600111191  Normal        OK    OK      2496       0   0.00%        0      0         --    2h13m
-1       3WEDH7600103661  Normal        OK    OK      2498       0   2.24%        0      3      8m05s    8m05s
-2       3WEDH5900100671  Normal        OK    OK      2497       0   0.00%        0      0         --    2h13m
+handle  broadcast_code   state         temp  fan   motor recv/s  loss/s  loss%    drop/s   disc  last_drop   uptime
+0       3WEDH7600111191  Normal        OK    OK    OK      2496       0    0.00%       0      0         --    2h13m
+1       3WEDH7600103661  Normal        OK    OK    OK      2498       0    2.24%       0      3      8m05s    8m05s
+2       3WEDH5900100671  Normal        OK    OK    OK      2497       0    0.00%       0      0         --    2h13m
 Temp changes: none (all lidars normal since start)
+Fault events:  lidar 1: 1 time(s) (motor+fan), last at 13:46:03
+Auto-recover:  lidar 1: 1 reboot(s), last at 13:46:08
 (updated: 1718000000.0)
 ```
-上例 1 号 `loss% = 2.24%` 明显高于其它（其它 0.00%）——说明它**累计**丢得多（历史上有过一段网络差的时期），是最该排查的那台。
+上例 1 号 `loss% = 2.24%` 明显高于其它（其它 0.00%）——说明它**累计**丢得多，是最该排查的那台。底部的 **Fault events / Auto-recover** 还显示它早些时候出过一次 `motor+fan` 故障、被自动重启过一次（虽然现在已恢复 `Normal`）——这种"出过事但已恢复"的历史，实时那几列是看不到的。
 
 #### 怎么读看板
 
@@ -247,6 +257,7 @@ Temp changes: none (all lidars normal since start)
 | `state` | `Normal` 正常 / `NO DATA` **连着但收不到点云**（假活，见下方）/ `DISCONNECTED` 掉线 / `PowerSaving` 节电 / `Error` 故障 |
 | `temp` | 温度状态 `OK` / `WARN`(偏高偏低) / `HOT!`(极端)。⚠️ 是状态码，**不是具体℃** |
 | `fan` | 风扇状态 `OK` 正常 / `WARN` **故障**（WARN 是风扇坏了，不是"在转"）|
+| `motor` | 电机（扫描)状态 `OK` 正常 / `WARN` 告警 / `ERR!` **错误，无法工作**（`ERR!` 意味着停止扫描、不再出点）|
 | `recv/s` | 每秒收到的点云包数（应稳定，多台 Horizon 约 2500/s）|
 | `loss/s` | **瞬时**每秒网络丢包数（看当下有没有在掉，正常时常为 0）|
 | `loss%` | **累计**网络丢包率（看这台从启动到现在总体掉了多少，哪台不靠谱一眼看出）|
@@ -256,6 +267,18 @@ Temp changes: none (all lidars normal since start)
 | `uptime` | 本次连接已稳定多久 |
 
 > **`loss/s` vs `loss%` 的区别**：`loss/s` 是当下这一秒的瞬时值（偶发小抖动会一闪而过、平时是 0）；`loss%` 是从启动累计的总丢包率（小抖动会慢慢累积体现出来）。**判断哪台最该换**就看 `loss%` 高、`disc` 多、`uptime` 短的那台。
+
+#### 看板底部：历史事件（恢复后也一直记着）
+
+实时那几列只反映**当下**状态——一台雷达出过故障但又恢复了，列里就什么都看不出来了。所以看板底部有三行**历史**，从启动累计，方便发现"间歇性发作"的问题雷达：
+
+| 底部行 | 含义 |
+|--------|------|
+| `Temp changes` | 各台温度状态变化的次数 + 上次时间（频繁变化 = 散热不稳）|
+| `Fault events` | 各台进入 **motor/fan/volt/fw/system** 故障的次数 + 上次时间 + **是哪几项**（如 `motor+fan`）。只记"从好变坏"那一下；**雷达恢复后这条仍保留** |
+| `Auto-recover` | 看门狗（`auto_recover`）给各台发过几次自动重启 + 上次时间。**只有真发生过自动重启才显示这行**（没开或没触发时不显示）|
+
+> 排障套路：某台 `Fault events` 反复累加、或 `Auto-recover` 次数不断上涨，就是它在反复发作——结合 `Fault events` 的标签（比如老是 `motor+fan`）基本能锁定是风扇/电机硬件在衰竭，该停机物理检查/更换了。
 
 #### 关于温度与风扇（重要说明）
 
@@ -285,11 +308,13 @@ Livox 的**心跳通道和点云数据通道是独立的**。偶尔会出现一�
 
 #### 可选：自动恢复看门狗（`auto_recover`）
 
-默认关闭。开启后，驱动检测到"**连着 + Normal + 持续无数据**"会**两段式自动恢复**，省去人工重启：
+默认关闭。开启后，驱动对**两类故障**自动恢复，省去人工重启：
 
 ```bash
 roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
 ```
+
+**情况 A：假活（连着 + `Normal` + 持续无数据）** —— 两段式：
 
 | 阶段 | 触发 | 动作 |
 |------|------|------|
@@ -297,9 +322,19 @@ roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
 | 2（重）| 仍无数据满 15 秒 | `RebootDevice` 重启该雷达（~10 秒恢复）|
 
 - 只对 `Normal` 状态生效；**节电/待机**模式本就不出数据，不会被误恢复
-- 重启后该台会断开重连，恢复后计数自动清零
-- 每次动作打印 `[LivoxRecover]` 日志（带原因）
-- 启动时日志会显示 `Auto-recover ... : ENABLED / disabled`
+
+**情况 B：`Error` 状态（如电机故障 `motor=ERR!`）** —— 这类故障雷达自报 `Error`、不算"在出数据"，情况 A 抓不到，单独处理：
+
+| 触发 | 动作 |
+|------|------|
+| 进入 `Error` 满 **5 秒** | 重启该雷达（第 1 次）|
+| 重连后仍 `Error`，每再过 **~40 秒** | 再重启，**最多 3 次** |
+| 3 次后仍 `Error` | **停止重启**，每 30 秒打一条 `[LivoxRecover]` `ERROR` 告警"需人工处理（多半是风扇/电机硬件坏了）" |
+
+- 设了上限是为了**避免死循环刷重启**：风扇/电机真物理损坏时，重启救不回来，试 3 次就放弃并明确报警，而不是无限重启掩盖故障
+- 恢复 `Normal` 后计数自动清零；冷却按"重连后仍 `Error` 的 40 秒"算，偏保守（给它时间稳定）
+
+两类共同点：只重启**出问题的那一台**；每次动作打印 `[LivoxRecover]` 日志；动作次数会出现在看板底部 `Auto-recover` 行；启动时日志显示 `Auto-recover ... : ENABLED / disabled`。
 
 > ⚠️ 这是驱动**自主重启硬件**的行为，所以默认关闭、需显式开启。无显示器的机器也能用（它和看板无关）。
 
