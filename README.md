@@ -28,9 +28,13 @@
 
 ```bash
 cd ~/catkin_ws
-catkin_make
+catkin_make -DPYTHON_EXECUTABLE=/usr/bin/python3
 source devel/setup.bash
 ```
+
+> - 加 `-DPYTHON_EXECUTABLE=/usr/bin/python3` 是**强制 catkin 用系统 python3**，避免 conda 等环境让它选错 python（否则编译或运行报 python 相关错）。比 `conda deactivate` 更稳，不受当前环境影响。
+> - 新版 CMake（≥3.27）若报 policy 版本错，再补 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`。
+> - ⚠️ **编译用的 `catkin_ws` 必须和下面 systemd 服务里 `source` 的是同一个目录**，否则你编译了、服务却跑的是另一份旧的，改动不生效还极难排查。
 
 ### 启动
 
@@ -41,6 +45,67 @@ roslaunch livox_ros_driver livox_lidar.launch
 # 多雷达
 roslaunch livox_ros_driver livox_lidar_multi.launch
 ```
+
+> 上面是**手动启动**（在桌面上调试用，会自动弹看板）。**生产 24/7 无人值守请用下面的 systemd 服务**，不要手动 roslaunch。
+
+### 生产部署（systemd：开机自启 + 崩溃自重启 + 无人值守自愈）
+
+把驱动跑成系统服务，这样**断电通电后自动启动、进程崩溃后自动重启**，无需人工敲命令。
+
+**① 服务文件** `/etc/systemd/system/livox-ros-driver.service`（把 `<USER>` 换成实际用户名）：
+
+```ini
+[Unit]
+Description=Livox ROS Driver
+After=network-online.target roscore.service
+Wants=network-online.target
+Wants=roscore.service
+
+[Service]
+Type=simple
+User=<USER>
+Group=<USER>
+WorkingDirectory=/home/<USER>
+Environment=HOME=/home/<USER>
+Environment=ROS_MASTER_URI=http://localhost:11311
+Environment=ROS_HOSTNAME=localhost
+# ⚠️ 这里 source 的 catkin_ws 必须和你编译用的是同一个目录
+ExecStart=/bin/bash -lc 'source /opt/ros/noetic/setup.bash && source /home/<USER>/catkin_ws/devel/setup.bash && exec roslaunch livox_ros_driver livox_lidar_multi.launch monitor:=false auto_recover:=true health_log:=true'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**② 为什么 ExecStart 末尾要带这三个参数**（命令行 `arg:=value` 会覆盖 launch 文件的默认值，且贯穿到驱动）：
+
+| 参数 | 生产值 | 原因 |
+|------|--------|------|
+| `monitor` | **`false`** | 后台服务**无图形界面**，自动弹 `gnome-terminal` 看板会弹不出来报错。想看看板时单独 `rosrun livox_ros_driver livox_stats_monitor.py` |
+| `auto_recover` | **`true`** | 无人值守时雷达故障（假活 / `Error`）**自动重启自愈**，不必等人 |
+| `health_log` | **`true`** | 健康事件 + 网络趋势**落盘取证**，供事后排查 |
+
+> 这三个值只对服务生效；你**手动 `roslaunch`** 时不带参数，仍是 `monitor:=true`（看板弹出）等默认值，两个场景各取所需、互不影响。
+
+**③ 启用并启动**：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable livox-ros-driver     # 开机自启（光有 [Install] 还不够，必须 enable）
+sudo systemctl restart livox-ros-driver
+```
+
+**④ 验证全部生效**：
+
+```bash
+# 自愈 + 日志开了没（应看到两条 ENABLED）
+journalctl -u livox-ros-driver -b | grep -iE "Auto-recover|Health logging"
+# 开机自启开了没（应显示 enabled）
+systemctl is-enabled livox-ros-driver
+```
+
+> ⚠️ **`health_log` 的目录必须先存在**：若用了 `health_log_dir:=/some/path`，先 `mkdir -p /some/path`；否则首次写盘失败会**自动禁用日志**（驱动不受影响，但日志不写）。确认日志在写：`ls -la <日志目录>/`，应出现 `livox_events_YYYY-MM-DD.csv`（快照文件 `livox_snapshot_*` 要等第一个周期，默认 10 分钟）。
 
 ---
 
