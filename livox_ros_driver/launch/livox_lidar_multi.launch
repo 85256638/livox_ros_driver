@@ -15,6 +15,9 @@
     <arg name="max_distance" default="25.0"/>
     <arg name="monitor" default="true"/>   <!-- auto-open the stats dashboard in its own terminal window; set false on headless/SSH hosts -->
     <arg name="auto_recover" default="false"/>   <!-- true: auto-recover a Normal-but-no-data lidar (restart sampling, then reboot) -->
+    <arg name="health_log" default="false"/>   <!-- true: write CSV health logs (edge-triggered events + periodic snapshot) for long-run trend/forensics -->
+    <arg name="health_log_dir" default=""/>   <!-- output dir; empty = node working dir (~/.ros). Must already exist -->
+    <arg name="health_log_snapshot_s" default="600"/>   <!-- snapshot cadence in seconds; events are always logged the instant they happen -->
 
 
     <!-- Livox Configuration -->
@@ -45,6 +48,9 @@
     <param name="enable_imu_bag" type="bool" value="$(arg imu_bag)"/>
     <param name="max_distance" type="double" value="$(arg max_distance)"/>   <!-- 加这行 -->
     <param name="auto_recover" type="bool" value="$(arg auto_recover)"/>
+    <param name="health_log" type="bool" value="$(arg health_log)"/>
+    <param name="health_log_dir" type="string" value="$(arg health_log_dir)"/>
+    <param name="health_log_snapshot_s" type="int" value="$(arg health_log_snapshot_s)"/>
 
 
     <!-- Add TF Transformations for 4 LiDARs -->

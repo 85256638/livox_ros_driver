@@ -33,6 +33,7 @@
 
 #include <ros/ros.h>
 #include <std_msgs/String.h>
+#include "health_logger.h"
 #include "lddc.h"
 #include "lds_hub.h"
 #include "lds_lidar.h"
@@ -163,6 +164,7 @@ static std::string FaultTags(uint32_t code) {
   };
   add(e.motor_status, "motor");
   add(e.fan_status, "fan");
+  add(e.dirty_warn, "dirty");
   add(e.volt_status, "volt");
   add(e.firmware_err, "fw");
   add(e.system_status, "sys");
@@ -225,10 +227,22 @@ void StatsTimerCb(const ros::TimerEvent &) {
 
   int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
 
+  /** Snapshot pacing for the persistent health log: one row per lidar every
+   *  snapshot_period_s (this timer ticks at 1 Hz). Events are logged elsewhere,
+   *  edge-triggered. Snapshot carries cumulative counters so two rows difference
+   *  into that interval's loss/recv totals with no gap. */
+  HealthLogger &hlog = HealthLogger::Get();
+  static int snap_counter = 0;
+  bool do_snapshot = false;
+  if (hlog.enabled() && ++snap_counter >= hlog.snapshot_period_s()) {
+    snap_counter = 0;
+    do_snapshot = true;
+  }
+
   std::ostringstream ss;
   ss << "===== Livox LiDAR Stats (1Hz) =====\n";
   ss << "handle  broadcast_code   state         temp  fan   motor recv/s  loss/s  "
-        "loss%    drop/s   disc  last_drop   uptime\n";
+        "loss%    drop/s   disc  down_for   uptime\n";
   bool any = false;
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
     LidarDevice *l = &g_read_lidar->lidars_[h];
@@ -248,8 +262,18 @@ void StatsTimerCb(const ros::TimerEvent &) {
     LidarPacketStatistic &st = l->statistic_info;
     LdsLidar::LinkStat &ls = g_read_lidar->link_stat_[h];
     uint32_t disc = ls.disconnect_count;
-    std::string last_drop =
-        ls.last_disconnect_ns ? FmtDur(now_ns - ls.last_disconnect_ns) : "--";
+    /** How long the most recent outage lasted: if currently disconnected it is
+     *  the still-growing down time; if reconnected it is the duration of the
+     *  last completed outage (reconnect - disconnect). More useful than "time
+     *  since last drop", which once reconnected just mirrors uptime. */
+    std::string down_for;
+    if (ls.last_disconnect_ns == 0) {
+      down_for = "--";  /** never dropped */
+    } else if (connected && ls.connect_since_ns) {
+      down_for = FmtDur(ls.connect_since_ns - ls.last_disconnect_ns);
+    } else {
+      down_for = FmtDur(now_ns - ls.last_disconnect_ns);  /** still down */
+    }
     std::string uptime = (connected && ls.connect_since_ns)
                              ? FmtDur(now_ns - ls.connect_since_ns)
                              : "--";
@@ -263,6 +287,11 @@ void StatsTimerCb(const ros::TimerEvent &) {
     char losspct[12];
     snprintf(losspct, sizeof(losspct), "%.2f%%",
              tot ? (100.0 * st.loss_packet_count / tot) : 0.0);
+    /** Extra fields the snapshot log wants (MotorStr also maps the 3-level
+     *  system_status: 0/1/2 -> OK/WARN/ERR!). */
+    unsigned dirty = em.lidar_error_code.dirty_warn;
+    const char *sys = MotorStr(em.lidar_error_code.system_status);
+    double loss_pct_d = tot ? (100.0 * st.loss_packet_count / tot) : 0.0;
     char line[256];
     if (connected) {
       uint32_t d_recv = st.receive_packet_count - prev_recv[h];
@@ -294,6 +323,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
           ls.recover_reboot_count++;
           ls.recover_last_wall_s = (int64_t)time(nullptr);
           ROS_WARN("[LivoxRecover] Lidar[%d] still no data for 15s -> reboot", h);
+          hlog.LogEvent(h, last_bcode[h], "REBOOT", "no-data 15s");
           recover_stage[h] = 2;
         } else if (recover_stage[h] == 2 && zero_secs[h] >= 45) {
           recover_stage[h] = 0;  /** reboot didn't help; allow another cycle */
@@ -326,6 +356,10 @@ void StatsTimerCb(const ros::TimerEvent &) {
             ROS_WARN("[LivoxRecover] Lidar[%d] in Error %us -> reboot "
                      "(attempt %u/%u)", h, error_secs[h], error_reboots[h],
                      kErrorRebootMaxAttempts);
+            char rb[40];
+            snprintf(rb, sizeof(rb), "Error %us attempt %u/%u", error_secs[h],
+                     error_reboots[h], kErrorRebootMaxAttempts);
+            hlog.LogEvent(h, last_bcode[h], "REBOOT", rb);
           }
         } else if ((error_secs[h] % 30) == 0) {
           /** Exhausted attempts: stop rebooting, warn loudly every 30s. */
@@ -343,7 +377,12 @@ void StatsTimerCb(const ros::TimerEvent &) {
       snprintf(line, sizeof(line),
                "%-6d  %-15s  %-12s  %-4s  %-4s  %-4s  %6u  %6u  %7s  %6u   %4u  %9s  %7s\n",
                h, last_bcode[h], st_str, temp, fan, motor, d_recv, d_loss, losspct,
-               d_drop, disc, last_drop.c_str(), uptime.c_str());
+               d_drop, disc, down_for.c_str(), uptime.c_str());
+      if (do_snapshot) {
+        hlog.LogSnapshot(h, last_bcode[h], st_str, temp, fan, motor, dirty, sys,
+                         st.receive_packet_count, st.loss_packet_count,
+                         st.queue_drop_count, loss_pct_d, disc);
+      }
     } else {
       prev_recv[h] = prev_loss[h] = prev_drop[h] = 0;
       zero_secs[h] = 0;
@@ -351,7 +390,12 @@ void StatsTimerCb(const ros::TimerEvent &) {
       snprintf(line, sizeof(line),
                "%-6d  %-15s  %-12s  %-4s  %-4s  %-4s  %6s  %6s  %7s  %6s   %4u  %9s  %7s\n",
                h, last_bcode[h], "DISCONNECTED", "-", "-", "-", "-", "-", losspct,
-               "-", disc, last_drop.c_str(), uptime.c_str());
+               "-", disc, down_for.c_str(), uptime.c_str());
+      if (do_snapshot) {
+        hlog.LogSnapshot(h, last_bcode[h], "DISCONNECTED", "-", "-", "-", 0, "-",
+                         st.receive_packet_count, st.loss_packet_count,
+                         st.queue_drop_count, loss_pct_d, disc);
+      }
     }
     ss << line;
   }
@@ -397,7 +441,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
     }
   }
   if (fault_note.empty()) {
-    ss << "Fault events: none (no motor/fan/volt/fw/system fault since start)\n";
+    ss << "Fault events: none (no motor/fan/dirty/volt/fw/system fault since "
+          "start)\n";
   } else {
     ss << "Fault events:" << fault_note << "\n";
   }
@@ -473,6 +518,30 @@ int main(int argc, char **argv) {
   livox_node.getParam("enable_imu_bag", imu_bag);
   livox_node.getParam("max_distance", max_distance);
   livox_node.getParam("auto_recover", g_auto_recover);
+
+  /** Optional persistent CSV health logging (events + periodic snapshot) for
+   *  long-run, unattended deployments. Off by default. */
+  bool health_log = false;
+  std::string health_log_dir;
+  int health_log_snapshot_s = 600;
+  livox_node.getParam("health_log", health_log);
+  livox_node.getParam("health_log_dir", health_log_dir);
+  livox_node.getParam("health_log_snapshot_s", health_log_snapshot_s);
+  if (health_log) {
+    HealthLogger::Get().Enable(health_log_dir, health_log_snapshot_s);
+    ROS_INFO("Health logging ENABLED -> dir='%s', snapshot every %ds (events "
+             "always edge-triggered)",
+             health_log_dir.empty() ? "(node cwd, ~/.ros)"
+                                    : health_log_dir.c_str(),
+             health_log_snapshot_s);
+    /** Marker row so multiple runs that share a day's file are easy to tell
+     *  apart (the log is append-only and keyed on date, not on run/PID). */
+    HealthLogger::Get().LogEvent(
+        -1, "-", "STARTUP",
+        std::string("driver ") + LIVOX_ROS_DRIVER_VERSION_STRING);
+  } else {
+    ROS_INFO("Health logging disabled (enable with health_log:=true)");
+  }
   if (publish_freq > 100.0) {
     publish_freq = 100.0;
   } else if (publish_freq < 0.1) {

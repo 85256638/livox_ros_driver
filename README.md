@@ -11,8 +11,9 @@
 7. **畸形包硬化** — 拒绝非法 `data_type`，堵住缓冲区溢出
 8. **零点洪泛防护** — 大丢包/掉线时限制零点回填，避免整片假点污染融合点云
 9. **自动恢复看门狗（可选）** — 检测到假活（`Normal` 但无数据）或 `Error`（如电机故障）时自动重启该雷达，带重试上限防死循环
+10. **持久化健康日志（可选）** — 把健康事件与网络趋势落盘成 CSV（边沿事件 + 周期快照），供长期无人值守的趋势分析与故障取证
 
-> 功能 1/2 需配套修改版 SDK；功能 3~9 为纯 ROS 驱动层改动，配任意 SDK 均可用。详见各章节。
+> 功能 1/2 需配套修改版 SDK；功能 3~10 为纯 ROS 驱动层改动，配任意 SDK 均可用。详见各章节。
 
 ---
 
@@ -239,16 +240,16 @@ rosrun livox_ros_driver livox_stats_monitor.py
 看板效果（掉线的雷达会明确标 `DISCONNECTED`，不会从看板上消失）：
 ```
 ===== Livox LiDAR Stats (1Hz) =====
-handle  broadcast_code   state         temp  fan   motor recv/s  loss/s  loss%    drop/s   disc  last_drop   uptime
+handle  broadcast_code   state         temp  fan   motor recv/s  loss/s  loss%    drop/s   disc  down_for   uptime
 0       3WEDH7600111191  Normal        OK    OK    OK      2496       0    0.00%       0      0         --    2h13m
-1       3WEDH7600103661  Normal        OK    OK    OK      2498       0    2.24%       0      3      8m05s    8m05s
+1       3WEDH7600103661  Normal        OK    OK    OK      2498       0    2.24%       0      3        12s    8m05s
 2       3WEDH5900100671  Normal        OK    OK    OK      2497       0    0.00%       0      0         --    2h13m
 Temp changes: none (all lidars normal since start)
 Fault events:  lidar 1: 1 time(s) (motor+fan), last at 13:46:03
 Auto-recover:  lidar 1: 1 reboot(s), last at 13:46:08
 (updated: 1718000000.0)
 ```
-上例 1 号 `loss% = 2.24%` 明显高于其它（其它 0.00%）——说明它**累计**丢得多，是最该排查的那台。底部的 **Fault events / Auto-recover** 还显示它早些时候出过一次 `motor+fan` 故障、被自动重启过一次（虽然现在已恢复 `Normal`）——这种"出过事但已恢复"的历史，实时那几列是看不到的。
+上例 1 号 `loss% = 2.24%` 明显高于其它（其它 0.00%）——说明它**累计**丢得多，是最该排查的那台。它 `disc = 3`（掉过 3 次），`down_for = 12s` 表示**最近那次只断了 12 秒**就重连了，而 `uptime = 8m05s` 是从那次重连至今稳定的时长——两者不再相同，一眼就能区分"断多久"和"稳多久"。底部的 **Fault events / Auto-recover** 还显示它早些时候出过一次 `motor+fan` 故障、被自动重启过一次（虽然现在已恢复 `Normal`）——这种"出过事但已恢复"的历史，实时那几列是看不到的。
 
 #### 怎么读看板
 
@@ -263,7 +264,7 @@ Auto-recover:  lidar 1: 1 reboot(s), last at 13:46:08
 | `loss%` | **累计**网络丢包率（看这台从启动到现在总体掉了多少，哪台不靠谱一眼看出）|
 | `drop/s` | 每秒队列丢包数（>0 说明主机/下游消费不过来）|
 | `disc` | 累计掉线次数 |
-| `last_drop` | 上次掉线距今多久（`--` = 从未掉过）|
+| `down_for` | **本次/上次掉线持续了多久**——当前还断着就是已断多久，已重连就是上次那次断了多久（`--` = 从未掉过）。比"距上次掉线多久"有用：后者一旦重连就基本等于 `uptime` |
 | `uptime` | 本次连接已稳定多久 |
 
 > **`loss/s` vs `loss%` 的区别**：`loss/s` 是当下这一秒的瞬时值（偶发小抖动会一闪而过、平时是 0）；`loss%` 是从启动累计的总丢包率（小抖动会慢慢累积体现出来）。**判断哪台最该换**就看 `loss%` 高、`disc` 多、`uptime` 短的那台。
@@ -275,7 +276,7 @@ Auto-recover:  lidar 1: 1 reboot(s), last at 13:46:08
 | 底部行 | 含义 |
 |--------|------|
 | `Temp changes` | 各台温度状态变化的次数 + 上次时间（频繁变化 = 散热不稳）|
-| `Fault events` | 各台进入 **motor/fan/volt/fw/system** 故障的次数 + 上次时间 + **是哪几项**（如 `motor+fan`）。只记"从好变坏"那一下；**雷达恢复后这条仍保留** |
+| `Fault events` | 各台进入 **motor/fan/dirty/volt/fw/system** 故障的次数 + 上次时间 + **是哪几项**（如 `motor+fan`、`dirty`）。`dirty` = 光窗脏污/遮挡（粉尘环境高频）。只记"从好变坏"那一下；**雷达恢复后这条仍保留** |
 | `Auto-recover` | 看门狗（`auto_recover`）给各台发过几次自动重启 + 上次时间。**只有真发生过自动重启才显示这行**（没开或没触发时不显示）|
 
 > 排障套路：某台 `Fault events` 反复累加、或 `Auto-recover` 次数不断上涨，就是它在反复发作——结合 `Fault events` 的标签（比如老是 `motor+fan`）基本能锁定是风扇/电机硬件在衰竭，该停机物理检查/更换了。
@@ -339,6 +340,32 @@ roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
 > ⚠️ 这是驱动**自主重启硬件**的行为，所以默认关闭、需显式开启。无显示器的机器也能用（它和看板无关）。
 
 > **某台 `loss/s` 持续 >0 → 重点排查那台的网线/接头/散热；某台 `DISCONNECTED` → 已掉线，可远程重启 `rosservice call /livox_lidar_reboot "{handle: N}"`。**
+
+#### 可选：持久化健康日志（`health_log`，长期无人值守用）
+
+看板和日志都是“当下/滚动”的，重启即失。开了它会把健康状况**落盘成 CSV**，供事后做周/月级趋势分析与故障取证。**默认关闭。**
+
+```bash
+roslaunch livox_ros_driver livox_lidar_multi.launch health_log:=true
+# 可选：自定义目录与快照周期
+roslaunch livox_ros_driver livox_lidar_multi.launch health_log:=true \
+          health_log_dir:=/data/livox_logs health_log_snapshot_s:=600
+```
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `health_log` | `false` | 总开关 |
+| `health_log_dir` | 空（= 节点工作目录 `~/.ros`）| 落盘目录，**需已存在** |
+| `health_log_snapshot_s` | `600` | 快照周期（秒）|
+
+写**两条流**，文件名带日期、**按天自动分文件**：
+
+- **`livox_events_YYYY-MM-DD.csv`（事件，边沿触发）**：一旦发生就记一行 —— 健康位变化（`HEALTH`，附完整解码）、掉线/重连（`DISCONNECT`/`RECONNECT`，附 down 时长）、自动重启（`REBOOT`）。**秒级、不漏任何短瞬故障**（哪怕几秒就自愈的 motor 故障）。列：`wall_time,handle,bcode,event,detail`。
+- **`livox_snapshot_YYYY-MM-DD.csv`（快照，每 `N` 秒）**：每台一行,带**累计**计数（`recv_total/loss_total/drop_total/loss_pct/disc`）+ 当前状态。**用累计值而非瞬时值**——相邻两行相减就是这段时间的丢包总量，**积分式、中间不漏**，适合看“是不是每到某时段 loss 就涨一截”（定位 EMI 规律）。列：`wall_time,handle,bcode,state,temp,fan,motor,dirty,system,recv_total,loss_total,drop_total,loss_pct,disc`。
+
+> 占用极小（4 台、600s 快照 ≈ 0.5 MB/天，事件仅在变化时才写）。打不开文件会**告警一次并自动禁用**，绝不拖垮驱动。事件流秒级捕捉离散故障、快照流积分式记录网络趋势，两者互补。
+
+> **同一天多次启停 → 自动合并进同一个文件**：文件名只按日期、以**追加**模式打开，所以当天反复结束/重启都接在同一个 `..._YYYY-MM-DD.csv` 里（不覆盖、不重复表头、不多生成文件），跨天才建新文件。每次驱动启动会写一行 `STARTUP` 事件，便于在合并文件里区分各次运行的边界。
 
 #### 不想用脚本？直接看原始 topic
 

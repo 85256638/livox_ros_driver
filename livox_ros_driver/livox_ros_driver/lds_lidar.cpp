@@ -32,6 +32,7 @@
 #include <mutex>
 #include <thread>
 
+#include "health_logger.h"
 #include "rapidjson/document.h"
 #include "rapidjson/filereadstream.h"
 #include "rapidjson/stringbuffer.h"
@@ -73,8 +74,12 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
     char buf[48];
     snprintf(buf, sizeof(buf), "RECONNECTED (down %llds)", down_s);
     PrintLidarEvent(handle, broadcast_code, buf);
+    char detail[32];
+    snprintf(detail, sizeof(detail), "down %llds", down_s);
+    HealthLogger::Get().LogEvent(handle, broadcast_code, "RECONNECT", detail);
   } else {
     PrintLidarEvent(handle, broadcast_code, "CONNECTED");
+    HealthLogger::Get().LogEvent(handle, broadcast_code, "CONNECT", "");
   }
 }
 
@@ -90,6 +95,7 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
   s.connect_since_ns = 0;
   s.health_code = 0;  /** stale once disconnected */
   PrintLidarEvent(handle, broadcast_code, "DISCONNECTED");
+  HealthLogger::Get().LogEvent(handle, broadcast_code, "DISCONNECT", "");
 }
 
 namespace {
@@ -652,12 +658,13 @@ void LdsLidar::LidarErrorStatusCb(livox_status status, uint8_t handle,
   temp_seen[handle] = true;
   prev_temp[handle] = ec.temp_status;
 
-  /** Track fault onsets (motor/fan/volt/firmware/system going bad) so the
+  /** Track fault onsets (motor/fan/dirty/volt/firmware/system going bad) so the
    *  dashboard keeps a record even after the lidar recovers -- the live
-   *  columns only ever show the current state. Count the rising edge only. */
+   *  columns only ever show the current state. Count the rising edge only.
+   *  dirty_warn (optical window dirty/blocked) matters in dusty environments. */
   static bool prev_fault[kMaxLidarCount] = {false};
-  bool fault = (ec.motor_status || ec.fan_status || ec.volt_status ||
-                ec.firmware_err || ec.system_status);
+  bool fault = (ec.motor_status || ec.fan_status || ec.dirty_warn ||
+                ec.volt_status || ec.firmware_err || ec.system_status);
   if (fault && !prev_fault[handle]) {
     g_lds_ldiar->link_stat_[handle].fault_count++;
     g_lds_ldiar->link_stat_[handle].fault_wall_s = (int64_t)time(nullptr);
@@ -686,6 +693,21 @@ void LdsLidar::LidarErrorStatusCb(livox_status status, uint8_t handle,
          ts, handle, TempStr(ec.temp_status), FanStr(ec.fan_status),
          Lvl3Str(ec.motor_status), Lvl3Str(ec.volt_status), ec.dirty_warn,
          ec.firmware_err, ec.self_heating, Lvl3Str(ec.system_status));
+
+  /** Same decoded line to the persistent event log (edge-triggered, so even a
+   *  brief fault that recovers before the next snapshot is recorded). */
+  if (HealthLogger::Get().enabled()) {
+    char detail[192];
+    snprintf(detail, sizeof(detail),
+             "temp=%s fan=%s motor=%s volt=%s dirty=%u fw=%u self_heat=%u "
+             "sys=%s",
+             TempStr(ec.temp_status), FanStr(ec.fan_status),
+             Lvl3Str(ec.motor_status), Lvl3Str(ec.volt_status), ec.dirty_warn,
+             ec.firmware_err, ec.self_heating, Lvl3Str(ec.system_status));
+    HealthLogger::Get().LogEvent(
+        handle, g_lds_ldiar->lidars_[handle].info.broadcast_code, "HEALTH",
+        detail);
+  }
 }
 
 void LdsLidar::ControlFanCb(livox_status status, uint8_t handle,
