@@ -305,16 +305,16 @@ rosrun livox_ros_driver livox_stats_monitor.py
 看板效果（掉线的雷达会明确标 `DISCONNECTED`，不会从看板上消失）：
 ```
 ===== Livox LiDAR Stats (1Hz) =====
-handle  broadcast_code   state         temp  fan   motor recv/s  loss/s  loss%    drop/s   disc  down_for   uptime
-0       3WEDH7600111191  Normal        OK    OK    OK      2496       0    0.00%       0      0         --    2h13m
-1       3WEDH7600103661  Normal        OK    OK    OK      2498       0    2.24%       0      3        12s    8m05s
-2       3WEDH5900100671  Normal        OK    OK    OK      2497       0    0.00%       0      0         --    2h13m
+handle  broadcast_code   state         temp  fan   motor recv/s  loss%    drop/s   disc  heartbeat  data
+0       3WEDH7600111191  Normal        OK    OK    OK      2496    0.00%       0      0      2h13m  有数据 2h13m
+1       3WEDH7600103661  Normal        OK    OK    OK      2498    2.24%       0      3      8m05s  有数据 8m05s
+2       3WEDH5900100671  Normal        OK    OK    OK      2497    0.00%       0      0      2h13m  有数据 2h13m
 Temp changes: none (all lidars normal since start)
 Fault events:  lidar 1: 1 time(s) (motor+fan), last at 13:46:03
 Auto-recover:  lidar 1: 1 reboot(s), last at 13:46:08
 (updated: 1718000000.0)
 ```
-上例 1 号 `loss% = 2.24%` 明显高于其它（其它 0.00%）——说明它**累计**丢得多，是最该排查的那台。它 `disc = 3`（掉过 3 次），`down_for = 12s` 表示**最近那次只断了 12 秒**就重连了，而 `uptime = 8m05s` 是从那次重连至今稳定的时长——两者不再相同，一眼就能区分"断多久"和"稳多久"。底部的 **Fault events / Auto-recover** 还显示它早些时候出过一次 `motor+fan` 故障、被自动重启过一次（虽然现在已恢复 `Normal`）——这种"出过事但已恢复"的历史，实时那几列是看不到的。
+上例 1 号 `loss% = 2.24%` 明显高于其它（其它 0.00%）——说明它**累计**网络丢得多，是最该排查的那台。它 `disc = 3`（掉过 3 次），而 `heartbeat = 8m05s` 是心跳链路从上次重连至今维持的时长。最右的 `data` 列显示三台都在 `有数据`——**只有出数据才能 confidently 认为这台真的正常**（心跳在≠出点云）。底部的 **Fault events / Auto-recover** 还显示 1 号早些时候出过一次 `motor+fan` 故障、被自动重启过一次（虽然现在已恢复 `Normal`）——这种"出过事但已恢复"的历史，实时那几列是看不到的。
 
 #### 怎么读看板
 
@@ -325,14 +325,13 @@ Auto-recover:  lidar 1: 1 reboot(s), last at 13:46:08
 | `fan` | 风扇状态 `OK` 正常 / `WARN` **故障**（WARN 是风扇坏了，不是"在转"）|
 | `motor` | 电机（扫描)状态 `OK` 正常 / `WARN` 告警 / `ERR!` **错误，无法工作**（`ERR!` 意味着停止扫描、不再出点）|
 | `recv/s` | 每秒收到的点云包数（应稳定，多台 Horizon 约 2500/s）|
-| `loss/s` | **瞬时**每秒网络丢包数（看当下有没有在掉，正常时常为 0）|
 | `loss%` | **累计**网络丢包率（看这台从启动到现在总体掉了多少，哪台不靠谱一眼看出）|
-| `drop/s` | 每秒队列丢包数（>0 说明主机/下游消费不过来）|
+| `drop/s` | 每秒**队列**丢包数——包到了驱动、但处理不过来被丢（和网络丢包 `loss%` **是两码事**；长期为 0 就没事，一旦经常 >0 说明主机/下游/单线程发布消费不过来）|
 | `disc` | 累计掉线次数 |
-| `down_for` | **本次/上次掉线持续了多久**——当前还断着就是已断多久，已重连就是上次那次断了多久（`--` = 从未掉过）。比"距上次掉线多久"有用：后者一旦重连就基本等于 `uptime` |
-| `uptime` | 本次连接已稳定多久 |
+| `heartbeat` | 心跳链路维持了多久（= 距上次掉线/重启多久）。⚠️ **不是"在出数据"的时长**——雷达睡眠(PowerSaving)时心跳不断，这个照数 |
+| `data` | **有/无数据流时长**，只在 `Normal` 下判定：`有数据 Ns` = 连续出点云多久；`无数据 Ns` = 该出没出多久（要警觉的）；`-` = PowerSaving/Init/掉线等本就不该有数据。**只有 `有数据` 才能 confidently 认为这台真健康**（心跳在 ≠ 出点云）|
 
-> **`loss/s` vs `loss%` 的区别**：`loss/s` 是当下这一秒的瞬时值（偶发小抖动会一闪而过、平时是 0）；`loss%` 是从启动累计的总丢包率（小抖动会慢慢累积体现出来）。**判断哪台最该换**就看 `loss%` 高、`disc` 多、`uptime` 短的那台。
+> **判断哪台最该排查/换**：看 `data` 长期 `无数据`、`loss%` 高、`disc` 多、`heartbeat` 老是很短（反复重启）的那台。
 
 #### 看板底部：历史事件（恢复后也一直记着）
 
@@ -393,7 +392,7 @@ roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
 
 | 触发 | 动作 |
 |------|------|
-| 进入 `Error` 满 **5 秒** | 重启该雷达（第 1 次）|
+| 进入 `Error` 满 **3 秒** | 重启该雷达（第 1 次）|
 | 重连后仍 `Error`，每再过 **~40 秒** | 再重启，**最多 3 次** |
 | 3 次后仍 `Error` | **停止重启**，每 30 秒打一条 `[LivoxRecover]` `ERROR` 告警"需人工处理（多半是风扇/电机硬件坏了）" |
 
@@ -404,7 +403,7 @@ roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
 
 > ⚠️ 这是驱动**自主重启硬件**的行为，所以默认关闭、需显式开启。无显示器的机器也能用（它和看板无关）。
 
-> **某台 `loss/s` 持续 >0 → 重点排查那台的网线/接头/散热；某台 `DISCONNECTED` → 已掉线，可远程重启 `rosservice call /livox_lidar_reboot "{handle: N}"`。**
+> **某台 `loss%` 偏高 → 重点排查那台的网线/接头/散热；某台 `data` 显示 `无数据` → 该出没出、要警觉；某台 `DISCONNECTED` → 已掉线，可远程重启 `rosservice call /livox_lidar_reboot "{handle: N}"`。**
 
 #### 可选：持久化健康日志（`health_log`，长期无人值守用）
 

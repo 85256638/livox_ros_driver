@@ -204,7 +204,7 @@ static std::string FmtDur(int64_t ns) {
  *  every kErrorRebootCooldownSec, up to kErrorRebootMaxAttempts times. After
  *  that, stop rebooting and flag for manual intervention -- this avoids
  *  reboot-looping a physically dead fan/motor that a reboot cannot fix. */
-static const uint32_t kErrorRebootDelaySec    = 5;
+static const uint32_t kErrorRebootDelaySec    = 3;
 static const uint32_t kErrorRebootCooldownSec = 40;
 static const uint32_t kErrorRebootMaxAttempts = 3;
 
@@ -216,7 +216,6 @@ void StatsTimerCb(const ros::TimerEvent &) {
     return;
   }
   static uint32_t prev_recv[kMaxLidarCount] = {0};
-  static uint32_t prev_loss[kMaxLidarCount] = {0};
   static uint32_t prev_drop[kMaxLidarCount] = {0};
   static bool ever_seen[kMaxLidarCount] = {false};
   static char last_bcode[kMaxLidarCount][kBdCodeSize + 1] = {{0}};
@@ -224,6 +223,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
   static uint8_t recover_stage[kMaxLidarCount] = {0};   /**< 0=ok 1=restarted sampling 2=rebooted */
   static uint32_t error_secs[kMaxLidarCount] = {0};     /**< consecutive 1s ticks in Error state */
   static uint8_t error_reboots[kMaxLidarCount] = {0};   /**< reboots attempted this Error episode */
+  static uint32_t data_secs[kMaxLidarCount] = {0};      /**< consecutive 1s ticks with data (recv>0) */
 
   int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
 
@@ -241,8 +241,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
 
   std::ostringstream ss;
   ss << "===== Livox LiDAR Stats (1Hz) =====\n";
-  ss << "handle  broadcast_code   state         temp  fan   motor recv/s  loss/s  "
-        "loss%    drop/s   disc  down_for   uptime\n";
+  ss << "handle  broadcast_code   state         temp  fan   motor recv/s  "
+        "loss%    drop/s   disc  heartbeat  data\n";
   bool any = false;
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
     LidarDevice *l = &g_read_lidar->lidars_[h];
@@ -262,21 +262,14 @@ void StatsTimerCb(const ros::TimerEvent &) {
     LidarPacketStatistic &st = l->statistic_info;
     LdsLidar::LinkStat &ls = g_read_lidar->link_stat_[h];
     uint32_t disc = ls.disconnect_count;
-    /** How long the most recent outage lasted: if currently disconnected it is
-     *  the still-growing down time; if reconnected it is the duration of the
-     *  last completed outage (reconnect - disconnect). More useful than "time
-     *  since last drop", which once reconnected just mirrors uptime. */
-    std::string down_for;
-    if (ls.last_disconnect_ns == 0) {
-      down_for = "--";  /** never dropped */
-    } else if (connected && ls.connect_since_ns) {
-      down_for = FmtDur(ls.connect_since_ns - ls.last_disconnect_ns);
-    } else {
-      down_for = FmtDur(now_ns - ls.last_disconnect_ns);  /** still down */
-    }
-    std::string uptime = (connected && ls.connect_since_ns)
-                             ? FmtDur(now_ns - ls.connect_since_ns)
-                             : "--";
+    /** "有数据/无数据" stream-health column: how long this lidar has (or hasn't)
+     *  been producing points. Only meaningful in Normal — a lidar in
+     *  PowerSaving/Standby/Init legitimately produces no data, so it shows "-".
+     *  Filled in below once d_recv is known (connected branch); "-" otherwise. */
+    std::string datacol = "-";
+    std::string heartbeat = (connected && ls.connect_since_ns)
+                                ? FmtDur(now_ns - ls.connect_since_ns)
+                                : "--";
     ErrorMessage em;
     em.error_code = ls.health_code;
     const char *temp = TempStr(em.lidar_error_code.temp_status);
@@ -295,10 +288,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
     char line[256];
     if (connected) {
       uint32_t d_recv = st.receive_packet_count - prev_recv[h];
-      uint32_t d_loss = st.loss_packet_count - prev_loss[h];
       uint32_t d_drop = st.queue_drop_count - prev_drop[h];
       prev_recv[h] = st.receive_packet_count;
-      prev_loss[h] = st.loss_packet_count;
       prev_drop[h] = st.queue_drop_count;
 
       /** A lidar in Normal state should be streaming; PowerSaving/Standby
@@ -309,6 +300,19 @@ void StatsTimerCb(const ros::TimerEvent &) {
       } else {
         zero_secs[h] = 0;
         recover_stage[h] = 0;
+      }
+
+      /** Stream-health column. Count "有数据"/"无数据" only in Normal; a lidar in
+       *  PowerSaving/Standby/Init/Error keeps datacol at "-" (no data expected). */
+      if (d_recv > 0) {
+        data_secs[h]++;
+      } else {
+        data_secs[h] = 0;
+      }
+      if (should_stream) {
+        int64_t secs = (d_recv > 0) ? data_secs[h] : zero_secs[h];
+        datacol = std::string(d_recv > 0 ? "有数据 " : "无数据 ") +
+                  FmtDur(secs * 1000000000LL);
       }
 
       /** (B) Two-stage auto-recovery for a "Normal but no data" stall. */
@@ -343,7 +347,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
       if (g_auto_recover && in_error) {
         if (error_reboots[h] < kErrorRebootMaxAttempts) {
           /** reboot #n is due at delay + n*cooldown seconds in Error
-           *  (5s, 45s, 85s for delay=5, cooldown=40). error_secs is frozen
+           *  (3s, 43s, 83s for delay=3, cooldown=40). error_secs is frozen
            *  while the lidar is disconnected mid-reboot, so the real gap is
            *  the cooldown plus reconnect time. */
           uint32_t due = kErrorRebootDelaySec +
@@ -375,22 +379,23 @@ void StatsTimerCb(const ros::TimerEvent &) {
         st_str = "NO DATA";
       }
       snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-12s  %-4s  %-4s  %-4s  %6u  %6u  %7s  %6u   %4u  %9s  %7s\n",
-               h, last_bcode[h], st_str, temp, fan, motor, d_recv, d_loss, losspct,
-               d_drop, disc, down_for.c_str(), uptime.c_str());
+               "%-6d  %-15s  %-12s  %-4s  %-4s  %-4s  %6u  %7s  %6u   %4u  %9s  %s\n",
+               h, last_bcode[h], st_str, temp, fan, motor, d_recv, losspct,
+               d_drop, disc, heartbeat.c_str(), datacol.c_str());
       if (do_snapshot) {
         hlog.LogSnapshot(h, last_bcode[h], st_str, temp, fan, motor, dirty, sys,
                          st.receive_packet_count, st.loss_packet_count,
                          st.queue_drop_count, loss_pct_d, disc);
       }
     } else {
-      prev_recv[h] = prev_loss[h] = prev_drop[h] = 0;
+      prev_recv[h] = prev_drop[h] = 0;
       zero_secs[h] = 0;
       recover_stage[h] = 0;
+      data_secs[h] = 0;
       snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-12s  %-4s  %-4s  %-4s  %6s  %6s  %7s  %6s   %4u  %9s  %7s\n",
-               h, last_bcode[h], "DISCONNECTED", "-", "-", "-", "-", "-", losspct,
-               "-", disc, down_for.c_str(), uptime.c_str());
+               "%-6d  %-15s  %-12s  %-4s  %-4s  %-4s  %6s  %7s  %6s   %4u  %9s  %s\n",
+               h, last_bcode[h], "DISCONNECTED", "-", "-", "-", "-", losspct,
+               "-", disc, heartbeat.c_str(), datacol.c_str());
       if (do_snapshot) {
         hlog.LogSnapshot(h, last_bcode[h], "DISCONNECTED", "-", "-", "-", 0, "-",
                          st.receive_packet_count, st.loss_packet_count,
