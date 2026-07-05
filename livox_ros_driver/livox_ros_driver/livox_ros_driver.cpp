@@ -208,6 +208,11 @@ static const uint32_t kErrorRebootDelaySec    = 3;
 static const uint32_t kErrorRebootCooldownSec = 40;
 static const uint32_t kErrorRebootMaxAttempts = 3;
 
+/** A "Normal but no data" (silent) episode is logged to the event log and shown
+ *  as "NO DATA" on the dashboard once it has lasted this long, so trivial 1-2s
+ *  hiccups don't spam either. */
+static const uint32_t kNoDataLogSec = 3;
+
 /** Timer callback (runs on the AsyncSpinner thread, independent of the data
  *  loop so it keeps updating even if a lidar stops sending). Publishes a
  *  preformatted dashboard of all connected lidars. */
@@ -223,6 +228,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
   static uint8_t recover_stage[kMaxLidarCount] = {0};   /**< 0=ok 1=restarted sampling 2=rebooted */
   static uint32_t error_secs[kMaxLidarCount] = {0};     /**< consecutive 1s ticks in Error state */
   static uint8_t error_reboots[kMaxLidarCount] = {0};   /**< reboots attempted this Error episode */
+  static bool nodata_logged[kMaxLidarCount] = {false};  /**< a NODATA onset event has been logged for the current silent episode */
 
   int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
 
@@ -305,7 +311,24 @@ void StatsTimerCb(const ros::TimerEvent &) {
       bool should_stream = (l->info.state == kLidarStateNormal);
       if (should_stream && d_recv == 0) {
         zero_secs[h]++;
+        /** Log the onset of a "Normal but silent" episode (once), with the
+         *  wall-clock time -- so afterwards you can see exactly when a lidar
+         *  went silent (e.g. correlate a slow wake with the scheduler log). */
+        if (!nodata_logged[h] && zero_secs[h] >= kNoDataLogSec) {
+          hlog.LogEvent(h, last_bcode[h], "NODATA", "");
+          nodata_logged[h] = true;
+        }
       } else {
+        /** Episode ended: if we logged its onset, record how long it stayed
+         *  silent. d_recv>0 => data resumed; otherwise the state left Normal
+         *  (slept / errored). zero_secs still holds the silent duration here. */
+        if (nodata_logged[h]) {
+          char det[40];
+          snprintf(det, sizeof(det), "silent %us%s", zero_secs[h],
+                   d_recv > 0 ? "" : " (left Normal)");
+          hlog.LogEvent(h, last_bcode[h], "DATA", det);
+          nodata_logged[h] = false;
+        }
         zero_secs[h] = 0;
         recover_stage[h] = 0;
       }
@@ -370,7 +393,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
 
       /** (A) Flag a connected-but-silent lidar loudly instead of "Normal". */
       const char *st_str = LidarStateStr(l->info.state);
-      if (should_stream && zero_secs[h] >= 3) {
+      if (should_stream && zero_secs[h] >= kNoDataLogSec) {
         st_str = "NO DATA";
       }
       snprintf(line, sizeof(line),
@@ -386,6 +409,9 @@ void StatsTimerCb(const ros::TimerEvent &) {
       prev_recv[h] = prev_drop[h] = 0;
       zero_secs[h] = 0;
       recover_stage[h] = 0;
+      /** Close any open silent episode; the DISCONNECT event already marks the
+       *  transition, so no separate DATA row is needed here. */
+      nodata_logged[h] = false;
       snprintf(line, sizeof(line),
                "%-6d  %-15s  %-12s  %-4s  %-4s  %-4s  %6s  %7s  %6s   %4u  %8s  %9s\n",
                h, last_bcode[h], "DISCONNECTED", "-", "-", "-", "-", losspct,
