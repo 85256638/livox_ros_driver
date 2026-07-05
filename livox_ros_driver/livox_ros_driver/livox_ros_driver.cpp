@@ -223,7 +223,6 @@ void StatsTimerCb(const ros::TimerEvent &) {
   static uint8_t recover_stage[kMaxLidarCount] = {0};   /**< 0=ok 1=restarted sampling 2=rebooted */
   static uint32_t error_secs[kMaxLidarCount] = {0};     /**< consecutive 1s ticks in Error state */
   static uint8_t error_reboots[kMaxLidarCount] = {0};   /**< reboots attempted this Error episode */
-  static uint32_t data_secs[kMaxLidarCount] = {0};      /**< consecutive 1s ticks with data (recv>0) */
 
   int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
 
@@ -242,7 +241,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
   std::ostringstream ss;
   ss << "===== Livox LiDAR Stats (1Hz) =====\n";
   ss << "handle  broadcast_code   state         temp  fan   motor recv/s  "
-        "loss%    drop/s   disc  heartbeat  data\n";
+        "loss%    drop/s   disc  HB_lost   heartbeat\n";
   bool any = false;
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
     LidarDevice *l = &g_read_lidar->lidars_[h];
@@ -262,11 +261,20 @@ void StatsTimerCb(const ros::TimerEvent &) {
     LidarPacketStatistic &st = l->statistic_info;
     LdsLidar::LinkStat &ls = g_read_lidar->link_stat_[h];
     uint32_t disc = ls.disconnect_count;
-    /** "有数据/无数据" stream-health column: how long this lidar has (or hasn't)
-     *  been producing points. Only meaningful in Normal — a lidar in
-     *  PowerSaving/Standby/Init legitimately produces no data, so it shows "-".
-     *  Filled in below once d_recv is known (connected branch); "-" otherwise. */
-    std::string datacol = "-";
+    /** "hb_lost" = heartbeat loss duration: how long the most recent heartbeat
+     *  outage lasted. Still down -> the still-growing down time; reconnected ->
+     *  duration of the last completed outage; never dropped -> "--". */
+    std::string hb_lost;
+    if (ls.last_disconnect_ns == 0) {
+      hb_lost = "--";
+    } else if (connected && ls.connect_since_ns) {
+      hb_lost = FmtDur(ls.connect_since_ns - ls.last_disconnect_ns);
+    } else {
+      hb_lost = FmtDur(now_ns - ls.last_disconnect_ns);
+    }
+    /** "heartbeat" = heartbeat maintained: how long the heartbeat link has been
+     *  up since the last (re)connect. NOT streaming/Normal time — a sleeping
+     *  lidar keeps its heartbeat, so this keeps counting through PowerSaving. */
     std::string heartbeat = (connected && ls.connect_since_ns)
                                 ? FmtDur(now_ns - ls.connect_since_ns)
                                 : "--";
@@ -300,19 +308,6 @@ void StatsTimerCb(const ros::TimerEvent &) {
       } else {
         zero_secs[h] = 0;
         recover_stage[h] = 0;
-      }
-
-      /** Stream-health column. Count "有数据"/"无数据" only in Normal; a lidar in
-       *  PowerSaving/Standby/Init/Error keeps datacol at "-" (no data expected). */
-      if (d_recv > 0) {
-        data_secs[h]++;
-      } else {
-        data_secs[h] = 0;
-      }
-      if (should_stream) {
-        int64_t secs = (d_recv > 0) ? data_secs[h] : zero_secs[h];
-        datacol = std::string(d_recv > 0 ? "有数据 " : "无数据 ") +
-                  FmtDur(secs * 1000000000LL);
       }
 
       /** (B) Two-stage auto-recovery for a "Normal but no data" stall. */
@@ -379,9 +374,9 @@ void StatsTimerCb(const ros::TimerEvent &) {
         st_str = "NO DATA";
       }
       snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-12s  %-4s  %-4s  %-4s  %6u  %7s  %6u   %4u  %9s  %s\n",
+               "%-6d  %-15s  %-12s  %-4s  %-4s  %-4s  %6u  %7s  %6u   %4u  %8s  %9s\n",
                h, last_bcode[h], st_str, temp, fan, motor, d_recv, losspct,
-               d_drop, disc, heartbeat.c_str(), datacol.c_str());
+               d_drop, disc, hb_lost.c_str(), heartbeat.c_str());
       if (do_snapshot) {
         hlog.LogSnapshot(h, last_bcode[h], st_str, temp, fan, motor, dirty, sys,
                          st.receive_packet_count, st.loss_packet_count,
@@ -391,11 +386,10 @@ void StatsTimerCb(const ros::TimerEvent &) {
       prev_recv[h] = prev_drop[h] = 0;
       zero_secs[h] = 0;
       recover_stage[h] = 0;
-      data_secs[h] = 0;
       snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-12s  %-4s  %-4s  %-4s  %6s  %7s  %6s   %4u  %9s  %s\n",
+               "%-6d  %-15s  %-12s  %-4s  %-4s  %-4s  %6s  %7s  %6s   %4u  %8s  %9s\n",
                h, last_bcode[h], "DISCONNECTED", "-", "-", "-", "-", losspct,
-               "-", disc, heartbeat.c_str(), datacol.c_str());
+               "-", disc, hb_lost.c_str(), heartbeat.c_str());
       if (do_snapshot) {
         hlog.LogSnapshot(h, last_bcode[h], "DISCONNECTED", "-", "-", "-", 0, "-",
                          st.receive_packet_count, st.loss_packet_count,
