@@ -326,7 +326,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
           char det[40];
           snprintf(det, sizeof(det), "silent %us%s", zero_secs[h],
                    d_recv > 0 ? "" : " (left Normal)");
-          hlog.LogEvent(h, last_bcode[h], "DATA", det);
+          hlog.LogEvent(h, last_bcode[h], "DATABACK", det);
           nodata_logged[h] = false;
         }
         zero_secs[h] = 0;
