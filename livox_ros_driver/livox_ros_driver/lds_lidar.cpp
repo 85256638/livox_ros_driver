@@ -225,6 +225,63 @@ void LdsLidar::ResetModeRequest(uint8_t handle) {
   }
 }
 
+namespace {
+/** How long to wait for a lidar's actual state to reach the requested sleep
+ *  mode before re-sending, and how many times to re-send before giving up. */
+const int64_t kSleepVerifyIntervalNs = 2LL * 1000000000LL;  // 2 s
+const uint8_t kSleepVerifyMaxRetries = 3;
+}  // namespace
+
+void LdsLidar::TickSleepModeVerification() {
+  int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+  for (uint8_t h = 0; h < kMaxLidarCount; h++) {
+    LidarMode desired = kLidarModeNormal;
+    uint8_t attempt = 0;
+    bool resend = false, giveup = false, done = false;
+    {
+      lock_guard<mutex> lock(mode_mutex_);
+      ModeChangeRequest &req = mode_requests_[h];
+      /** Only verify an in-progress PowerSaving/Standby request; Normal wakes
+       *  have their own spinning-up / reconnect handling. */
+      if (!req.active || req.desired_mode == kLidarModeNormal) {
+        continue;
+      }
+      desired = req.desired_mode;
+      /** Gate on elapsed time + actual state (not command_inflight): resending
+       *  is idempotent, so even a lost ack still gets retried after the interval. */
+      if (lidars_[h].connect_state == kConnectStateOff) {
+        giveup = true;  // disconnected; can't verify
+      } else if (lidars_[h].info.state == ModeToState(req.desired_mode)) {
+        done = true;  // mode actually took effect
+      } else if (now - req.last_command_ns >= kSleepVerifyIntervalNs) {
+        if (req.sleep_retry_count < kSleepVerifyMaxRetries) {
+          req.sleep_retry_count++;
+          req.last_command_ns = now;
+          attempt = req.sleep_retry_count;
+          resend = true;
+        } else {
+          giveup = true;
+        }
+      }
+    }
+    if (done) {
+      ResetModeRequest(h);  // silent: the common success path
+    } else if (resend) {
+      printf("Lidar[%d] not in mode[%d] yet -- re-sending (attempt %u/%u)\n", h,
+             desired, attempt, kSleepVerifyMaxRetries);
+      livox_status s = LidarSetMode(h, desired, SetModeCb, this);
+      if (s != kStatusSuccess) {
+        printf("Lidar[%d] mode re-send returned %d\n", h, s);
+      }
+    } else if (giveup) {
+      printf("Lidar[%d] did not enter mode[%d] after %u retries -- manual check "
+             "needed\n",
+             h, desired, kSleepVerifyMaxRetries);
+      ResetModeRequest(h);
+    }
+  }
+}
+
 void LdsLidar::MarkModeRequestDisconnected(uint8_t handle) {
   if (handle >= kMaxLidarCount) {
     return;
@@ -253,6 +310,7 @@ livox_status LdsLidar::SendModeChangeRequest(uint8_t handle, LidarMode mode,
       request.waiting_for_reconnect = false;
       request.command_inflight = false;
       request.desired_mode = mode;
+      request.sleep_retry_count = 0;
     }
     if (p_lidar->info.broadcast_code[0] != '\0') {
       strncpy(request.broadcast_code, p_lidar->info.broadcast_code,
@@ -284,6 +342,8 @@ livox_status LdsLidar::SendModeChangeRequest(uint8_t handle, LidarMode mode,
   if (status == kStatusSuccess) {
     request.command_inflight = true;
     request.waiting_for_reconnect = false;
+    request.last_command_ns =
+        std::chrono::steady_clock::now().time_since_epoch().count();
   } else if (mode == kLidarModeNormal && ShouldWaitForReconnect(status)) {
     request.active = true;
     request.desired_mode = mode;
@@ -746,8 +806,12 @@ void LdsLidar::SetModeCb(livox_status status, uint8_t handle, uint8_t response,
           clear_request = true;
         }
       } else {
-        printf("Lidar[%d] set mode[%d] success\n", handle, desired_mode);
-        clear_request = true;
+        /** PowerSaving/Standby: the lidar acked, but some units ack "success"
+         *  without actually switching. Keep the request active -- the 1Hz
+         *  TickSleepModeVerification confirms the real state and re-sends if the
+         *  mode did not take effect. (command_inflight is already cleared.) */
+        printf("Lidar[%d] set mode[%d] acked; verifying actual state\n", handle,
+               desired_mode);
       }
     } else {
       printf("Lidar[%d] set mode[%d] status[%d] response[%d]\n", handle,
@@ -755,6 +819,9 @@ void LdsLidar::SetModeCb(livox_status status, uint8_t handle, uint8_t response,
       if (desired_mode == kLidarModeNormal && ShouldWaitForReconnect(status)) {
         request.waiting_for_reconnect = true;
         wait_for_reconnect = true;
+      } else if (desired_mode != kLidarModeNormal) {
+        /** Sleep/standby command failed at the ack stage; leave the request
+         *  active so the verify tick re-sends it. */
       } else {
         clear_request = true;
       }

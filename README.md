@@ -2,7 +2,7 @@
 
 本分支基于官方 [livox_ros_driver v2.6.0](https://github.com/Livox-SDK/livox_ros_driver) 修改，面向**多雷达 + 工业环境长时间运行**场景，新增以下功能与可靠性修复：
 
-1. **在线工作模式切换** — 运行时通过 ROS Service 切换 LiDAR 工作模式（Normal / PowerSaving / Standby）
+1. **在线工作模式切换** — 运行时通过 ROS Service 切换 LiDAR 工作模式（Normal / PowerSaving / Standby）；休眠/待机切换带**实际状态校验 + 自动重试**（防个别雷达 ack 成功却没真切）
 2. **远程重启** — 通过 ROS Service 软重启雷达，无需现场断电
 3. **可配置点云距离过滤** — 通过 launch 参数设置最大发布距离，无需重新编译
 4. **掉线崩溃修复（UAF）** — 修复官方驱动在雷达掉线时的 use-after-free 竞态崩溃
@@ -145,6 +145,12 @@ rosservice call /livox_lidar_mode "{handle: 255, mode: 2}"
 |------------|------|
 | 0 | 请求已接受 |
 | 非 0 | 错误（详见终端日志）|
+
+> ⚠️ `ret_code = 0` 只表示**命令被雷达确认收到**，不代表模式一定切成了。个别情况下雷达会 ack `success` 却不真正切换（尤其广播 `handle:255` 同时命令多台时，偶发某台没切）。
+
+### 切换到 PowerSaving / Standby 的自动校验重试
+
+针对上面那个"ack 成功但没真切"的问题，驱动会**校验实际状态、没切就自动重发**：切换到休眠/待机后，每秒检查该雷达的**真实 `state`** 是否已变成目标模式；若 **2 秒**内还没变，就自动重发命令，**最多 3 次**；仍不切则打印 `did not enter mode[..] after 3 retries -- manual check needed` 提示人工。这样一条 `rosservice call /livox_lidar_mode "{handle: 255, mode: 2}"` 就能可靠地把所有雷达都切到休眠，不必手动再跑。（Normal 唤醒不走这套——它有自己的 spinning-up/重连恢复逻辑。）
 
 ### 断线行为
 

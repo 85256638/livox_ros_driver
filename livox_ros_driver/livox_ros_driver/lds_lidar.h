@@ -56,6 +56,10 @@ class LdsLidar : public Lds {
   livox_status RequestLidarModeChange(const char *broadcast_code,
                                       LidarMode mode);
   livox_status RequestLidarModeChange(uint8_t handle, LidarMode mode);
+  /** Called at 1 Hz: for an in-progress PowerSaving/Standby request, verify the
+   *  lidar's actual state really reached the target and re-send if it did not
+   *  (some lidars ack "success" without switching). No-op for Normal requests. */
+  void TickSleepModeVerification();
   livox_status RequestLidarReboot(uint8_t handle, uint16_t timeout_ms = 100);
   livox_status RequestRestartSampling(uint8_t handle);
 
@@ -87,6 +91,8 @@ class LdsLidar : public Lds {
       waiting_for_reconnect = false;
       command_inflight = false;
       desired_mode = kLidarModeNormal;
+      last_command_ns = 0;
+      sleep_retry_count = 0;
       memset(broadcast_code, 0, sizeof(broadcast_code));
     }
 
@@ -94,6 +100,8 @@ class LdsLidar : public Lds {
     bool waiting_for_reconnect;
     bool command_inflight;
     LidarMode desired_mode;
+    int64_t last_command_ns;    /**< steady_clock ns of the last SetMode send (for sleep verify/retry) */
+    uint8_t sleep_retry_count;  /**< PowerSaving/Standby re-sends done for the current request */
     char broadcast_code[kBroadcastCodeSize];
   };
 

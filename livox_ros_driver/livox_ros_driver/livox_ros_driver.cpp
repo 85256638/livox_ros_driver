@@ -220,6 +220,9 @@ void StatsTimerCb(const ros::TimerEvent &) {
   if (g_read_lidar == nullptr) {
     return;
   }
+  /** Verify/retry any in-progress PowerSaving/Standby switch: some lidars ack
+   *  the command but do not actually change mode, so confirm the real state. */
+  g_read_lidar->TickSleepModeVerification();
   static uint32_t prev_recv[kMaxLidarCount] = {0};
   static uint32_t prev_drop[kMaxLidarCount] = {0};
   static bool ever_seen[kMaxLidarCount] = {false};
