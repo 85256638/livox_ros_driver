@@ -237,7 +237,7 @@ void LdsLidar::TickSleepModeVerification() {
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
     LidarMode desired = kLidarModeNormal;
     uint8_t attempt = 0;
-    bool resend = false, giveup = false, done = false;
+    bool resend = false, giveup = false, done = false, exhausted = false;
     {
       lock_guard<mutex> lock(mode_mutex_);
       ModeChangeRequest &req = mode_requests_[h];
@@ -250,7 +250,7 @@ void LdsLidar::TickSleepModeVerification() {
       /** Gate on elapsed time + actual state (not command_inflight): resending
        *  is idempotent, so even a lost ack still gets retried after the interval. */
       if (lidars_[h].connect_state == kConnectStateOff) {
-        giveup = true;  // disconnected; can't verify
+        giveup = true;  // disconnected; can't verify (DISCONNECT event covers it)
       } else if (lidars_[h].info.state == ModeToState(req.desired_mode)) {
         done = true;  // mode actually took effect
       } else if (now - req.last_command_ns >= kSleepVerifyIntervalNs) {
@@ -260,7 +260,7 @@ void LdsLidar::TickSleepModeVerification() {
           attempt = req.sleep_retry_count;
           resend = true;
         } else {
-          giveup = true;
+          exhausted = true;  // tried the max times, still not switched
         }
       }
     }
@@ -273,11 +273,19 @@ void LdsLidar::TickSleepModeVerification() {
       if (s != kStatusSuccess) {
         printf("Lidar[%d] mode re-send returned %d\n", h, s);
       }
-    } else if (giveup) {
+    } else if (exhausted) {
+      /** Record for the dashboard "Mode retry" footer so it is visible without
+       *  digging through the log; then warn and drop the request. Same thread as
+       *  the footer render, so no lock needed for link_stat_. */
+      link_stat_[h].mode_fail_count++;
+      link_stat_[h].mode_fail_wall_s = (int64_t)time(nullptr);
+      link_stat_[h].mode_fail_mode = (uint8_t)desired;
       printf("Lidar[%d] did not enter mode[%d] after %u retries -- manual check "
              "needed\n",
              h, desired, kSleepVerifyMaxRetries);
       ResetModeRequest(h);
+    } else if (giveup) {
+      ResetModeRequest(h);  // disconnected mid-switch; silent
     }
   }
 }

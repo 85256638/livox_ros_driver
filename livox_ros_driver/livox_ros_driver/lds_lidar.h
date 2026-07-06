@@ -78,6 +78,9 @@ class LdsLidar : public Lds {
     uint32_t fault_code = 0;         /**< health bits captured at last fault onset */
     uint32_t recover_reboot_count = 0; /**< auto_recover reboots issued for this lidar */
     int64_t recover_last_wall_s = 0;   /**< wall-clock (time_t) of last auto_recover reboot */
+    uint32_t mode_fail_count = 0;      /**< PowerSaving/Standby switches that failed after all retries */
+    int64_t mode_fail_wall_s = 0;      /**< wall-clock (time_t) of last such failure, 0=never */
+    uint8_t mode_fail_mode = 0;        /**< mode it failed to enter (2=PowerSaving, 3=Standby) */
   };
   LinkStat link_stat_[kMaxLidarCount];
 

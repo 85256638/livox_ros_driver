@@ -494,6 +494,27 @@ void StatsTimerCb(const ros::TimerEvent &) {
     ss << "Auto-recover:" << rec_note << "\n";
   }
 
+  /** Mode-switch footer: PowerSaving/Standby switches that failed after all
+   *  retries (only shown when non-zero). Surfaces the "manual check needed"
+   *  alert on the dashboard so it is not missed in the scrolling log. */
+  std::string mode_note;
+  for (uint8_t h = 0; h < kMaxLidarCount; h++) {
+    if (!ever_seen[h]) {
+      continue;
+    }
+    LdsLidar::LinkStat &ls = g_read_lidar->link_stat_[h];
+    if (ls.mode_fail_count > 0) {
+      const char *m = (ls.mode_fail_mode == 3) ? "Standby" : "PowerSaving";
+      char buf[96];
+      snprintf(buf, sizeof(buf), "  lidar %d: %s FAILED %u time(s), last at %s",
+               h, m, ls.mode_fail_count, FmtWall(ls.mode_fail_wall_s).c_str());
+      mode_note += buf;
+    }
+  }
+  if (!mode_note.empty()) {
+    ss << "Mode switch:" << mode_note << "\n";
+  }
+
   std_msgs::String msg;
   msg.data = ss.str();
   g_stats_pub.publish(msg);

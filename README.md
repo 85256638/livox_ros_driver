@@ -150,7 +150,9 @@ rosservice call /livox_lidar_mode "{handle: 255, mode: 2}"
 
 ### 切换到 PowerSaving / Standby 的自动校验重试
 
-针对上面那个"ack 成功但没真切"的问题，驱动会**校验实际状态、没切就自动重发**：切换到休眠/待机后，每秒检查该雷达的**真实 `state`** 是否已变成目标模式；若 **2 秒**内还没变，就自动重发命令，**最多 3 次**；仍不切则打印 `did not enter mode[..] after 3 retries -- manual check needed` 提示人工。这样一条 `rosservice call /livox_lidar_mode "{handle: 255, mode: 2}"` 就能可靠地把所有雷达都切到休眠，不必手动再跑。（Normal 唤醒不走这套——它有自己的 spinning-up/重连恢复逻辑。）
+针对上面那个"ack 成功但没真切"的问题，驱动会**校验实际状态、没切就自动重发**：切换到休眠/待机后，每秒检查该雷达的**真实 `state`** 是否已变成目标模式；若 **2 秒**内还没变，就自动重发命令，**最多 3 次**。这样一条 `rosservice call /livox_lidar_mode "{handle: 255, mode: 2}"` 就能可靠地把所有雷达都切到休眠，不必手动再跑。**广播 `handle:255` 时只对没切成功的那几台补发（逐台定向），已切好的不再打扰。**（Normal 唤醒不走这套——它有自己的 spinning-up/重连恢复逻辑。）
+
+> 仍切不成的极端情况：日志打印 `did not enter mode[..] after 3 retries -- manual check needed`，**同时看板底部会显示一行 `Mode switch: lidar X: PowerSaving FAILED N time(s), last at ...`**（只在发生过时出现、恢复后仍保留），这样盯着看板也不会漏掉"哪台没切成、该人工介入"。
 
 ### 断线行为
 
@@ -348,6 +350,7 @@ Auto-recover:  lidar 1: 1 reboot(s), last at 13:46:08
 | `Temp changes` | 各台温度状态变化的次数 + 上次时间（频繁变化 = 散热不稳）|
 | `Fault events` | 各台进入 **motor/fan/dirty/volt/fw/system** 故障的次数 + 上次时间 + **是哪几项**（如 `motor+fan`、`dirty`）。`dirty` = 光窗脏污/遮挡（粉尘环境高频）。只记"从好变坏"那一下；**雷达恢复后这条仍保留** |
 | `Auto-recover` | 看门狗（`auto_recover`）给各台发过几次自动重启 + 上次时间。**只有真发生过自动重启才显示这行**（没开或没触发时不显示）|
+| `Mode switch` | 切 **PowerSaving/Standby** 重试 3 次仍没切成的次数 + 上次时间（如 `lidar 1: PowerSaving FAILED 1 time(s)`）。**只有真失败过才显示这行**；提示这台需人工介入 |
 
 > 排障套路：某台 `Fault events` 反复累加、或 `Auto-recover` 次数不断上涨，就是它在反复发作——结合 `Fault events` 的标签（比如老是 `motor+fan`）基本能锁定是风扇/电机硬件在衰竭，该停机物理检查/更换了。
 
