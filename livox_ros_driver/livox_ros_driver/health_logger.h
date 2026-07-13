@@ -62,8 +62,9 @@ class HealthLogger {
    *  totals without missing anything in between. */
   void LogSnapshot(int handle, const char *bcode, const char *state,
                    const char *temp, const char *fan, const char *motor,
-                   unsigned dirty, const char *system, unsigned recv_total,
-                   unsigned loss_total, unsigned drop_total, double loss_pct,
+                   unsigned dirty, const char *system,
+                   unsigned long long recv_total, unsigned long long loss_total,
+                   unsigned long long drop_total, double loss_pct,
                    unsigned disc) {
     if (!enabled_) {
       return;
@@ -72,7 +73,7 @@ class HealthLogger {
     NowStamp(ts, sizeof(ts));
     char row[384];
     snprintf(row, sizeof(row),
-             "%s,%d,%s,%s,%s,%s,%s,%u,%s,%u,%u,%u,%.3f,%u", ts, handle,
+             "%s,%d,%s,%s,%s,%s,%s,%u,%s,%llu,%llu,%llu,%.3f,%u", ts, handle,
              (bcode && bcode[0]) ? bcode : "?", state, temp, fan, motor, dirty,
              system, recv_total, loss_total, drop_total, loss_pct, disc);
     Write("snapshot",

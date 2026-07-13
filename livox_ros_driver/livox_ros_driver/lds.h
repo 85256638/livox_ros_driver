@@ -114,14 +114,15 @@ typedef enum {
 } ExtrinsicParameterType;
 
 typedef struct {
-  uint32_t receive_packet_count;
-  uint32_t loss_packet_count;
+  uint64_t receive_packet_count;
+  uint64_t loss_packet_count;
+  uint64_t publish_packet_count; /**< real pointcloud packets published */
   int64_t last_timestamp;
   int64_t timebase; /**< unit:ns */
   int64_t last_imu_timestamp;
   int64_t imu_timebase; /**< unit:ns */
   uint32_t timebase_state;
-  uint32_t queue_drop_count; /**< packets dropped because the queue was full */
+  uint64_t queue_drop_count; /**< packets dropped because the queue was full */
   int64_t last_recv_ts_ns;   /**< last received pointcloud ts, for loss estimate */
   int64_t last_report_ns;    /**< steady-clock ns of last stats report */
   uint32_t win_recv;         /**< received pkts in current report window */

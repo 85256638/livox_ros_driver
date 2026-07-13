@@ -244,6 +244,8 @@ uint32_t Lddc::PublishPointcloud2(LidarDataQueue *queue, uint32_t packet_num,
 
     if (!is_zero_packet) {
       QueuePopUpdate(queue);
+      /** real packet consumed & converted (holder: DistributeLidarData lock) */
+      ++lidar->statistic_info.publish_packet_count;
     } else {
       is_zero_packet = 0;
     }
@@ -369,6 +371,8 @@ uint32_t Lddc::PublishPointcloudData(LidarDataQueue *queue, uint32_t packet_num,
     FillPointsToPclMsg(cloud, dst_point, single_point_num);
     if (!is_zero_packet) {
       QueuePopUpdate(queue);
+      /** real packet consumed & converted (holder: DistributeLidarData lock) */
+      ++lidar->statistic_info.publish_packet_count;
     } else {
       is_zero_packet = 0;
     }
@@ -510,6 +514,8 @@ uint32_t Lddc::PublishCustomPointcloud(LidarDataQueue *queue,
 
     if (!is_zero_packet) {
       QueuePopUpdate(queue);
+      /** real packet consumed & converted (holder: DistributeLidarData lock) */
+      ++lidar->statistic_info.publish_packet_count;
     } else {
       is_zero_packet = 0;
     }

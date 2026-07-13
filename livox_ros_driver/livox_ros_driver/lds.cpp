@@ -24,6 +24,7 @@
 
 #include "lds.h"
 
+#include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -694,10 +695,12 @@ void Lds::ReportPacketStatistic(uint8_t handle) {
     double net_loss_pct = expected ? (100.0 * w_loss / expected) : 0.0;
     double drop_pct = w_recv ? (100.0 * w_drop / w_recv) : 0.0;
     printf("[LivoxStats][WARN] Lidar[%d][%s] 5s: recv=%u net_loss=%u(%.2f%%) "
-           "queue_drop=%u(%.2f%%) | total recv=%u net_loss=%u drop=%u\n",
+           "queue_drop=%u(%.2f%%) | total recv=%" PRIu64
+           " net_loss=%" PRIu64 " drop=%" PRIu64 " published=%" PRIu64
+           "\n",
            handle, p_lidar->info.broadcast_code, w_recv, w_loss, net_loss_pct,
            w_drop, drop_pct, st->receive_packet_count, st->loss_packet_count,
-           st->queue_drop_count);
+           st->queue_drop_count, st->publish_packet_count);
   }
 
   st->win_recv = 0;
@@ -717,15 +720,6 @@ void Lds::StorageRawPacket(uint8_t handle, LivoxEthPacket* eth_packet) {
   if (eth_packet->data_type >= kMaxPointDataType) {
     return;
   }
-  LidarDevice *p_lidar = &lidars_[handle];
-  /** Ignore data for a lidar the driver considers disconnected. The point-cloud
-   *  UDP stream and the heartbeat are separate channels, so a lidar can keep
-   *  streaming data after a heartbeat-timeout disconnect. Counting it would make
-   *  the stats look healthy while the driver reports the lidar disconnected. */
-  if (p_lidar->connect_state == kConnectStateOff) {
-    return;
-  }
-  LidarPacketStatistic *packet_statistic = &p_lidar->statistic_info;
   LdsStamp cur_timestamp;
   uint64_t timestamp;
 
@@ -736,6 +730,18 @@ void Lds::StorageRawPacket(uint8_t handle, LivoxEthPacket* eth_packet) {
     printf("Raw EthPacket time out of range Lidar[%d]\n", handle);
     return;
   }
+
+  /** Keep the connection-state check, device metadata/statistics update, queue
+   *  allocation and queue push in one transaction. In particular, re-checking
+   *  Off only after acquiring this lock prevents a packet callback that raced
+   *  with disconnect/ResetLidar from allocating a fresh queue for a device that
+   *  has already been reset. */
+  std::lock_guard<std::mutex> lk(data_lock_[handle]);
+  LidarDevice *p_lidar = &lidars_[handle];
+  if (p_lidar->connect_state == kConnectStateOff) {
+    return;
+  }
+  LidarPacketStatistic *packet_statistic = &p_lidar->statistic_info;
 
   if (kImu != eth_packet->data_type) {
     UpdateLidarInfoByEthPacket(p_lidar, eth_packet);
@@ -763,39 +769,35 @@ void Lds::StorageRawPacket(uint8_t handle, LivoxEthPacket* eth_packet) {
         int64_t missed = gap / interval - 1;
         if (missed > 0 && missed < 1000) {
           /** cap ignores reconnect / PPS-sync jumps (not single losses) */
-          packet_statistic->loss_packet_count += (uint32_t)missed;
+          packet_statistic->loss_packet_count += (uint64_t)missed;
           packet_statistic->win_loss += (uint32_t)missed;
         }
       }
     }
     packet_statistic->last_recv_ts_ns = (int64_t)timestamp;
 
-    /** Guard queue alloc/push against concurrent ResetLidar (disconnect) */
-    {
-      std::lock_guard<std::mutex> lk(data_lock_[handle]);
-      LidarDataQueue *p_queue = &p_lidar->data;
-      if (nullptr == p_queue->storage_packet) {
-        uint32_t queue_size = CalculatePacketQueueSize(
-            buffer_time_ms_, p_lidar->info.type, eth_packet->data_type);
-        InitQueue(p_queue, queue_size);
-        printf("Lidar[%d][%s] storage queue size : %d %d\n", p_lidar->handle,
-               p_lidar->info.broadcast_code, queue_size, p_queue->size);
-      }
-      if (!QueueIsFull(p_queue)) {
-        QueuePushAny(p_queue, (uint8_t *)eth_packet,
-            GetEthPacketLen(eth_packet->data_type),
-            packet_statistic->timebase,
-            GetPointsPerPacket(eth_packet->data_type));
-        if (QueueUsedSize(p_queue) > p_lidar->onetime_publish_packets) {
-          if (semaphore_.GetCount() <= 0) {
-            semaphore_.Signal();
-          }
+    LidarDataQueue *p_queue = &p_lidar->data;
+    if (nullptr == p_queue->storage_packet) {
+      uint32_t queue_size = CalculatePacketQueueSize(
+          buffer_time_ms_, p_lidar->info.type, eth_packet->data_type);
+      InitQueue(p_queue, queue_size);
+      printf("Lidar[%d][%s] storage queue size : %d %d\n", p_lidar->handle,
+             p_lidar->info.broadcast_code, queue_size, p_queue->size);
+    }
+    if (!QueueIsFull(p_queue)) {
+      QueuePushAny(p_queue, (uint8_t *)eth_packet,
+          GetEthPacketLen(eth_packet->data_type),
+          packet_statistic->timebase,
+          GetPointsPerPacket(eth_packet->data_type));
+      if (QueueUsedSize(p_queue) > p_lidar->onetime_publish_packets) {
+        if (semaphore_.GetCount() <= 0) {
+          semaphore_.Signal();
         }
-      } else {
-        /** consumer can't keep up -> packet silently dropped here. Count it. */
-        packet_statistic->queue_drop_count++;
-        packet_statistic->win_drop++;
       }
+    } else {
+      /** consumer can't keep up -> packet silently dropped here. Count it. */
+      packet_statistic->queue_drop_count++;
+      packet_statistic->win_drop++;
     }
 
     ReportPacketStatistic(handle);
@@ -812,8 +814,6 @@ void Lds::StorageRawPacket(uint8_t handle, LivoxEthPacket* eth_packet) {
     }
     packet_statistic->last_imu_timestamp = cur_timestamp.stamp;
 
-    /** Guard queue alloc/push against concurrent ResetLidar (disconnect) */
-    std::lock_guard<std::mutex> lk(data_lock_[handle]);
     LidarDataQueue *p_queue = &p_lidar->imu_data;
     if (nullptr == p_queue->storage_packet) {
       uint32_t queue_size = 256;  /* fixed imu data queue size */
