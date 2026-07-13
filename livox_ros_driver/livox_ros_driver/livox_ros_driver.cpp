@@ -245,6 +245,12 @@ static const uint32_t kErrorRebootMaxAttempts = 3;
  *  hiccups don't spam either. */
 static const uint32_t kNoDataLogSec = 3;
 
+/** The Error reboot budget (kErrorRebootMaxAttempts) is cleared only after the
+ *  lidar has been out of Error this long. A reboot cycles through Init/Normal
+ *  for a few ticks; clearing on any single non-Error tick would reset the
+ *  budget every cycle and bypass the "max attempts then manual" stop. */
+static const uint32_t kErrorClearAfterSec = 60;
+
 /** Timer callback (runs on the AsyncSpinner thread, independent of the data
  *  loop so it keeps updating even if a lidar stops sending). Publishes a
  *  preformatted dashboard of all connected lidars. */
@@ -256,12 +262,15 @@ void StatsTimerCb(const ros::TimerEvent &) {
    *  the command but do not actually change mode, so confirm the real state. */
   g_read_lidar->TickSleepModeVerification();
   static uint64_t prev_recv[kMaxLidarCount] = {0};
+  static uint64_t prev_pub[kMaxLidarCount] = {0};
   static uint64_t prev_drop[kMaxLidarCount] = {0};
   static bool ever_seen[kMaxLidarCount] = {false};
   static char last_bcode[kMaxLidarCount][kBdCodeSize + 1] = {{0}};
-  static uint32_t zero_secs[kMaxLidarCount] = {0};      /**< consecutive 1s ticks with no data while Normal */
+  static uint32_t zero_secs[kMaxLidarCount] = {0};      /**< stage timer of the current stall (reset when a recovery cycle recycles) */
+  static uint32_t nodata_secs[kMaxLidarCount] = {0};    /**< whole-episode stall duration (display + NODATA/DATABACK log) */
   static uint8_t recover_stage[kMaxLidarCount] = {0};   /**< 0=ok 1=restarted sampling 2=rebooted */
   static uint32_t error_secs[kMaxLidarCount] = {0};     /**< consecutive 1s ticks in Error state */
+  static uint32_t error_free_secs[kMaxLidarCount] = {0}; /**< consecutive non-Error ticks, for clearing the attempt budget */
   static uint8_t error_reboots[kMaxLidarCount] = {0};   /**< reboots attempted this Error episode */
   static bool nodata_logged[kMaxLidarCount] = {false};  /**< a NODATA onset event has been logged for the current silent episode */
 
@@ -337,53 +346,71 @@ void StatsTimerCb(const ros::TimerEvent &) {
     char line[256];
     if (connected) {
       uint32_t d_recv = (uint32_t)(st.receive_packet_count - prev_recv[h]);
+      uint32_t d_pub = (uint32_t)(st.publish_packet_count - prev_pub[h]);
       uint32_t d_drop = (uint32_t)(st.queue_drop_count - prev_drop[h]);
       prev_recv[h] = st.receive_packet_count;
+      prev_pub[h] = st.publish_packet_count;
       prev_drop[h] = st.queue_drop_count;
 
-      /** A lidar in Normal state should be streaming; PowerSaving/Standby
-       *  legitimately produce no data, so only watch when state == Normal. */
-      bool should_stream = (l->info.state == kLidarStateNormal);
-      if (should_stream && d_recv == 0) {
+      /** Watch "should be DELIVERING points but is not" -- keyed on published
+       *  packets, not received ones. A lidar stuck mid-configure keeps
+       *  receiving into a full queue that nobody consumes (recv/s normal,
+       *  drop 100%, zero ROS output; field-confirmed), which a recv-based
+       *  check is blind to. PowerSaving/Standby/Init/Error legitimately
+       *  produce nothing, and a lidar inside a planned mode switch is left to
+       *  the mode verify/retry machinery instead of this watchdog. */
+      bool transition = g_read_lidar->IsModeTransitionActive(h);
+      bool should_stream = (l->info.state == kLidarStateNormal) && !transition;
+      if (should_stream && d_pub == 0) {
         zero_secs[h]++;
+        nodata_secs[h]++;
         /** Log the onset of a "Normal but silent" episode (once), with the
          *  wall-clock time -- so afterwards you can see exactly when a lidar
          *  went silent (e.g. correlate a slow wake with the scheduler log). */
-        if (!nodata_logged[h] && zero_secs[h] >= kNoDataLogSec) {
+        if (!nodata_logged[h] && nodata_secs[h] >= kNoDataLogSec) {
           hlog.LogEvent(h, last_bcode[h], "NODATA", "");
           nodata_logged[h] = true;
         }
       } else {
         /** Episode ended: if we logged its onset, record how long it stayed
-         *  silent. d_recv>0 => data resumed; otherwise the state left Normal
-         *  (slept / errored). zero_secs still holds the silent duration here. */
+         *  silent. d_pub>0 => data resumed; otherwise the state left Normal
+         *  (slept / errored / planned switch started). */
         if (nodata_logged[h]) {
           char det[40];
-          snprintf(det, sizeof(det), "silent %us%s", zero_secs[h],
-                   d_recv > 0 ? "" : " (left Normal)");
+          snprintf(det, sizeof(det), "silent %us%s", nodata_secs[h],
+                   d_pub > 0 ? "" : " (left Normal)");
           hlog.LogEvent(h, last_bcode[h], "DATABACK", det);
           nodata_logged[h] = false;
         }
         zero_secs[h] = 0;
+        nodata_secs[h] = 0;
         recover_stage[h] = 0;
       }
 
-      /** (B) Two-stage auto-recovery for a "Normal but no data" stall. */
+      /** (B) Two-stage auto-recovery for a "Normal but not publishing" stall.
+       *  RestartSampling also re-arms a lidar whose earlier start-sampling
+       *  timed out and left it demoted out of the Sampling state. */
       if (g_auto_recover && should_stream) {
         if (recover_stage[h] == 0 && zero_secs[h] >= 5) {
           g_read_lidar->RequestRestartSampling(h);
-          ROS_WARN("[LivoxRecover] Lidar[%d] no data for 5s -> restart sampling",
-                   h);
+          ROS_WARN("[LivoxRecover] Lidar[%d] no published data for 5s -> "
+                   "restart sampling", h);
           recover_stage[h] = 1;
         } else if (recover_stage[h] == 1 && zero_secs[h] >= 15) {
           g_read_lidar->RequestLidarReboot(h);
           ls.recover_reboot_count++;
           ls.recover_last_wall_s = (int64_t)time(nullptr);
-          ROS_WARN("[LivoxRecover] Lidar[%d] still no data for 15s -> reboot", h);
+          ROS_WARN("[LivoxRecover] Lidar[%d] still no published data for 15s "
+                   "-> reboot", h);
           hlog.LogEvent(h, last_bcode[h], "REBOOT", "no-data 15s");
           recover_stage[h] = 2;
         } else if (recover_stage[h] == 2 && zero_secs[h] >= 45) {
-          recover_stage[h] = 0;  /** reboot didn't help; allow another cycle */
+          /** Reboot didn't help; allow another cycle. Reset the stage timer
+           *  too -- leaving it running keeps every threshold permanently
+           *  exceeded and degrades the cycle into a restart/reboot every
+           *  tick (a 3-second reboot storm). */
+          recover_stage[h] = 0;
+          zero_secs[h] = 0;
         }
       }
 
@@ -393,9 +420,18 @@ void StatsTimerCb(const ros::TimerEvent &) {
       bool in_error = (l->info.state == kLidarStateError);
       if (in_error) {
         error_secs[h]++;
+        error_free_secs[h] = 0;
       } else {
         error_secs[h] = 0;      /** left Error (recovered or other state) */
-        error_reboots[h] = 0;
+        /** Clear the reboot budget only after a SUSTAINED recovery
+         *  (kErrorClearAfterSec out of Error). A reboot passes through
+         *  Init/Normal for a few ticks; clearing on any one of them would
+         *  reset the budget every cycle and turn "max 3 attempts then
+         *  manual" into an endless reboot loop. */
+        if (error_reboots[h] != 0 && ++error_free_secs[h] >= kErrorClearAfterSec) {
+          error_reboots[h] = 0;
+          error_free_secs[h] = 0;
+        }
       }
       if (g_auto_recover && in_error) {
         if (error_reboots[h] < kErrorRebootMaxAttempts) {
@@ -428,7 +464,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
 
       /** (A) Flag a connected-but-silent lidar loudly instead of "Normal". */
       const char *st_str = LidarStateStr(l->info.state);
-      if (should_stream && zero_secs[h] >= kNoDataLogSec) {
+      if (should_stream && nodata_secs[h] >= kNoDataLogSec) {
         st_str = "NO DATA";
       }
       snprintf(line, sizeof(line),
@@ -441,8 +477,9 @@ void StatsTimerCb(const ros::TimerEvent &) {
                          st.queue_drop_count, loss_pct_d, disc);
       }
     } else {
-      prev_recv[h] = prev_drop[h] = 0;
+      prev_recv[h] = prev_pub[h] = prev_drop[h] = 0;
       zero_secs[h] = 0;
+      nodata_secs[h] = 0;
       recover_stage[h] = 0;
       /** Close any open silent episode; the DISCONNECT event already marks the
        *  transition, so no separate DATA row is needed here. */

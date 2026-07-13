@@ -1057,6 +1057,15 @@ void LdsLidar::StartSampleCb(livox_status status, uint8_t handle,
       printf("Lidar start sample fail : state[%d] handle[%d] res[%d]\n", status,
              handle, response);
     } else {
+      /** Promote back to Sampling on success. Without this, a start-sampling
+       *  retry (auto_recover) after an earlier timeout demoted the state to On
+       *  leaves it at On forever: the lidar streams, but the consumer only
+       *  reads Sampling-state queues, so every packet is queue-dropped
+       *  (field-confirmed: recv normal, drop 100%, no ROS output). Guard
+       *  against a disconnect that raced the ack. */
+      if (p_lidar->connect_state != kConnectStateOff) {
+        p_lidar->connect_state = kConnectStateSampling;
+      }
       printf("Lidar start sample success\n");
     }
   } else if (status == kStatusTimeout) {
