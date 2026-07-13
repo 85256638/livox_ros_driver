@@ -5,12 +5,12 @@
 1. **在线工作模式切换** — 运行时通过 ROS Service 切换 LiDAR 工作模式（Normal / PowerSaving / Standby）；休眠/待机切换带**实际状态校验 + 自动重试**（防个别雷达 ack 成功却没真切）
 2. **远程重启** — 通过 ROS Service 软重启雷达，无需现场断电
 3. **可配置点云距离过滤** — 通过 launch 参数设置最大发布距离，无需重新编译
-4. **掉线崩溃修复（UAF）** — 修复官方驱动在雷达掉线时的 use-after-free 竞态崩溃
+4. **掉线崩溃修复（UAF）** — 修复官方驱动在雷达掉线时的 use-after-free 竞态崩溃（收包/统计/队列已并入同一把锁的事务）
 5. **状态抖动断流修复** — 避免温度/电机告警等瞬时状态抖动导致话题断流
-6. **健康与丢包监控** — 异常日志告警 + `livox/lidar_stats` 实时看板（温度/风扇/**电机**状态、丢包、掉线，独立终端原地刷新，底部含**故障/自动恢复历史**）
-7. **畸形包硬化** — 拒绝非法 `data_type`，堵住缓冲区溢出
+6. **健康与丢包监控** — 异常日志告警 + `livox/lidar_stats` 实时看板（温度/风扇/**电机**状态、丢包、掉线，独立终端原地刷新，底部含**故障/自动恢复历史**）；累计计数 64 位，长期运行不回绕
+7. **畸形包硬化** — 拒绝非法 `data_type`；发布时**按每包自身类型**解析，堵住类型混用越界（ASan 实证过的内存破坏）
 8. **零点洪泛防护** — 大丢包/掉线时限制零点回填，避免整片假点污染融合点云
-9. **自动恢复看门狗（可选）** — 检测到假活（`Normal` 但无数据）或 `Error`（如电机故障）时自动重启该雷达，带重试上限防死循环
+9. **自动恢复看门狗（可选）** — 检测到假活（`Normal` 但**没有点云发布**，含"在收包但驱动卡住没发布"的隐蔽卡死）或 `Error`（如电机故障）时自动重启该雷达，带重试上限防死循环
 10. **持久化健康日志（可选）** — 把健康事件与网络趋势落盘成 CSV（边沿事件 + 周期快照），供长期无人值守的趋势分析与故障取证
 
 > 功能 1/2 需配套修改版 SDK；功能 3~10 为纯 ROS 驱动层改动，配任意 SDK 均可用。详见各章节。
@@ -154,6 +154,12 @@ rosservice call /livox_lidar_mode "{handle: 255, mode: 2}"
 
 > 仍切不成的极端情况：日志打印 `did not enter mode[..] after 3 retries -- manual check needed`，**同时看板底部会显示一行 `Mode switch: lidar X: PowerSaving FAILED N time(s), last at ...`**（只在发生过时出现、恢复后仍保留），这样盯着看板也不会漏掉"哪台没切成、该人工介入"。
 
+### 模式命令的其他保障
+
+- **广播只发给"当前真正连着"的雷达**：`handle:255` 不再给 4~31 号不存在的 handle 排队请求（旧行为会留下"陈旧的 Normal 请求"，等以后哪台雷达占了那个 handle 就被误命令）。一台雷达都没连时 `ret_code` 返回未连接而不是假成功。
+- **迟到的 Normal 状态事件不会取消新的休眠请求**：雷达的状态事件可能因健康位变化而重复上报；旧逻辑一收到 Normal 就把当前模式请求清掉——若你刚发完唤醒又紧接着发休眠（如调度器两个条件先后触发），迟到的 Normal 事件会把休眠请求删掉、校验重试也随之失效。现在只有"目标就是 Normal"的请求才会被 Normal 事件完成。
+- **一个操作建议**：仍应避免在上一条模式命令完成前发送**相反**命令（唤醒后等所有雷达出数据、稳定数秒，再发休眠）——驱动能自愈这种冲突，但雷达固件会坚持完成前一个流程，来回打架只会拖慢切换。
+
 ### 断线行为
 
 | 场景 | 行为 |
@@ -189,28 +195,27 @@ rosservice call /livox_lidar_reboot "{handle: 255}"
 
 ### 使用方法
 
+> ⚠️ 该 launch 参数目前只在 **`livox_lidar_multi.launch`** 里接了线（单雷达 `livox_lidar.launch` 没有这个 arg，传了会报 unused argument）。
+
 ```bash
 # 只发布 5 米以内的点
-roslaunch livox_ros_driver livox_lidar.launch max_distance:=5.0
+roslaunch livox_ros_driver livox_lidar_multi.launch max_distance:=5.0
 
-# 只发布 2 米以内的点
-roslaunch livox_ros_driver livox_lidar.launch max_distance:=2.0
-
-# 禁用过滤，发布所有点（默认）
-roslaunch livox_ros_driver livox_lidar.launch max_distance:=0
+# 禁用过滤，发布所有点
+roslaunch livox_ros_driver livox_lidar_multi.launch max_distance:=0
 ```
 
 也可在 launch 文件中修改默认值：
 
 ```xml
-<arg name="max_distance" default="5.0"/>
+<arg name="max_distance" default="25.0"/>
 ```
 
 ### 参数说明
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `max_distance` | double | 0.0 | 最大发布距离（米），0 表示禁用过滤 |
+| `max_distance` | double | **25.0**（multi launch 的 default）| 最大发布距离（米），0 表示禁用过滤 |
 
 启动时终端会输出确认信息：
 ```
@@ -248,6 +253,16 @@ roslaunch livox_ros_driver livox_lidar.launch max_distance:=0
 
 **修复**：每帧点云的零点回填**最多 10 个包**（`kMaxZeroFillPacketPerMsg`），到上限即停止补零、转去处理真实包并重同步时间戳。三处发布路径（`PublishPointcloud2` / `PublishPointcloudData` / `PublishCustomPointcloud`）一致生效。正常无缺口时计数恒为 0、**行为完全不变**；只在病态丢包下从"无底洞灌假点"变成"补几个就回到真数据"。保留了小丢包（1~2 包）补零以维持时间戳连续的合理用途。
 
+### 4. 数据类型混用越界修复（内存安全）
+
+**官方行为**：发布器用"设备**最新**的 data_type"去解析队列里的**所有**包。但一次回波模式/坐标系重配置（首次连接、休眠唤醒、重连都会触发）之后，队列里可能还残留**旧类型**的包——用新类型的解析器去读旧包，步长就是错的，会越界读写（AddressSanitizer 实测可复现：单回波包被按三回波解析时，向 2KB 栈缓冲写入超过 5KB，足以崩溃或静默破坏内存）。
+
+**修复**：三处发布路径全部改为**按每个包自带的 `data_type`** 选解析器和回波数（包的点数本来就是入队时按包自身类型记录的）。同构数据流（正常情况）行为完全一致；混流时每个包都按自己的真实格式解析，越界在构造上不可能发生。
+
+### 5. 累计计数 64 位化（防 ~20 天回绕）
+
+收包/丢包/队列丢弃累计计数原为 32 位——Horizon 单回波速率下约 **19.9 天**就会回绕，导致累计 `loss%`、CSV 快照和长期趋势统计突跳失真。全部改为 64 位（看板、`[LivoxStats]` 日志、快照 CSV 一致），并新增 `published` 累计（真正发布出去的包数——"收到了多少"和"发出去了多少"从此可分开审计）。
+
 ---
 
 ## 新增功能四：丢包可视化
@@ -259,7 +274,7 @@ roslaunch livox_ros_driver livox_lidar.launch max_distance:=0
 驱动每 5 秒检查一次，**只有在该窗口内丢包达到一定程度时才打印一行**，健康运行时日志保持干净：
 
 ```
-[LivoxStats][WARN] Lidar[0][1PQDH5B00100041] 5s: recv=12480 net_loss=80(0.64%) queue_drop=3(0.02%) | total recv=998400 net_loss=152 drop=10
+[LivoxStats][WARN] Lidar[0][1PQDH5B00100041] 5s: recv=12480 net_loss=80(0.64%) queue_drop=3(0.02%) | total recv=998400 net_loss=152 drop=10 published=998390
 ```
 
 触发条件：**窗口网络丢包率 ≥ 0.5%**，或**出现任何队列丢包**（消费跟不上，总是值得知道）。
@@ -318,8 +333,8 @@ handle  broadcast_code   state         temp  fan   motor recv/s  loss%    drop/s
 1       3WEDH7600103661  Normal        OK    OK    OK      2498    2.24%       0      3       12s      8m05s
 2       3WEDH5900100671  Normal        OK    OK    OK      2497    0.00%       0      0        --      2h13m
 Temp changes: none (all lidars normal since start)
-Fault events:  lidar 1: 1 time(s) (motor+fan), last at 13:46:03
-Auto-recover:  lidar 1: 1 reboot(s), last at 13:46:08
+Fault events:  lidar 1: 1 time(s) (motor+fan), last at 2026-06-26 13:46:03
+Auto-recover:  lidar 1: 1 reboot(s), last at 2026-06-26 13:46:08
 (updated: 1718000000.0)
 ```
 上例 1 号 `loss% = 2.24%` 明显高于其它（其它 0.00%）——说明它**累计**网络丢得多，是最该排查的那台。它 `disc = 3`（掉过 3 次），`HB_lost = 12s` 表示**最近那次心跳丢失（掉线）持续了 12 秒**就重连了，而 `heartbeat = 8m05s` 是从那次重连至今心跳维持的时长——两者不同，一眼区分"上次断了多久"和"这次稳了多久"。底部的 **Fault events / Auto-recover** 还显示 1 号早些时候出过一次 `motor+fan` 故障、被自动重启过一次（虽然现在已恢复 `Normal`）——这种"出过事但已恢复"的历史，实时那几列是看不到的。
@@ -328,7 +343,7 @@ Auto-recover:  lidar 1: 1 reboot(s), last at 13:46:08
 
 | 列 | 含义 |
 |----|------|
-| `state` | `Normal` 正常 / `NO DATA` **连着但收不到点云**（假活，见下方）/ `DISCONNECTED` 掉线 / `PowerSaving` 节电 / `Error` 故障 |
+| `state` | `Normal` 正常 / `NO DATA` **连着但没有点云发布出来**（假活——没收到数据，或收到了但驱动卡住没发布，两种都算；见下方）/ `DISCONNECTED` 掉线 / `PowerSaving` 节电 / `Error` 故障 |
 | `temp` | 温度状态 `OK` / `WARN`(偏高偏低) / `HOT!`(极端)。⚠️ 是状态码，**不是具体℃** |
 | `fan` | 风扇状态 `OK` 正常 / `WARN` **故障**（WARN 是风扇坏了，不是"在转"）|
 | `motor` | 电机（扫描)状态 `OK` 正常 / `WARN` 告警 / `ERR!` **错误，无法工作**（`ERR!` 意味着停止扫描、不再出点）|
@@ -388,14 +403,17 @@ Livox 的**心跳通道和点云数据通道是独立的**。偶尔会出现一�
 roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
 ```
 
-**情况 A：假活（连着 + `Normal` + 持续无数据）** —— 两段式：
+**情况 A：假活（连着 + `Normal` + 持续没有点云发布）** —— 两段式：
 
 | 阶段 | 触发 | 动作 |
 |------|------|------|
-| 1（轻）| 无数据满 5 秒 | 重发 `StartSampling`（几乎无中断）|
-| 2（重）| 仍无数据满 15 秒 | `RebootDevice` 重启该雷达（~10 秒恢复）|
+| 1（轻）| 无**发布**数据满 5 秒 | 重发 `StartSampling`（几乎无中断；也能把"上次启采样超时后卡在半路"的雷达重新拉回采样态）|
+| 2（重）| 仍无发布数据满 15 秒 | `RebootDevice` 重启该雷达（~10 秒恢复）|
+| 循环 | 重启后仍无发布数据满 45 秒 | 回到阶段 1 重来一整轮（**计时归零**，保持 5s/15s 节奏，不会退化成秒级重启风暴）|
 
+- 判据是**"发布出去的点云"**而不是"收到的 UDP 包"：一台雷达若卡在配置态，会一直收包但驱动一包都不发布（队列 100% 丢弃）——这种"在收但没出"的隐蔽卡死同样会被抓到并恢复（现场实证过的故障模式）
 - 只对 `Normal` 状态生效；**节电/待机**模式本就不出数据，不会被误恢复
+- **正在执行计划中的模式切换**（唤醒/休眠命令进行中）的雷达不受此路径打扰——切换由自己的校验/重试机制负责，不会被看门狗中途踹一脚
 
 **情况 B：`Error` 状态（如电机故障 `motor=ERR!`）** —— 这类故障雷达自报 `Error`、不算"在出数据"，情况 A 抓不到，单独处理：
 
@@ -406,13 +424,14 @@ roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
 | 3 次后仍 `Error` | **停止重启**，每 30 秒打一条 `[LivoxRecover]` `ERROR` 告警"需人工处理（多半是风扇/电机硬件坏了）" |
 
 - 设了上限是为了**避免死循环刷重启**：风扇/电机真物理损坏时，重启救不回来，试 3 次就放弃并明确报警，而不是无限重启掩盖故障
-- 恢复 `Normal` 后计数自动清零；冷却按"重连后仍 `Error` 的 40 秒"算，偏保守（给它时间稳定）
+- 重启次数**脱离 `Error` 持续 60 秒才清零**（重启过程会短暂经过 Init/Normal，若见一眼 Normal 就清零，3 次上限会被绕过、变成无限重启）；冷却按"重连后仍 `Error` 的 40 秒"算，偏保守（给它时间稳定）
+- `Error` 路径在模式切换期间**照常生效**：唤醒过程不该报 `Error`，报了就是真故障、就该快速重启（运维决策）
 
 两类共同点：只重启**出问题的那一台**；每次动作打印 `[LivoxRecover]` 日志；动作次数会出现在看板底部 `Auto-recover` 行；启动时日志显示 `Auto-recover ... : ENABLED / disabled`。
 
 > ⚠️ 这是驱动**自主重启硬件**的行为，所以默认关闭、需显式开启。无显示器的机器也能用（它和看板无关）。
 
-> **某台 `loss%` 偏高 → 重点排查那台的网线/接头/散热；某台 `state` 显示 `NO DATA` → Normal 却收不到点云（假活），要警觉；某台 `DISCONNECTED` → 已掉线，可远程重启 `rosservice call /livox_lidar_reboot "{handle: N}"`。**
+> **某台 `loss%` 偏高 → 重点排查那台的网线/接头/散热；某台 `state` 显示 `NO DATA` → Normal 却没有点云发布出来（假活），要警觉；某台 `DISCONNECTED` → 已掉线，可远程重启 `rosservice call /livox_lidar_reboot "{handle: N}"`。**
 
 #### 可选：持久化健康日志（`health_log`，长期无人值守用）
 
