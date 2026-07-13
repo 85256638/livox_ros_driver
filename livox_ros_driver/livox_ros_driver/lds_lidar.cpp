@@ -89,6 +89,12 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
     return;
   }
   LinkStat &s = link_stat_[handle];
+  /** The SDK can report the same disconnect more than once before a reconnect.
+   *  Count only the connected -> disconnected edge and retain the timestamp of
+   *  the first report so the outage duration is not shortened. */
+  if (s.connect_since_ns == 0 && s.last_disconnect_ns != 0) {
+    return;
+  }
   s.disconnect_count++;
   s.last_disconnect_ns =
       std::chrono::steady_clock::now().time_since_epoch().count();
@@ -225,6 +231,36 @@ void LdsLidar::ResetModeRequest(uint8_t handle) {
   }
 }
 
+bool LdsLidar::ResetModeRequestIfTarget(uint8_t handle, LidarMode target) {
+  if (handle >= kMaxLidarCount) {
+    return false;
+  }
+
+  lock_guard<mutex> lock(mode_mutex_);
+  ModeChangeRequest &request = mode_requests_[handle];
+  if (!request.active || request.desired_mode != target) {
+    return false;
+  }
+
+  char broadcast_code[kBroadcastCodeSize] = {0};
+  strncpy(broadcast_code, request.broadcast_code, sizeof(broadcast_code) - 1);
+  request = ModeChangeRequest();
+  if (broadcast_code[0] != '\0') {
+    strncpy(request.broadcast_code, broadcast_code,
+            sizeof(request.broadcast_code) - 1);
+    request.broadcast_code[sizeof(request.broadcast_code) - 1] = '\0';
+  }
+  return true;
+}
+
+bool LdsLidar::IsModeTransitionActive(uint8_t handle) {
+  if (handle >= kMaxLidarCount) {
+    return false;
+  }
+  lock_guard<mutex> lock(mode_mutex_);
+  return mode_requests_[handle].active;
+}
+
 namespace {
 /** How long to wait for a lidar's actual state to reach the requested sleep
  *  mode before re-sending, and how many times to re-send before giving up. */
@@ -265,7 +301,7 @@ void LdsLidar::TickSleepModeVerification() {
       }
     }
     if (done) {
-      ResetModeRequest(h);  // silent: the common success path
+      ResetModeRequestIfTarget(h, desired);  // silent: common success path
     } else if (resend) {
       printf("Lidar[%d] not in mode[%d] yet -- re-sending (attempt %u/%u)\n", h,
              desired, attempt, kSleepVerifyMaxRetries);
@@ -283,9 +319,9 @@ void LdsLidar::TickSleepModeVerification() {
       printf("Lidar[%d] did not enter mode[%d] after %u retries -- manual check "
              "needed\n",
              h, desired, kSleepVerifyMaxRetries);
-      ResetModeRequest(h);
+      ResetModeRequestIfTarget(h, desired);
     } else if (giveup) {
-      ResetModeRequest(h);  // disconnected mid-switch; silent
+      ResetModeRequestIfTarget(h, desired);  // disconnected mid-switch; silent
     }
   }
 }
@@ -619,8 +655,13 @@ void LdsLidar::OnDeviceChange(const DeviceInfo *info, DeviceEvent type) {
       p_lidar->connect_state = kConnectStateOn;
     }
 
+    /** A Normal state event only completes a pending NORMAL request. It must
+     *  not cancel a newer PowerSaving/Standby request: the SDK re-sends state
+     *  events on health/feature changes, and a late Normal event from a wake
+     *  would otherwise erase the sleep request queued right after it -- the
+     *  sleep verify tick then never runs and the switch is silently lost. */
     if (info->state == ModeToState(kLidarModeNormal)) {
-      g_lds_ldiar->ResetModeRequest(handle);
+      g_lds_ldiar->ResetModeRequestIfTarget(handle, kLidarModeNormal);
     }
   }
 

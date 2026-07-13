@@ -49,6 +49,18 @@ const int32_t kSdkVersionMajorLimit = 2;
 /** Pointer to LdsLidar for service callback, only valid when data_src == raw lidar */
 static LdsLidar *g_read_lidar = nullptr;
 
+/** A broadcast service request must only target a live SDK handle.  ResetLidar
+ *  deliberately sets LidarDevice::handle to kMaxSourceLidar, so checking both
+ *  fields also prevents a stale slot from receiving a queued request. */
+static bool IsCurrentConnectedHandle(uint8_t handle) {
+  if (g_read_lidar == nullptr || handle >= kMaxLidarCount) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(g_read_lidar->data_lock_[handle]);
+  const LidarDevice &lidar = g_read_lidar->lidars_[handle];
+  return lidar.connect_state != kConnectStateOff && lidar.handle == handle;
+}
+
 bool LidarModeServiceCb(livox_ros_driver::LidarMode::Request &req,
                         livox_ros_driver::LidarMode::Response &res) {
   if (g_read_lidar == nullptr) {
@@ -66,14 +78,24 @@ bool LidarModeServiceCb(livox_ros_driver::LidarMode::Request &req,
   if (req.handle == 255) {
     /** Broadcast to all connected LiDARs */
     ROS_INFO("LiDAR mode service: ALL lidars -> mode=%d", req.mode);
-    livox_status last_status = kStatusSuccess;
+    livox_status last_status = kStatusNotConnected;
+    bool requested = false;
     for (uint8_t h = 0; h < kMaxLidarCount; h++) {
+      if (!IsCurrentConnectedHandle(h)) {
+        continue;
+      }
+      requested = true;
       livox_status s = g_read_lidar->RequestLidarModeChange(
           h, static_cast<LidarMode>(req.mode));
-      if (s != kStatusSuccess && s != kStatusNotConnected) {
+      if (s == kStatusSuccess) {
+        last_status = kStatusSuccess;
+      } else {
         ROS_WARN("LiDAR mode change failed for handle=%d: %d", h, s);
         last_status = s;
       }
+    }
+    if (!requested) {
+      ROS_WARN("LiDAR mode service: no connected lidar to broadcast to");
     }
     res.ret_code = last_status;
     return true;
@@ -103,13 +125,23 @@ bool LidarRebootServiceCb(livox_ros_driver::LidarReboot::Request &req,
   if (req.handle == 255) {
     /** Reboot all connected LiDARs */
     ROS_INFO("LiDAR reboot service: ALL lidars");
-    livox_status last_status = kStatusSuccess;
+    livox_status last_status = kStatusNotConnected;
+    bool requested = false;
     for (uint8_t h = 0; h < kMaxLidarCount; h++) {
+      if (!IsCurrentConnectedHandle(h)) {
+        continue;
+      }
+      requested = true;
       livox_status s = g_read_lidar->RequestLidarReboot(h);
-      if (s != kStatusSuccess && s != kStatusNotConnected) {
+      if (s == kStatusSuccess) {
+        last_status = kStatusSuccess;
+      } else {
         ROS_WARN("LiDAR reboot failed for handle=%d: %d", h, s);
         last_status = s;
       }
+    }
+    if (!requested) {
+      ROS_WARN("LiDAR reboot service: no connected lidar to broadcast to");
     }
     res.ret_code = last_status;
     return true;
@@ -171,7 +203,7 @@ static std::string FaultTags(uint32_t code) {
   return s.empty() ? "?" : s;
 }
 
-/** Format a wall-clock time_t as HH:MM:SS, or "--" when 0 (never). */
+/** Format a wall-clock time_t with its date, or "--" when 0 (never). */
 static std::string FmtWall(int64_t t) {
   if (t == 0) {
     return "--";
@@ -179,8 +211,8 @@ static std::string FmtWall(int64_t t) {
   time_t tt = (time_t)t;
   struct tm tmv;
   localtime_r(&tt, &tmv);
-  char buf[16];
-  strftime(buf, sizeof(buf), "%H:%M:%S", &tmv);
+  char buf[24];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv);
   return std::string(buf);
 }
 
@@ -223,8 +255,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
   /** Verify/retry any in-progress PowerSaving/Standby switch: some lidars ack
    *  the command but do not actually change mode, so confirm the real state. */
   g_read_lidar->TickSleepModeVerification();
-  static uint32_t prev_recv[kMaxLidarCount] = {0};
-  static uint32_t prev_drop[kMaxLidarCount] = {0};
+  static uint64_t prev_recv[kMaxLidarCount] = {0};
+  static uint64_t prev_drop[kMaxLidarCount] = {0};
   static bool ever_seen[kMaxLidarCount] = {false};
   static char last_bcode[kMaxLidarCount][kBdCodeSize + 1] = {{0}};
   static uint32_t zero_secs[kMaxLidarCount] = {0};      /**< consecutive 1s ticks with no data while Normal */
@@ -304,8 +336,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
     double loss_pct_d = tot ? (100.0 * st.loss_packet_count / tot) : 0.0;
     char line[256];
     if (connected) {
-      uint32_t d_recv = st.receive_packet_count - prev_recv[h];
-      uint32_t d_drop = st.queue_drop_count - prev_drop[h];
+      uint32_t d_recv = (uint32_t)(st.receive_packet_count - prev_recv[h]);
+      uint32_t d_drop = (uint32_t)(st.queue_drop_count - prev_drop[h]);
       prev_recv[h] = st.receive_packet_count;
       prev_drop[h] = st.queue_drop_count;
 

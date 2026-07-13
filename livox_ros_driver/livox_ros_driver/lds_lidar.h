@@ -62,6 +62,10 @@ class LdsLidar : public Lds {
   void TickSleepModeVerification();
   livox_status RequestLidarReboot(uint8_t handle, uint16_t timeout_ms = 100);
   livox_status RequestRestartSampling(uint8_t handle);
+  /** True while this lidar has an unfinished Normal/PowerSaving/Standby
+   *  request. Thread-safe; used by recovery code to avoid fighting a planned
+   *  mode transition. */
+  bool IsModeTransitionActive(uint8_t handle);
 
   /** Per-lidar connection history. Lives outside LidarDevice (which ResetLidar
    *  memsets on disconnect) so it survives disconnect/reconnect cycles. Read by
@@ -155,6 +159,7 @@ class LdsLidar : public Lds {
   bool IsBroadcastCodeExistInWhitelist(const char *broadcast_code);
   void RememberBroadcastCode(uint8_t handle, const char *broadcast_code);
   void ResetModeRequest(uint8_t handle);
+  bool ResetModeRequestIfTarget(uint8_t handle, LidarMode target);
   void MarkModeRequestDisconnected(uint8_t handle);
   livox_status SendModeChangeRequest(uint8_t handle, LidarMode mode,
                                      bool from_reconnect);
