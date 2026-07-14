@@ -26,6 +26,7 @@
 #define USER_UART_H_
 
 #include <stdint.h>
+#include <mutex>
 #include <sys/fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -75,11 +76,13 @@ class UserUart {
   ssize_t Read(char *buffer, size_t size);
   int Close();
   int Open(const char *filename);
-  bool IsOpen() { return is_open_; };
+  bool IsOpen();
 
  private:
+  int SetupUnlocked(uint8_t baudrate_index, uint8_t parity);
+  std::mutex mutex_;
   int fd_;
-  volatile bool is_open_;
+  bool is_open_;
 
   uint8_t baudrate_;
   uint8_t parity_;

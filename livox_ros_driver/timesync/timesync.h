@@ -25,6 +25,8 @@
 #ifndef TIMESYNC_TIMESYNC_H_
 #define TIMESYNC_TIMESYNC_H_
 
+#include <atomic>
+#include <memory>
 #include <thread>
 #include "comm_device.h"
 #include "comm_protocol.h"
@@ -53,12 +55,12 @@ class TimeSync {
   int32_t InitTimeSync(const TimeSyncConfig &config);
   int32_t DeInitTimeSync();
   void StartTimesync() {
-    start_poll_state_ = true;
-    start_poll_data_ = true;
+    start_poll_state_.store(true);
+    start_poll_data_.store(true);
   }
 
   int32_t SetReceiveSyncTimeCb(FnReceiveSyncTimeCb cb, void *data) {
-    if ((cb != nullptr) || (data != nullptr)) {
+    if (cb != nullptr) {
       fn_cb_ = cb;
       client_data_ = data;
       return 0;
@@ -78,22 +80,22 @@ class TimeSync {
   void StopTimesync();
 
   std::shared_ptr<std::thread> t_poll_state_;
-  volatile bool exit_poll_state_;
-  volatile bool start_poll_state_;
+  std::atomic<bool> exit_poll_state_;
+  std::atomic<bool> start_poll_state_;
 
   std::shared_ptr<std::thread> t_poll_data_;
-  volatile bool exit_poll_data_;
-  volatile bool start_poll_data_;
+  std::atomic<bool> exit_poll_data_;
+  std::atomic<bool> start_poll_data_;
 
   TimeSyncConfig config_;
   UserUart *uart_;
   CommProtocol *comm_;
-  volatile uint32_t rx_bytes_;
+  std::atomic<uint32_t> rx_bytes_;
 
   FnReceiveSyncTimeCb fn_cb_;
   void *client_data_;
 
-  volatile uint8_t fsm_state_;
+  uint8_t fsm_state_;
   std::chrono::steady_clock::time_point transfer_time_;
   void FsmTransferState(uint8_t new_state);
   void FsmOpenDev();

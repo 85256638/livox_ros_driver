@@ -35,23 +35,23 @@ namespace livox_ros {
 
 UserUart::UserUart(uint8_t baudrate_index, uint8_t parity)
     : baudrate_(baudrate_index), parity_(parity) {
-  fd_ = 0;
+  fd_ = -1;
   is_open_ = false;
 }
 
-UserUart::~UserUart() {
-  is_open_ = false;
-  if (fd_ > 0) {
-    /** first we flush the port */
-    tcflush(fd_, TCOFLUSH);
-    tcflush(fd_, TCIFLUSH);
-
-    close(fd_);
-  }
-}
+UserUart::~UserUart() { Close(); }
 
 int UserUart::Open(const char *filename) {
-  fd_ = open(filename, O_RDWR | O_NOCTTY);  //| O_NDELAY
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (fd_ >= 0) {
+    tcflush(fd_, TCIOFLUSH);
+    close(fd_);
+    fd_ = -1;
+  }
+  is_open_ = false;
+  /** Nonblocking open prevents shutdown from hanging in a carrier/device open.
+   *  Clear O_NONBLOCK after termios is configured so VMIN/VTIME governs reads. */
+  fd_ = open(filename, O_RDWR | O_NOCTTY | O_NONBLOCK);
   if (fd_ < 0) {
     printf("Open %s fail!\n", filename);
     return -1;
@@ -60,9 +60,17 @@ int UserUart::Open(const char *filename) {
     printf("Open %s success!\n", filename);
   }
 
-  if (fd_ > 0) {
+  if (fd_ >= 0) {
     /** set baudrate and parity,etc. */
-    if (Setup(baudrate_, parity_)) {
+    if (SetupUnlocked(baudrate_, parity_)) {
+      close(fd_);
+      fd_ = -1;
+      return -1;
+    }
+    int flags = fcntl(fd_, F_GETFL);
+    if (flags < 0 || fcntl(fd_, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+      close(fd_);
+      fd_ = -1;
       return -1;
     }
   }
@@ -72,12 +80,15 @@ int UserUart::Open(const char *filename) {
 }
 
 int UserUart::Close() {
+  std::lock_guard<std::mutex> lock(mutex_);
   is_open_ = false;
-  if (fd_ > 0) {
+  if (fd_ >= 0) {
     /** first we flush the port */
     tcflush(fd_, TCOFLUSH);
     tcflush(fd_, TCIFLUSH);
-    return close(fd_);
+    int result = close(fd_);
+    fd_ = -1;
+    return result;
   }
 
   return -1;
@@ -85,6 +96,11 @@ int UserUart::Close() {
 
 /** sets up the port parameters */
 int UserUart::Setup(uint8_t baudrate_index, uint8_t parity) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return SetupUnlocked(baudrate_index, parity);
+}
+
+int UserUart::SetupUnlocked(uint8_t baudrate_index, uint8_t parity) {
   static uint32_t baud_map[19] = {
       B2400,    B4800,    B9600,    B19200,   B38400,  B57600,   B115200,
       B230400,  B460800,  B500000,  B576000,  B921600, B1152000, B1500000,
@@ -97,10 +113,14 @@ int UserUart::Setup(uint8_t baudrate_index, uint8_t parity) {
   }
 
   /** clear old setting completely,must add here for CDC serial */
-  tcgetattr(fd_, &options);
+  if (tcgetattr(fd_, &options) != 0) {
+    return -1;
+  }
   memset(&options, 0, sizeof(options));
   tcflush(fd_, TCIOFLUSH);
-  tcsetattr(fd_, TCSANOW, &options);
+  if (tcsetattr(fd_, TCSANOW, &options) != 0) {
+    return -1;
+  }
   usleep(10000);
 
   /** Enable the receiver and set local mode... */
@@ -163,20 +183,25 @@ int UserUart::Setup(uint8_t baudrate_index, uint8_t parity) {
   /** Time to wait for data */
   options.c_cc[VTIME] = 1;
 
-  /** Minimum number of characters to read */
-  options.c_cc[VMIN] = 1;
+  /** A zero minimum makes an idle read return after VTIME (~100 ms). This
+   *  bounds TimeSync shutdown instead of leaving join blocked forever waiting
+   *  for the first serial byte. */
+  options.c_cc[VMIN] = 0;
 
   /** flush the port */
   tcflush(fd_, TCIOFLUSH);
 
   /** send new config to the port */
-  tcsetattr(fd_, TCSANOW, &options);
+  if (tcsetattr(fd_, TCSANOW, &options) != 0) {
+    return -1;
+  }
 
   return 0;
 }
 
 ssize_t UserUart::Write(const char *buffer, size_t size) {
-  if (fd_ > 0) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (fd_ >= 0) {
     return write(fd_, buffer, size);
   } else {
     return 0;
@@ -184,11 +209,17 @@ ssize_t UserUart::Write(const char *buffer, size_t size) {
 }
 
 ssize_t UserUart::Read(char *buffer, size_t size) {
-  if (fd_ > 0) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (fd_ >= 0) {
     return read(fd_, buffer, size);
   } else {
     return 0;
   }
+}
+
+bool UserUart::IsOpen() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return is_open_;
 }
 
 }  // namespace livox_ros

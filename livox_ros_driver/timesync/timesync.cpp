@@ -50,6 +50,15 @@ TimeSync::TimeSync()
 TimeSync::~TimeSync() { DeInitTimeSync(); }
 
 int32_t TimeSync::InitTimeSync(const TimeSyncConfig &config) {
+  if (t_poll_state_ || t_poll_data_ || uart_ || comm_) {
+    return -1;
+  }
+  exit_poll_state_.store(false);
+  start_poll_state_.store(false);
+  exit_poll_data_.store(false);
+  start_poll_data_.store(false);
+  rx_bytes_.store(0);
+  fsm_state_ = kOpenDev;
   config_ = config;
 
   if (config_.dev_config.type == kCommDevUart) {
@@ -81,8 +90,14 @@ int32_t TimeSync::InitTimeSync(const TimeSyncConfig &config) {
 int32_t TimeSync::DeInitTimeSync() {
   StopTimesync();
 
-  if (uart_) delete uart_;
-  if (comm_) delete comm_;
+  if (uart_) {
+    delete uart_;
+    uart_ = nullptr;
+  }
+  if (comm_) {
+    delete comm_;
+    comm_ = nullptr;
+  }
 
   fn_cb_ = nullptr;
   client_data_ = nullptr;
@@ -90,27 +105,31 @@ int32_t TimeSync::DeInitTimeSync() {
 }
 
 void TimeSync::StopTimesync() {
-  start_poll_state_ = false;
-  start_poll_data_ = false;
-  exit_poll_state_ = true;
-  exit_poll_data_ = true;
+  exit_poll_state_.store(true);
+  exit_poll_data_.store(true);
   if (t_poll_state_) {
-    t_poll_state_->join();
+    if (t_poll_state_->joinable()) {
+      t_poll_state_->join();
+    }
     t_poll_state_ = nullptr;
   }
 
   if (t_poll_data_) {
-    t_poll_data_->join();
+    if (t_poll_data_->joinable()) {
+      t_poll_data_->join();
+    }
     t_poll_data_ = nullptr;
   }
+  start_poll_state_.store(false);
+  start_poll_data_.store(false);
 }
 
 void TimeSync::PollStateLoop() {
-  while (!start_poll_state_) {
-    /* waiting to start */
+  while (!start_poll_state_.load() && !exit_poll_state_.load()) {
+    std::this_thread::yield();
   }
 
-  while (!exit_poll_state_) {
+  while (!exit_poll_state_.load()) {
     if (fsm_state_ == kOpenDev) {
       FsmOpenDev();
     } else if (fsm_state_ == kPrepareDev) {
@@ -123,24 +142,25 @@ void TimeSync::PollStateLoop() {
 }
 
 void TimeSync::PollDataLoop() {
-  while (!start_poll_data_) {
-    /* waiting to start */
+  while (!start_poll_data_.load() && !exit_poll_data_.load()) {
+    std::this_thread::yield();
   }
 
-  while (!exit_poll_data_) {
+  while (!exit_poll_data_.load()) {
     if (uart_->IsOpen()) {
       uint32_t get_buf_size;
       uint8_t *cache_buf = comm_->FetchCacheFreeSpace(&get_buf_size);
       if (get_buf_size) {
-        uint32_t read_data_size;
-        read_data_size = uart_->Read((char *)cache_buf, get_buf_size);
-        if (read_data_size) {
-          comm_->UpdateCacheWrIdx(read_data_size);
-          rx_bytes_ += read_data_size;
+          ssize_t read_data_size;
+          read_data_size = uart_->Read((char *)cache_buf, get_buf_size);
+          if (read_data_size > 0) {
+            uint32_t bytes_read = static_cast<uint32_t>(read_data_size);
+            comm_->UpdateCacheWrIdx(bytes_read);
+            rx_bytes_.fetch_add(bytes_read);
           CommPacket packet;
           memset(&packet, 0, sizeof(packet));
           while ((kParseSuccess == comm_->ParseCommStream(&packet))) {
-            if (((fn_cb_ != nullptr) || (client_data_ != nullptr))) {
+            if (fn_cb_ != nullptr) {
               if ((strstr((const char *)packet.data, "$GPRMC")) ||
                       (strstr((const char *)packet.data , "$GNRMC"))){
                 fn_cb_((const char *)packet.data, packet.data_len, client_data_);
@@ -192,12 +212,13 @@ void TimeSync::FsmCheckDevState() {
       chrono::duration_cast<chrono::milliseconds>(t2 - t1);
 
   if (time_gap.count() > 2000) { /* period : 2.5s */
-    if (last_rx_bytes == rx_bytes_) {
+    uint32_t rx_bytes = rx_bytes_.load();
+    if (last_rx_bytes == rx_bytes) {
       uart_->Close();
       FsmTransferState(kOpenDev);
       printf("Uart is disconnected, close it\n");
     }
-    last_rx_bytes = rx_bytes_;
+    last_rx_bytes = rx_bytes;
     t1 = t2;
   }
 }
