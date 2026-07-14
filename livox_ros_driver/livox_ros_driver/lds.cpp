@@ -597,6 +597,7 @@ void Lds::ResetLidar(LidarDevice *lidar, uint8_t data_src) {
   lidar->data_is_pubulished = false;
   lidar->connect_state = kConnectStateOff;
   lidar->raw_data_type = 0xFF;
+  lidar->last_published_data_type = 0xFF;
 }
 
 void Lds::SetLidarDataSrc(LidarDevice *lidar, uint8_t data_src) {
@@ -612,7 +613,10 @@ void Lds::ResetLds(uint8_t data_src) {
 }
 
 void Lds::RequestExit() {
-  request_exit_ = true;
+  request_exit_.store(true);
+  /** Wake a distributor blocked with no incoming packets so it can observe the
+   *  exit request and run PrepareExit. */
+  semaphore_.Signal();
 }
 
 bool Lds::IsAllQueueEmpty() {
@@ -744,6 +748,10 @@ void Lds::StorageRawPacket(uint8_t handle, LivoxEthPacket* eth_packet) {
   LidarPacketStatistic *packet_statistic = &p_lidar->statistic_info;
 
   if (kImu != eth_packet->data_type) {
+    /** The packet cadence changes with return/coordinate data_type. Do not
+     *  interpret the one boundary gap using the new cadence as packet loss. */
+    bool data_type_changed =
+        (p_lidar->raw_data_type != eth_packet->data_type);
     UpdateLidarInfoByEthPacket(p_lidar, eth_packet);
     if (eth_packet->timestamp_type == kTimestampTypePps) {
       /** Whether a new sync frame */
@@ -761,7 +769,8 @@ void Lds::StorageRawPacket(uint8_t handle, LivoxEthPacket* eth_packet) {
      *  timestamp gap (a lost packet makes the next ts jump by ~N intervals). */
     packet_statistic->receive_packet_count++;
     packet_statistic->win_recv++;
-    if (p_lidar->data_is_pubulished && p_lidar->packet_interval > 0 &&
+    if (!data_type_changed && p_lidar->data_is_pubulished &&
+        p_lidar->packet_interval > 0 &&
         packet_statistic->last_recv_ts_ns > 0) {
       int64_t gap = (int64_t)timestamp - packet_statistic->last_recv_ts_ns;
       int64_t interval = (int64_t)p_lidar->packet_interval;

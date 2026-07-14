@@ -27,6 +27,8 @@
 #ifndef LIVOX_ROS_DRIVER_LDS_H_
 #define LIVOX_ROS_DRIVER_LDS_H_
 
+#include <atomic>
+#include <chrono>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -180,6 +182,7 @@ typedef struct {
   uint8_t handle;                    /**< Lidar access handle. */
   uint8_t data_src;                  /**< From raw lidar or livox file. */
   uint8_t raw_data_type;             /**< The data type in eth packaet. */
+  uint8_t last_published_data_type;  /**< Last real packet consumed, 0xFF=none. */
   bool data_is_pubulished;           /**< Indicate the data of lidar whether is
                                           pubulished. */
   uint32_t timestamp_type;           /**< timestamp type of the current eth packet. */
@@ -416,18 +419,28 @@ class Semaphore {
 
   void Wait() {
     std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait(lock, [=] { return count_ > 0; });
+    cv_.wait(lock, [this] { return count_ > 0; });
     --count_;
   }
 
+  bool WaitFor(const std::chrono::milliseconds &timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!cv_.wait_for(lock, timeout, [this] { return count_ > 0; })) {
+      return false;
+    }
+    --count_;
+    return true;
+  }
+
   int GetCount() {
+    std::lock_guard<std::mutex> lock(mutex_);
     return count_;
   }
 
  private:
   std::mutex mutex_;
   std::condition_variable cv_;
-  volatile int count_;
+  int count_;
 };
 
 /**
@@ -446,8 +459,8 @@ class Lds {
   void RequestExit();
   bool IsAllQueueEmpty();
   bool IsAllQueueReadStop();
-  void CleanRequestExit() { request_exit_ = false; }
-  bool IsRequestExit() { return request_exit_; }
+  void CleanRequestExit() { request_exit_.store(false); }
+  bool IsRequestExit() { return request_exit_.load(); }
   virtual void PrepareExit(void);
   void UpdateLidarInfoByEthPacket(LidarDevice *p_lidar, \
       LivoxEthPacket* eth_packet);
@@ -468,7 +481,7 @@ class Lds {
   /** Throttled (every 5s) per-lidar packet-loss / drop report to stdout. */
   void ReportPacketStatistic(uint8_t handle);
 
-  volatile bool request_exit_;
+  std::atomic<bool> request_exit_;
 };
 
 }  // namespace livox_ros

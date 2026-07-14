@@ -24,6 +24,7 @@
 
 #include "lddc.h"
 
+#include <chrono>
 #include <inttypes.h>
 #include <math.h>
 #include <stdint.h>
@@ -102,8 +103,23 @@ int32_t Lddc::GetPublishStartTime(LidarDevice *lidar, LidarDataQueue *queue,
                                   uint64_t *start_time,
                                   StoragePacket *storage_packet) {
   QueuePrePop(queue, storage_packet);
+  LivoxEthPacket *raw_packet =
+      reinterpret_cast<LivoxEthPacket *>(storage_packet->raw_data);
+  const uint8_t alignment_data_type = raw_packet->data_type;
+  uint32_t packet_interval =
+      GetPacketInterval(lidar->info.type, raw_packet->data_type);
+  uint32_t packet_interval_max =
+      static_cast<uint32_t>(packet_interval * 1.8f);
   uint64_t timestamp =
       GetStoragePacketTimestamp(storage_packet, lidar->data_src);
+  /** A return/coordinate type boundary has a different cadence. Start from
+   *  the real packet timestamp instead of aligning/skipping it with the new
+   *  cadence as though it were a loss gap. */
+  if (lidar->last_published_data_type != 0xFF &&
+      lidar->last_published_data_type != raw_packet->data_type) {
+    *start_time = timestamp;
+    return 0;
+  }
   uint32_t remaining_time = timestamp % publish_period_ns_;
   uint32_t diff_time = publish_period_ns_ - remaining_time;
   /** Get start time, down to the period boundary */
@@ -111,7 +127,7 @@ int32_t Lddc::GetPublishStartTime(LidarDevice *lidar, LidarDataQueue *queue,
     // ROS_INFO("0 : %u", diff_time);
     *start_time = timestamp - remaining_time;
     return 0;
-  } else if (diff_time <= lidar->packet_interval_max) {
+  } else if (diff_time <= packet_interval_max) {
     *start_time = timestamp;
     return 0;
   } else {
@@ -122,7 +138,20 @@ int32_t Lddc::GetPublishStartTime(LidarDevice *lidar, LidarDataQueue *queue,
         break;
       }
       QueuePopUpdate(queue); /* skip packet */
+      if (QueueIsEmpty(queue)) {
+        break;
+      }
       QueuePrePop(queue, storage_packet);
+      raw_packet =
+          reinterpret_cast<LivoxEthPacket *>(storage_packet->raw_data);
+      /** Do not align through a return/coordinate-mode boundary. The boundary
+       *  packet is only being peeked here (it has not been popped), so leave it
+       *  for the next publish batch, which will start at its real timestamp. */
+      if (raw_packet->data_type != alignment_data_type) {
+        break;
+      }
+      packet_interval =
+          GetPacketInterval(lidar->info.type, raw_packet->data_type);
       uint32_t last_remaning_time = remaining_time;
       timestamp = GetStoragePacketTimestamp(storage_packet, lidar->data_src);
       remaining_time = timestamp % publish_period_ns_;
@@ -132,7 +161,7 @@ int32_t Lddc::GetPublishStartTime(LidarDevice *lidar, LidarDataQueue *queue,
         break;
       }
       diff_time = publish_period_ns_ - remaining_time;
-    } while (diff_time > lidar->packet_interval);
+    } while (diff_time > packet_interval);
 
     /* the remaning packets in queue maybe not enough after skip */
     return -1;
@@ -205,15 +234,22 @@ uint32_t Lddc::PublishPointcloud2(LidarDataQueue *queue, uint32_t packet_num,
      *  type, and decoding those with the new type's converter reads/writes out
      *  of bounds (point_num was already stored per-packet at ingest). */
     uint32_t echo_num = GetEchoNumPerPoint(raw_packet->data_type);
+    uint32_t packet_interval =
+        GetPacketInterval(lidar->info.type, raw_packet->data_type);
+    uint32_t packet_interval_max =
+        static_cast<uint32_t>(packet_interval * 1.8f);
+    bool data_type_changed =
+        (lidar->last_published_data_type != 0xFF &&
+         lidar->last_published_data_type != raw_packet->data_type);
     timestamp = GetStoragePacketTimestamp(&storage_packet, data_source);
     int64_t packet_gap = timestamp - last_timestamp;
-    if ((packet_gap > lidar->packet_interval_max) &&
+    if (!data_type_changed && (packet_gap > packet_interval_max) &&
         lidar->data_is_pubulished &&
         (zero_packet_count < kMaxZeroFillPacketPerMsg)) {
       // ROS_INFO("Lidar[%d] packet time interval is %ldns", handle,
       //     packet_gap);
       if (kSourceLvxFile != data_source) {
-        timestamp = last_timestamp + lidar->packet_interval;
+        timestamp = last_timestamp + packet_interval;
         ZeroPointDataOfStoragePacket(&storage_packet);
         is_zero_packet = 1;
         ++zero_packet_count;
@@ -244,6 +280,7 @@ uint32_t Lddc::PublishPointcloud2(LidarDataQueue *queue, uint32_t packet_num,
 
     if (!is_zero_packet) {
       QueuePopUpdate(queue);
+      lidar->last_published_data_type = raw_packet->data_type;
       /** real packet consumed & converted (holder: DistributeLidarData lock) */
       ++lidar->statistic_info.publish_packet_count;
     } else {
@@ -333,14 +370,21 @@ uint32_t Lddc::PublishPointcloudData(LidarDataQueue *queue, uint32_t packet_num,
     /** Per-packet data_type: see PublishPointcloud2 -- queued packets can
      *  predate a return-mode/coordinate reconfigure. */
     uint32_t echo_num = GetEchoNumPerPoint(raw_packet->data_type);
+    uint32_t packet_interval =
+        GetPacketInterval(lidar->info.type, raw_packet->data_type);
+    uint32_t packet_interval_max =
+        static_cast<uint32_t>(packet_interval * 1.8f);
+    bool data_type_changed =
+        (lidar->last_published_data_type != 0xFF &&
+         lidar->last_published_data_type != raw_packet->data_type);
     timestamp = GetStoragePacketTimestamp(&storage_packet, data_source);
     int64_t packet_gap = timestamp - last_timestamp;
-    if ((packet_gap > lidar->packet_interval_max) &&
+    if (!data_type_changed && (packet_gap > packet_interval_max) &&
         lidar->data_is_pubulished &&
         (zero_packet_count < kMaxZeroFillPacketPerMsg)) {
       //ROS_INFO("Lidar[%d] packet time interval is %ldns", handle, packet_gap);
       if (kSourceLvxFile != data_source) {
-        timestamp = last_timestamp + lidar->packet_interval;
+        timestamp = last_timestamp + packet_interval;
         ZeroPointDataOfStoragePacket(&storage_packet);
         is_zero_packet = 1;
         ++zero_packet_count;
@@ -371,6 +415,7 @@ uint32_t Lddc::PublishPointcloudData(LidarDataQueue *queue, uint32_t packet_num,
     FillPointsToPclMsg(cloud, dst_point, single_point_num);
     if (!is_zero_packet) {
       QueuePopUpdate(queue);
+      lidar->last_published_data_type = raw_packet->data_type;
       /** real packet consumed & converted (holder: DistributeLidarData lock) */
       ++lidar->statistic_info.publish_packet_count;
     } else {
@@ -467,15 +512,22 @@ uint32_t Lddc::PublishCustomPointcloud(LidarDataQueue *queue,
     /** Per-packet data_type: see PublishPointcloud2 -- queued packets can
      *  predate a return-mode/coordinate reconfigure. */
     uint32_t echo_num = GetEchoNumPerPoint(raw_packet->data_type);
+    uint32_t packet_interval =
+        GetPacketInterval(lidar->info.type, raw_packet->data_type);
+    uint32_t packet_interval_max =
+        static_cast<uint32_t>(packet_interval * 1.8f);
+    bool data_type_changed =
+        (lidar->last_published_data_type != 0xFF &&
+         lidar->last_published_data_type != raw_packet->data_type);
     timestamp = GetStoragePacketTimestamp(&storage_packet, data_source);
     int64_t packet_gap = timestamp - last_timestamp;
-    if ((packet_gap > lidar->packet_interval_max) &&
+    if (!data_type_changed && (packet_gap > packet_interval_max) &&
         lidar->data_is_pubulished &&
         (zero_packet_count < kMaxZeroFillPacketPerMsg)) {
       // ROS_INFO("Lidar[%d] packet time interval is %ldns", handle,
       // packet_gap);
       if (kSourceLvxFile != data_source) {
-        timestamp = last_timestamp + lidar->packet_interval;
+        timestamp = last_timestamp + packet_interval;
         ZeroPointDataOfStoragePacket(&storage_packet);
         is_zero_packet = 1;
         ++zero_packet_count;
@@ -514,6 +566,7 @@ uint32_t Lddc::PublishCustomPointcloud(LidarDataQueue *queue,
 
     if (!is_zero_packet) {
       QueuePopUpdate(queue);
+      lidar->last_published_data_type = raw_packet->data_type;
       /** real packet consumed & converted (holder: DistributeLidarData lock) */
       ++lidar->statistic_info.publish_packet_count;
     } else {
@@ -646,21 +699,22 @@ void Lddc::DistributeLidarData(void) {
   if (lds_ == nullptr) {
     return;
   }
-  lds_->semaphore_.Wait();
+  if (!lds_->semaphore_.WaitFor(std::chrono::milliseconds(100))) {
+    if (lds_->IsRequestExit()) {
+      PrepareExit();
+    }
+    return;
+  }
   for (uint32_t i = 0; i < lds_->lidar_count_; i++) {
     uint32_t lidar_id = i;
-    LidarDevice *lidar = &lds_->lidars_[lidar_id];
-    LidarDataQueue *p_queue = &lidar->data;
-    if ((kConnectStateSampling != lidar->connect_state) ||
-        (p_queue == nullptr)) {
-      continue;
-    }
     /** Hold the per-lidar lock across the whole poll so a concurrent
      *  ResetLidar (disconnect, runs on the SDK callback thread) cannot free
-     *  the queue / clear lidar fields while we read them. */
+     *  the queue / clear lidar fields while we read them. Even the state
+     *  eligibility check belongs inside the lock; an unlocked pre-check is a
+     *  C++ data race and does not make the later re-check safe. */
     std::lock_guard<std::mutex> lk(lds_->data_lock_[lidar_id]);
+    LidarDevice *lidar = &lds_->lidars_[lidar_id];
     if (kConnectStateSampling != lidar->connect_state) {
-      /** state may have changed to Off while acquiring the lock */
       continue;
     }
     PollingLidarPointCloudData(lidar_id, lidar);
@@ -767,6 +821,7 @@ void Lddc::PrepareExit(void) {
     ROS_INFO("Waiting to save the bag file!");
     bag_->close();
     ROS_INFO("Save the bag file successfully!");
+    delete bag_;
     bag_ = nullptr;
   }
   if (lds_) {
