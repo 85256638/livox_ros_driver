@@ -26,7 +26,6 @@
 
 #include <chrono>
 #include <vector>
-#include <csignal>
 #include <sstream>
 #include <cstring>
 #include <ctime>
@@ -78,8 +77,9 @@ bool LidarModeServiceCb(livox_ros_driver::LidarMode::Request &req,
   if (req.handle == 255) {
     /** Broadcast to all connected LiDARs */
     ROS_INFO("LiDAR mode service: ALL lidars -> mode=%d", req.mode);
-    livox_status last_status = kStatusNotConnected;
+    livox_status last_failure = kStatusSuccess;
     bool requested = false;
+    bool have_failure = false;
     for (uint8_t h = 0; h < kMaxLidarCount; h++) {
       if (!IsCurrentConnectedHandle(h)) {
         continue;
@@ -87,17 +87,19 @@ bool LidarModeServiceCb(livox_ros_driver::LidarMode::Request &req,
       requested = true;
       livox_status s = g_read_lidar->RequestLidarModeChange(
           h, static_cast<LidarMode>(req.mode));
-      if (s == kStatusSuccess) {
-        last_status = kStatusSuccess;
-      } else {
+      if (s != kStatusSuccess) {
         ROS_WARN("LiDAR mode change failed for handle=%d: %d", h, s);
-        last_status = s;
+        /** Preserve a partial failure: a later successful handle must not make
+         *  a broadcast request look wholly successful to the scheduler. */
+        last_failure = s;
+        have_failure = true;
       }
     }
     if (!requested) {
       ROS_WARN("LiDAR mode service: no connected lidar to broadcast to");
     }
-    res.ret_code = last_status;
+    res.ret_code = !requested ? kStatusNotConnected
+                              : have_failure ? last_failure : kStatusSuccess;
     return true;
   }
 
@@ -125,25 +127,27 @@ bool LidarRebootServiceCb(livox_ros_driver::LidarReboot::Request &req,
   if (req.handle == 255) {
     /** Reboot all connected LiDARs */
     ROS_INFO("LiDAR reboot service: ALL lidars");
-    livox_status last_status = kStatusNotConnected;
+    livox_status last_failure = kStatusSuccess;
     bool requested = false;
+    bool have_failure = false;
     for (uint8_t h = 0; h < kMaxLidarCount; h++) {
       if (!IsCurrentConnectedHandle(h)) {
         continue;
       }
       requested = true;
       livox_status s = g_read_lidar->RequestLidarReboot(h);
-      if (s == kStatusSuccess) {
-        last_status = kStatusSuccess;
-      } else {
+      if (s != kStatusSuccess) {
         ROS_WARN("LiDAR reboot failed for handle=%d: %d", h, s);
-        last_status = s;
+        /** As above, retain any partial failure for the caller. */
+        last_failure = s;
+        have_failure = true;
       }
     }
     if (!requested) {
       ROS_WARN("LiDAR reboot service: no connected lidar to broadcast to");
     }
-    res.ret_code = last_status;
+    res.ret_code = !requested ? kStatusNotConnected
+                              : have_failure ? last_failure : kStatusSuccess;
     return true;
   }
 
@@ -239,6 +243,11 @@ static std::string FmtDur(int64_t ns) {
 static const uint32_t kErrorRebootDelaySec    = 3;
 static const uint32_t kErrorRebootCooldownSec = 40;
 static const uint32_t kErrorRebootMaxAttempts = 3;
+/** Config commands get their own bounded recovery path. Never start sampling
+ *  through a partial configuration; reboot only after a generous timeout. */
+static const uint32_t kConfigRebootDelaySec    = 30;
+static const uint32_t kConfigRebootCooldownSec = 40;
+static const uint32_t kConfigRebootMaxAttempts = 3;
 
 /** A "Normal but no data" (silent) episode is logged to the event log and shown
  *  as "NO DATA" on the dashboard once it has lasted this long, so trivial 1-2s
@@ -258,8 +267,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
   if (g_read_lidar == nullptr) {
     return;
   }
-  /** Verify/retry any in-progress PowerSaving/Standby switch: some lidars ack
-   *  the command but do not actually change mode, so confirm the real state. */
+  /** Verify/retry every in-progress mode switch from actual heartbeat state;
+   *  this also bounds Normal requests whose ACK/state event was lost. */
   g_read_lidar->TickSleepModeVerification();
   static uint64_t prev_recv[kMaxLidarCount] = {0};
   static uint64_t prev_pub[kMaxLidarCount] = {0};
@@ -272,6 +281,9 @@ void StatsTimerCb(const ros::TimerEvent &) {
   static uint32_t error_secs[kMaxLidarCount] = {0};     /**< consecutive 1s ticks in Error state */
   static uint32_t error_free_secs[kMaxLidarCount] = {0}; /**< consecutive non-Error ticks, for clearing the attempt budget */
   static uint8_t error_reboots[kMaxLidarCount] = {0};   /**< reboots attempted this Error episode */
+  static uint32_t config_secs[kMaxLidarCount] = {0};    /**< consecutive ticks stuck in Config */
+  static uint8_t config_reboots[kMaxLidarCount] = {0};  /**< bounded reboots for the Config episode */
+  static uint32_t config_healthy_secs[kMaxLidarCount] = {0}; /**< sustained published recovery before budget reset */
   static bool nodata_logged[kMaxLidarCount] = {false};  /**< a NODATA onset event has been logged for the current silent episode */
 
   int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -292,13 +304,30 @@ void StatsTimerCb(const ros::TimerEvent &) {
   ss << "===== Livox LiDAR Stats (1Hz) =====\n";
   ss << "handle  broadcast_code   state         temp  fan   motor recv/s  "
         "loss%    drop/s   disc  HB_lost   heartbeat\n";
+  LdsLidar::LinkStat link_snapshot[kMaxLidarCount];
   bool any = false;
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
-    LidarDevice *l = &g_read_lidar->lidars_[h];
-    bool connected = (l->connect_state != kConnectStateOff);
+    /** Counters are written by the ingest/publish threads under data_lock_.
+     *  Take one coherent snapshot so the watchdog never drives hardware from
+     *  a torn/racing 64-bit read. */
+    LidarConnectState connect_state;
+    DeviceInfo info;
+    LidarPacketStatistic st;
+    {
+      std::lock_guard<std::mutex> lock(g_read_lidar->data_lock_[h]);
+      const LidarDevice &live = g_read_lidar->lidars_[h];
+      connect_state = live.connect_state;
+      info = live.info;
+      st = live.statistic_info;
+    }
+    {
+      std::lock_guard<std::mutex> lock(g_read_lidar->link_stat_lock_[h]);
+      link_snapshot[h] = g_read_lidar->link_stat_[h];
+    }
+    bool connected = (connect_state != kConnectStateOff);
     if (connected) {
       ever_seen[h] = true;
-      strncpy(last_bcode[h], l->info.broadcast_code, kBdCodeSize);
+      strncpy(last_bcode[h], info.broadcast_code, kBdCodeSize);
       last_bcode[h][kBdCodeSize] = '\0';
     }
     /** Skip handles that have never connected; but keep showing a lidar once
@@ -308,8 +337,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
       continue;
     }
     any = true;
-    LidarPacketStatistic &st = l->statistic_info;
-    LdsLidar::LinkStat &ls = g_read_lidar->link_stat_[h];
+    LdsLidar::LinkStat &ls = link_snapshot[h];
     uint32_t disc = ls.disconnect_count;
     /** "hb_lost" = heartbeat loss duration: how long the most recent heartbeat
      *  outage lasted. Still down -> the still-growing down time; reconnected ->
@@ -360,7 +388,29 @@ void StatsTimerCb(const ros::TimerEvent &) {
        *  produce nothing, and a lidar inside a planned mode switch is left to
        *  the mode verify/retry machinery instead of this watchdog. */
       bool transition = g_read_lidar->IsModeTransitionActive(h);
-      bool should_stream = (l->info.state == kLidarStateNormal) && !transition;
+      /** Config is explicitly excluded: starting/rebooting while coordinate,
+       *  return-mode, IMU or extrinsic commands are still pending can publish
+       *  data with only part of the requested configuration applied. On is
+       *  retained because StartSampleCb uses it after a start timeout, which is
+       *  the field-confirmed state the restart path must recover. */
+      bool should_stream = (info.state == kLidarStateNormal) && !transition &&
+                           (connect_state != kConnectStateConfig);
+      bool configuring = (info.state == kLidarStateNormal) &&
+                          (connect_state == kConnectStateConfig);
+      if (configuring) {
+        config_secs[h]++;
+      } else {
+        config_secs[h] = 0;
+      }
+      if (connect_state == kConnectStateSampling && d_pub > 0) {
+        if (config_reboots[h] != 0 &&
+            ++config_healthy_secs[h] >= kErrorClearAfterSec) {
+          config_reboots[h] = 0;
+          config_healthy_secs[h] = 0;
+        }
+      } else {
+        config_healthy_secs[h] = 0;
+      }
       if (should_stream && d_pub == 0) {
         zero_secs[h]++;
         nodata_secs[h]++;
@@ -391,19 +441,46 @@ void StatsTimerCb(const ros::TimerEvent &) {
        *  RestartSampling also re-arms a lidar whose earlier start-sampling
        *  timed out and left it demoted out of the Sampling state. */
       if (g_auto_recover && should_stream) {
-        if (recover_stage[h] == 0 && zero_secs[h] >= 5) {
-          g_read_lidar->RequestRestartSampling(h);
-          ROS_WARN("[LivoxRecover] Lidar[%d] no published data for 5s -> "
-                   "restart sampling", h);
-          recover_stage[h] = 1;
-        } else if (recover_stage[h] == 1 && zero_secs[h] >= 15) {
-          g_read_lidar->RequestLidarReboot(h);
-          ls.recover_reboot_count++;
-          ls.recover_last_wall_s = (int64_t)time(nullptr);
-          ROS_WARN("[LivoxRecover] Lidar[%d] still no published data for 15s "
-                   "-> reboot", h);
-          hlog.LogEvent(h, last_bcode[h], "REBOOT", "no-data 15s");
-          recover_stage[h] = 2;
+        if (recover_stage[h] == 0 && zero_secs[h] >= 5 &&
+            ((zero_secs[h] - 5) % 5) == 0) {
+          livox_status s = g_read_lidar->RequestRestartSampling(h);
+          if (s == kStatusSuccess) {
+            ROS_WARN("[LivoxRecover] Lidar[%d] no published data for 5s -> "
+                     "restart sampling", h);
+            recover_stage[h] = 1;
+            zero_secs[h] = 5;  // preserve a full 10s verification window
+          } else {
+            ROS_WARN("[LivoxRecover] Lidar[%d] restart sampling was not "
+                     "accepted: %d", h, s);
+          }
+        } else if (recover_stage[h] == 1 && zero_secs[h] >= 15 &&
+                   ((zero_secs[h] - 15) % 5) == 0) {
+          /** Re-check the planned-mode guard atomically with enqueue. A sleep
+           *  service can win after the earlier transition snapshot; in that
+           *  case the watchdog stands down, while manual reboot remains an
+           *  explicit override through RequestLidarReboot(). */
+          livox_status s =
+              g_read_lidar->RequestLidarRebootIfModeIdle(h);
+          if (s == kStatusSuccess) {
+            int64_t now_wall = (int64_t)time(nullptr);
+            {
+              std::lock_guard<std::mutex> lock(
+                  g_read_lidar->link_stat_lock_[h]);
+              LdsLidar::LinkStat &live = g_read_lidar->link_stat_[h];
+              live.recover_reboot_count++;
+              live.recover_last_wall_s = now_wall;
+              ls.recover_reboot_count = live.recover_reboot_count;
+              ls.recover_last_wall_s = live.recover_last_wall_s;
+            }
+            ROS_WARN("[LivoxRecover] Lidar[%d] still no published data for 15s "
+                     "-> reboot", h);
+            hlog.LogEvent(h, last_bcode[h], "REBOOT", "no-data 15s");
+            recover_stage[h] = 2;
+            zero_secs[h] = 15;  // preserve the post-reboot observation window
+          } else {
+            ROS_WARN("[LivoxRecover] Lidar[%d] no-data reboot was not "
+                     "accepted: %d", h, s);
+          }
         } else if (recover_stage[h] == 2 && zero_secs[h] >= 45) {
           /** Reboot didn't help; allow another cycle. Reset the stage timer
            *  too -- leaving it running keeps every threshold permanently
@@ -414,10 +491,56 @@ void StatsTimerCb(const ros::TimerEvent &) {
         }
       }
 
+      /** (B2) Configuration recovery. Config is deliberately excluded from
+       *  the no-data path above: issuing StartSampling while only some command
+       *  bits completed can change coordinates/return semantics mid-stream.
+       *  If callbacks never complete, use slow, bounded single-lidar reboots. */
+      if (g_auto_recover && configuring) {
+        if (config_reboots[h] < kConfigRebootMaxAttempts) {
+          uint32_t due = (config_reboots[h] == 0)
+                             ? kConfigRebootDelaySec
+                             : kConfigRebootCooldownSec;
+          if (config_secs[h] >= due &&
+              ((config_secs[h] - due) % 5) == 0) {
+            livox_status s = g_read_lidar->RequestLidarReboot(h);
+            if (s == kStatusSuccess) {
+              uint32_t stuck_secs = config_secs[h];
+              int64_t now_wall = (int64_t)time(nullptr);
+              {
+                std::lock_guard<std::mutex> lock(
+                    g_read_lidar->link_stat_lock_[h]);
+                LdsLidar::LinkStat &live = g_read_lidar->link_stat_[h];
+                live.recover_reboot_count++;
+                live.recover_last_wall_s = now_wall;
+                ls.recover_reboot_count = live.recover_reboot_count;
+                ls.recover_last_wall_s = live.recover_last_wall_s;
+              }
+              config_reboots[h]++;
+              config_secs[h] = 0;
+              ROS_WARN("[LivoxRecover] Lidar[%d] stuck in Config %us -> "
+                       "reboot (attempt %u/%u)", h, stuck_secs,
+                       config_reboots[h], kConfigRebootMaxAttempts);
+              char rb[48];
+              snprintf(rb, sizeof(rb), "Config %us attempt %u/%u",
+                       stuck_secs, config_reboots[h],
+                       kConfigRebootMaxAttempts);
+              hlog.LogEvent(h, last_bcode[h], "REBOOT", rb);
+            } else {
+              ROS_WARN("[LivoxRecover] Lidar[%d] Config reboot was not "
+                       "accepted: %d", h, s);
+            }
+          }
+        } else if ((config_secs[h] % 30) == 0) {
+          ROS_ERROR("[LivoxRecover] Lidar[%d] still in Config after %u "
+                    "reboots; manual intervention needed", h,
+                    kConfigRebootMaxAttempts);
+        }
+      }
+
       /** (C) Error-state auto-recovery. A lidar reporting Error (e.g. a
        *  recoverable motor fault) never counts as "streaming", so path (B)
        *  above ignores it. Reboot just this lidar on a bounded schedule. */
-      bool in_error = (l->info.state == kLidarStateError);
+      bool in_error = (info.state == kLidarStateError);
       if (in_error) {
         error_secs[h]++;
         error_free_secs[h] = 0;
@@ -441,18 +564,32 @@ void StatsTimerCb(const ros::TimerEvent &) {
            *  the cooldown plus reconnect time. */
           uint32_t due = kErrorRebootDelaySec +
                          error_reboots[h] * kErrorRebootCooldownSec;
-          if (error_secs[h] >= due) {
-            g_read_lidar->RequestLidarReboot(h);
-            ls.recover_reboot_count++;
-            ls.recover_last_wall_s = (int64_t)time(nullptr);
-            error_reboots[h]++;
-            ROS_WARN("[LivoxRecover] Lidar[%d] in Error %us -> reboot "
-                     "(attempt %u/%u)", h, error_secs[h], error_reboots[h],
-                     kErrorRebootMaxAttempts);
-            char rb[40];
-            snprintf(rb, sizeof(rb), "Error %us attempt %u/%u", error_secs[h],
-                     error_reboots[h], kErrorRebootMaxAttempts);
-            hlog.LogEvent(h, last_bcode[h], "REBOOT", rb);
+          if (error_secs[h] >= due &&
+              ((error_secs[h] - due) % 5) == 0) {
+            livox_status s = g_read_lidar->RequestLidarReboot(h);
+            if (s == kStatusSuccess) {
+              int64_t now_wall = (int64_t)time(nullptr);
+              {
+                std::lock_guard<std::mutex> lock(
+                    g_read_lidar->link_stat_lock_[h]);
+                LdsLidar::LinkStat &live = g_read_lidar->link_stat_[h];
+                live.recover_reboot_count++;
+                live.recover_last_wall_s = now_wall;
+                ls.recover_reboot_count = live.recover_reboot_count;
+                ls.recover_last_wall_s = live.recover_last_wall_s;
+              }
+              error_reboots[h]++;
+              ROS_WARN("[LivoxRecover] Lidar[%d] in Error %us -> reboot "
+                       "(attempt %u/%u)", h, error_secs[h], error_reboots[h],
+                       kErrorRebootMaxAttempts);
+              char rb[40];
+              snprintf(rb, sizeof(rb), "Error %us attempt %u/%u", error_secs[h],
+                       error_reboots[h], kErrorRebootMaxAttempts);
+              hlog.LogEvent(h, last_bcode[h], "REBOOT", rb);
+            } else {
+              ROS_WARN("[LivoxRecover] Lidar[%d] Error reboot was not "
+                       "accepted: %d", h, s);
+            }
           }
         } else if ((error_secs[h] % 30) == 0) {
           /** Exhausted attempts: stop rebooting, warn loudly every 30s. */
@@ -463,7 +600,9 @@ void StatsTimerCb(const ros::TimerEvent &) {
       }
 
       /** (A) Flag a connected-but-silent lidar loudly instead of "Normal". */
-      const char *st_str = LidarStateStr(l->info.state);
+      const char *st_str = (connect_state == kConnectStateConfig)
+                               ? "Config"
+                               : LidarStateStr(info.state);
       if (should_stream && nodata_secs[h] >= kNoDataLogSec) {
         st_str = "NO DATA";
       }
@@ -481,6 +620,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
       zero_secs[h] = 0;
       nodata_secs[h] = 0;
       recover_stage[h] = 0;
+      config_secs[h] = 0;
+      config_healthy_secs[h] = 0;
       /** Close any open silent episode; the DISCONNECT event already marks the
        *  transition, so no separate DATA row is needed here. */
       nodata_logged[h] = false;
@@ -507,7 +648,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
     if (!ever_seen[h]) {
       continue;
     }
-    LdsLidar::LinkStat &ls = g_read_lidar->link_stat_[h];
+    LdsLidar::LinkStat &ls = link_snapshot[h];
     if (ls.temp_change_count > 0) {
       char buf[80];
       snprintf(buf, sizeof(buf), "  lidar %d: %u time(s), last at %s", h,
@@ -528,7 +669,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
     if (!ever_seen[h]) {
       continue;
     }
-    LdsLidar::LinkStat &ls = g_read_lidar->link_stat_[h];
+    LdsLidar::LinkStat &ls = link_snapshot[h];
     if (ls.fault_count > 0) {
       char buf[96];
       snprintf(buf, sizeof(buf), "  lidar %d: %u time(s) (%s), last at %s", h,
@@ -551,7 +692,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
     if (!ever_seen[h]) {
       continue;
     }
-    LdsLidar::LinkStat &ls = g_read_lidar->link_stat_[h];
+    LdsLidar::LinkStat &ls = link_snapshot[h];
     if (ls.recover_reboot_count > 0) {
       char buf[80];
       snprintf(buf, sizeof(buf), "  lidar %d: %u reboot(s), last at %s", h,
@@ -563,17 +704,20 @@ void StatsTimerCb(const ros::TimerEvent &) {
     ss << "Auto-recover:" << rec_note << "\n";
   }
 
-  /** Mode-switch footer: PowerSaving/Standby switches that failed after all
-   *  retries (only shown when non-zero). Surfaces the "manual check needed"
+  /** Mode-switch footer: requests that failed after all bounded retries
+   *  (only shown when non-zero). Surfaces the "manual check needed"
    *  alert on the dashboard so it is not missed in the scrolling log. */
   std::string mode_note;
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
     if (!ever_seen[h]) {
       continue;
     }
-    LdsLidar::LinkStat &ls = g_read_lidar->link_stat_[h];
+    LdsLidar::LinkStat &ls = link_snapshot[h];
     if (ls.mode_fail_count > 0) {
-      const char *m = (ls.mode_fail_mode == 3) ? "Standby" : "PowerSaving";
+      const char *m = (ls.mode_fail_mode == 1)
+                          ? "Normal"
+                          : (ls.mode_fail_mode == 3) ? "Standby"
+                                                    : "PowerSaving";
       char buf[96];
       snprintf(buf, sizeof(buf), "  lidar %d: %s FAILED %u time(s), last at %s",
                h, m, ls.mode_fail_count, FmtWall(ls.mode_fail_wall_s).c_str());
@@ -589,12 +733,6 @@ void StatsTimerCb(const ros::TimerEvent &) {
   g_stats_pub.publish(msg);
 }
 
-inline void SignalHandler(int signum) {
-  printf("livox ros driver will exit\r\n");
-  ros::shutdown();
-  exit(signum);
-}
-
 int main(int argc, char **argv) {
   /** Ros related */
   if (ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME,
@@ -605,7 +743,6 @@ int main(int argc, char **argv) {
   ros::NodeHandle livox_node;
 
   ROS_INFO("Livox Ros Driver Version: %s", LIVOX_ROS_DRIVER_VERSION_STRING);
-  signal(SIGINT, SignalHandler);
   /** Check sdk version */
   LivoxSdkVersion _sdkversion;
   GetLivoxSdkVersion(&_sdkversion);
@@ -752,6 +889,13 @@ int main(int argc, char **argv) {
     } while (0);
   }
 
+  if ((data_src == kSourceRawLidar || data_src == kSourceRawHub) && ret != 0) {
+    /** Do not enter the distribution loop with a failed SDK data source. */
+    delete lddc;
+    g_read_lidar = nullptr;
+    return 1;
+  }
+
   /** Advertise lidar mode service */
   ros::ServiceServer mode_srv =
       livox_node.advertiseService("livox_lidar_mode", LidarModeServiceCb);
@@ -769,7 +913,7 @@ int main(int argc, char **argv) {
     g_stats_pub = livox_node.advertise<std_msgs::String>("livox/lidar_stats", 1);
     stats_timer = livox_node.createTimer(ros::Duration(1.0), StatsTimerCb);
     ROS_INFO("Publishing stats topic: livox/lidar_stats (1Hz)");
-    ROS_INFO("Auto-recover (Normal-but-no-data watchdog): %s",
+    ROS_INFO("Auto-recover (no-data/Config/Error watchdogs): %s",
              g_auto_recover ? "ENABLED" : "disabled");
   }
 
@@ -783,6 +927,13 @@ int main(int argc, char **argv) {
     lddc->DistributeLidarData();
   }
 
+  stats_timer.stop();
   spinner.stop();
+  /** Lddc owns shutdown sequencing for the registered source. This explicitly
+   *  reaches TimeSync stop/join -> SDK Uninit instead of relying on static
+   *  destruction while SDK I/O threads are still running. */
+  lddc->PrepareExit();
+  g_read_lidar = nullptr;
+  delete lddc;
   return 0;
 }
