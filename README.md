@@ -10,10 +10,10 @@
 6. **健康与丢包监控** — 异常日志告警 + `livox/lidar_stats` 实时看板（温度/风扇/**电机**状态、丢包、掉线，独立终端原地刷新，底部含**故障/自动恢复历史**）；累计计数 64 位，长期运行不回绕
 7. **畸形包硬化** — 拒绝非法 `data_type`；发布时**按每包自身类型**解析，堵住类型混用越界（ASan 实证过的内存破坏）
 8. **零点洪泛防护** — 大丢包/掉线时限制零点回填，避免整片假点污染融合点云
-9. **自动恢复看门狗（可选）** — 检测到假活（`Normal` 但**没有点云发布**，含"在收包但驱动卡住没发布"的隐蔽卡死）或 `Error`（如电机故障）时自动重启该雷达，带重试上限防死循环
+9. **自动恢复看门狗（可选）** — 检测到假活（`Normal` 但**没有点云发布**）、配置长期不完成或 `Error`（如电机故障）时按各自路径恢复该雷达，带重试上限防死循环
 10. **持久化健康日志（可选）** — 把健康事件与网络趋势落盘成 CSV（边沿事件 + 周期快照），供长期无人值守的趋势分析与故障取证
 
-> 功能 1/2 需配套修改版 SDK；功能 3~10 为纯 ROS 驱动层改动，配任意 SDK 均可用。详见各章节。
+> **整个分支必须配套固定版 SDK。** Driver 的异步 callback context 生命周期依赖 SDK 的 exactly-once completion/cancellation 契约；不能只为模式切换换 SDK、再让其他功能链接任意同名库。
 
 ---
 
@@ -22,7 +22,8 @@
 ### 前置条件
 
 - Ubuntu 20.04 + ROS Noetic
-- **必须使用修改版 Livox SDK**（见下方"Livox SDK 修改"章节）
+- Git（首次构建会在 build 目录获取固定版 Livox SDK）
+- 不要预装或手工选择官方 SDK；CMake 会固定 fork、分支和精确 commit
 
 ### 编译
 
@@ -33,6 +34,8 @@ source devel/setup.bash
 ```
 
 > - 加 `-DPYTHON_EXECUTABLE=/usr/bin/python3` 是**强制 catkin 用系统 python3**，避免 conda 等环境让它选错 python（否则编译或运行报 python 相关错）。比 `conda deactivate` 更稳，不受当前环境影响。
+> - 首次构建会克隆 `85256638/Livox-SDK` 的配套分支并检出固定 SHA；后续使用 build 目录缓存。不会链接 `/usr/local/lib` 中来源不明的同名库。
+> - 离线构建可额外传 `-DLIVOX_SDK_SOURCE_DIR=/绝对路径/Livox-SDK`；该 checkout 必须是 README 下方列出的精确 SHA，且 tracked 文件无修改，否则 CMake 会 fail closed。
 > - 新版 CMake（≥3.27）若报 policy 版本错，再补 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`。
 > - ⚠️ **编译用的 `catkin_ws` 必须和下面 systemd 服务里 `source` 的是同一个目录**，否则你编译了、服务却跑的是另一份旧的，改动不生效还极难排查。
 
@@ -146,19 +149,21 @@ rosservice call /livox_lidar_mode "{handle: 255, mode: 2}"
 | 0 | 请求已接受 |
 | 非 0 | 错误（详见终端日志）|
 
-> ⚠️ `ret_code = 0` 只表示**命令被雷达确认收到**，不代表模式一定切成了。个别情况下雷达会 ack `success` 却不真正切换（尤其广播 `handle:255` 同时命令多台时，偶发某台没切）。
+> ⚠️ `ret_code = 0` 只表示请求已被驱动/SDK 同步接受（也可能表示设备已在目标态，或断线中的 Normal 请求已排队等重连），不是雷达的异步 ACK，更不代表模式一定切成。后续由 callback 和真实 heartbeat state 完成校验。
 
 ### 切换到 PowerSaving / Standby 的自动校验重试
 
-针对上面那个"ack 成功但没真切"的问题，驱动会**校验实际状态、没切就自动重发**：切换到休眠/待机后，每秒检查该雷达的**真实 `state`** 是否已变成目标模式；若 **2 秒**内还没变，就自动重发命令，**最多 3 次**。这样一条 `rosservice call /livox_lidar_mode "{handle: 255, mode: 2}"` 就能可靠地把所有雷达都切到休眠，不必手动再跑。**广播 `handle:255` 时只对没切成功的那几台补发（逐台定向），已切好的不再打扰。**（Normal 唤醒不走这套——它有自己的 spinning-up/重连恢复逻辑。）
+针对上面那个"ack 成功但没真切"的问题，驱动会**校验实际状态、没切就自动重发**：每秒检查该雷达的**真实 `state`** 是否已变成目标模式；若 **2 秒**内还没变就定向重发。PowerSaving / Standby 最多重发 **3 次**；Normal 考虑电机 spin-up，最多重发 **7 次**。这样广播时只补发仍未到目标状态的雷达，已完成的不会再被打扰；即使 Normal ACK 或 state-change 丢失，请求也不会永久占住 transition、无限禁用 watchdog。
 
-> 仍切不成的极端情况：日志打印 `did not enter mode[..] after 3 retries -- manual check needed`，**同时看板底部会显示一行 `Mode switch: lidar X: PowerSaving FAILED N time(s), last at ...`**（只在发生过时出现、恢复后仍保留），这样盯着看板也不会漏掉"哪台没切成、该人工介入"。
+> 仍切不成的极端情况：日志打印 `did not enter mode[..] after N retries -- manual check needed`（休眠/待机 N=3，Normal N=7），**同时看板底部会显示一行 `Mode switch: lidar X: <mode> FAILED ...`**（只在发生过时出现、恢复后仍保留），这样盯着看板也不会漏掉"哪台没切成、该人工介入"。
 
 ### 模式命令的其他保障
 
 - **广播只发给"当前真正连着"的雷达**：`handle:255` 不再给 4~31 号不存在的 handle 排队请求（旧行为会留下"陈旧的 Normal 请求"，等以后哪台雷达占了那个 handle 就被误命令）。一台雷达都没连时 `ret_code` 返回未连接而不是假成功。
 - **迟到的 Normal 状态事件不会取消新的休眠请求**：雷达的状态事件可能因健康位变化而重复上报；旧逻辑一收到 Normal 就把当前模式请求清掉——若你刚发完唤醒又紧接着发休眠（如调度器两个条件先后触发），迟到的 Normal 事件会把休眠请求删掉、校验重试也随之失效。现在只有"目标就是 Normal"的请求才会被 Normal 事件完成。
-- **一个操作建议**：仍应避免在上一条模式命令完成前发送**相反**命令（唤醒后等所有雷达出数据、稳定数秒，再发休眠）——驱动能自愈这种冲突，但雷达固件会坚持完成前一个流程，来回打架只会拖慢切换。
+- **旧 ACK 不会改写新请求**：每个 logical request、每次 send attempt 和每次连接都有独立 token；迟到 ACK 只有三者都匹配才可更新状态。每个 handle 的“发布请求→SDK enqueue”也串行，避免软件状态虽能识别旧 ACK、硬件却先收到新命令再收到旧命令。
+- **低功耗命令有安全准入条件**：新的 PowerSaving / Standby 只在设备处于 `Sampling + Normal` 时接受；已在目标低功耗状态则幂等返回成功、不重发。启动配置期、错误态或存在相反请求时会同步返回失败，调度器应稍后重试。
+- **一个操作建议**：避免在上一条模式命令完成前发送**相反**命令；唤醒后等所有雷达恢复点云并稳定数秒，再发休眠。若 service 返回非 0，应等待当前配置/转换结束后重试，不要高频来回命令固件。
 
 ### 断线行为
 
@@ -233,7 +238,7 @@ roslaunch livox_ros_driver livox_lidar_multi.launch max_distance:=0
 
 ## 新增功能三：可靠性修复（多雷达长时间运行）
 
-> 以下为纯 ROS 驱动层修复，不需要改 SDK。
+> 以下问题的主要修复位于 ROS Driver；但整个定制分支仍必须链接上文固定 SDK，才能满足异步 context 的完成/取消生命周期契约。
 
 ### 1. 掉线崩溃（use-after-free）修复
 
@@ -358,14 +363,14 @@ Auto-recover:  lidar 1: 1 reboot(s), last at 2026-06-26 13:46:08
 
 #### 看板底部：历史事件（恢复后也一直记着）
 
-实时那几列只反映**当下**状态——一台雷达出过故障但又恢复了，列里就什么都看不出来了。所以看板底部有三行**历史**，从启动累计，方便发现"间歇性发作"的问题雷达：
+实时那几列只反映**当下**状态——一台雷达出过故障但又恢复了，列里就什么都看不出来了。所以看板底部有四类**历史汇总**（仅发生过时显示），从启动累计，方便发现"间歇性发作"的问题雷达：
 
 | 底部行 | 含义 |
 |--------|------|
 | `Temp changes` | 各台温度状态变化的次数 + 上次时间（频繁变化 = 散热不稳）|
 | `Fault events` | 各台进入 **motor/fan/dirty/volt/fw/system** 故障的次数 + 上次时间 + **是哪几项**（如 `motor+fan`、`dirty`）。`dirty` = 光窗脏污/遮挡（粉尘环境高频）。只记"从好变坏"那一下；**雷达恢复后这条仍保留** |
 | `Auto-recover` | 看门狗（`auto_recover`）给各台发过几次自动重启 + 上次时间。**只有真发生过自动重启才显示这行**（没开或没触发时不显示）|
-| `Mode switch` | 切 **PowerSaving/Standby** 重试 3 次仍没切成的次数 + 上次时间（如 `lidar 1: PowerSaving FAILED 1 time(s)`）。**只有真失败过才显示这行**；提示这台需人工介入 |
+| `Mode switch` | 模式请求耗尽有限重试仍没切成的次数 + 上次时间（PowerSaving/Standby 最多 3 次，Normal 最多 7 次）。**只有真失败过才显示这行**；提示这台需人工介入 |
 
 > 排障套路：某台 `Fault events` 反复累加、或 `Auto-recover` 次数不断上涨，就是它在反复发作——结合 `Fault events` 的标签（比如老是 `motor+fan`）基本能锁定是风扇/电机硬件在衰竭，该停机物理检查/更换了。
 
@@ -397,7 +402,7 @@ Livox 的**心跳通道和点云数据通道是独立的**。偶尔会出现一�
 
 #### 可选：自动恢复看门狗（`auto_recover`）
 
-默认关闭。开启后，驱动对**两类故障**自动恢复，省去人工重启：
+默认关闭。开启后，驱动对**三类故障**使用相互隔离的恢复路径：
 
 ```bash
 roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
@@ -411,7 +416,7 @@ roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
 | 2（重）| 仍无发布数据满 15 秒 | `RebootDevice` 重启该雷达（~10 秒恢复）|
 | 循环 | 重启后仍无发布数据满 45 秒 | 回到阶段 1 重来一整轮（**计时归零**，保持 5s/15s 节奏，不会退化成秒级重启风暴）|
 
-- 判据是**"发布出去的点云"**而不是"收到的 UDP 包"：一台雷达若卡在配置态，会一直收包但驱动一包都不发布（队列 100% 丢弃）——这种"在收但没出"的隐蔽卡死同样会被抓到并恢复（现场实证过的故障模式）
+- 判据是**"发布出去的点云"**而不是"收到的 UDP 包"，所以能发现“UDP 仍在收、ROS 却没发布”的假活；但 `Config` 明确排除在情况 A 之外，避免配置只完成一半时强行 `StartSampling`
 - 只对 `Normal` 状态生效；**节电/待机**模式本就不出数据，不会被误恢复
 - **正在执行计划中的模式切换**（唤醒/休眠命令进行中）的雷达不受此路径打扰——切换由自己的校验/重试机制负责，不会被看门狗中途踹一脚
 
@@ -427,7 +432,17 @@ roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
 - 重启次数**脱离 `Error` 持续 60 秒才清零**（重启过程会短暂经过 Init/Normal，若见一眼 Normal 就清零，3 次上限会被绕过、变成无限重启）；冷却按"重连后仍 `Error` 的 40 秒"算，偏保守（给它时间稳定）
 - `Error` 路径在模式切换期间**照常生效**：唤醒过程不该报 `Error`，报了就是真故障、就该快速重启（运维决策）
 
-两类共同点：只重启**出问题的那一台**；每次动作打印 `[LivoxRecover]` 日志；动作次数会出现在看板底部 `Auto-recover` 行；启动时日志显示 `Auto-recover ... : ENABLED / disabled`。
+**情况 C：长期停在 `Config`** —— 配置命令没有全部完成时绝不绕过配置直接采样：
+
+| 触发 | 动作 |
+|------|------|
+| 首次持续停在 `Config` 约 **30 秒** | 重启该雷达 |
+| 重连后再次卡住，每次约 **40 秒** | 再重启，整个故障 episode 最多 3 次 |
+| 3 次后仍卡住 | 停止自动重启，每 30 秒告警需人工处理 |
+
+- 只有恢复到 `Sampling` 且连续有点云发布约 60 秒，才清空本次 Config 重启预算，防止短暂重连绕过上限
+
+三类共同点：只处理**出问题的那一台**；每次重启动作打印 `[LivoxRecover]` 日志；动作次数会出现在看板底部 `Auto-recover` 行；启动时日志显示 `Auto-recover ... : ENABLED / disabled`。
 
 > ⚠️ 这是驱动**自主重启硬件**的行为，所以默认关闭、需显式开启。无显示器的机器也能用（它和看板无关）。
 
@@ -476,71 +491,58 @@ rostopic echo /livox/lidar_stats
 
 ## Livox SDK 修改（重要）
 
-**本驱动需要配合修改版的 Livox SDK 使用。** 如果使用未修改的 SDK，模式切换将无法正常工作（切到节电后会立即自动恢复 Normal）。
+**必须使用下面这个精确版本，不能用官方 SDK 或仅凭同名静态库判断：**
 
-### 修改内容
+- fork：`https://github.com/85256638/Livox-SDK.git`
+- branch：`mod_set&range_filter`
+- commit：[`fe1a68cd54be70219821e4186e66329d375d224f`](https://github.com/85256638/Livox-SDK/commit/fe1a68cd54be70219821e4186e66329d375d224f)
 
-修改了 `Livox-SDK/sdk_core/src/command_handler/` 下的两个文件：
+### 配套 SDK 提供的保证
 
-#### 1. `command_channel.h`
+1. mode 2/3 命令**实际发送成功时**立即开启独立 15 秒 transition deadline；已处于 PowerSaving / Standby 时也使用 15 秒阈值，Normal 稳态仍是 3 秒。
+2. heartbeat ACK 必须带完整 `HeartbeatResponse` 才能刷新连接或上报状态；短载荷安全拒绝。
+3. 异步 API 返回 `kStatusSuccess` 后，ACK、timeout、发送失败、断线、queued-but-unsent 取消和全局 `Uninit()` 路径中必有且仅有一次终态 callback。
+4. command payload 使用 RAII；断线清队列不会泄漏 Driver 的 callback context。ACK 同时核对 seq、command set 和 command id。
+5. LiDAR channel 查找/移除有同步；从 I/O callback 内断线时，channel 会保留到 raw delegate 真正移除后再析构，避免当前 callback 尚未返回就释放对象。
+6. 修复零长度协议 payload 的空指针 `memcpy` UB 和 `<memory>` 直接依赖缺失。
 
-新增成员变量：
-```cpp
-uint8_t last_work_state_ = 0;  /**< Last known work state from heartbeat */
-```
+Driver 端的 context registry 只释放 SDK 已明确 callback/cancel 完成的 context，并保留 60 秒 tombstone 防御重复/迟到 callback 的地址复用；它不会凭“过了 N 秒”释放仍可能被 SDK 持有的裸指针。
 
-#### 2. `command_channel.cpp`
+### CMake 如何保证没有链错 SDK
 
-**修改 `OnHeartbeatAck()`** — 记录心跳 ACK 中的设备状态：
-```cpp
-void CommandChannel::OnHeartbeatAck(const CommPacket &packet) {
-  last_heartbeat_ = steady_clock::now();
-  if (packet.data != NULL && packet.data_len >= sizeof(HeartbeatResponse)) {
-    last_work_state_ = reinterpret_cast<HeartbeatResponse *>(packet.data)->state;
-  }
-}
-```
+- 默认只在 catkin build 目录的 `_deps` 下克隆上述 fork/branch，并 detach 到固定 commit。
+- SDK 作为 `livox_sdk_static` CMake target 构建和链接，不再使用裸 `livox_sdk_static.a` 名称，也不探测 `/usr/local/lib`。
+- 不再执行源码树内 `rm -rf Livox-SDK`，也不会 fallback 到官方默认分支。
+- 显式传 `LIVOX_SDK_SOURCE_DIR` 时会校验 Git HEAD 和 tracked 工作树；不匹配即 configure 失败。
 
-**修改 `OnTimer()`** — 心跳超时从固定 3 秒改为状态感知（Normal=3s，PowerSaving/Standby=15s）：
-```cpp
-auto heartbeat_timeout = std::chrono::seconds(3);
-if (last_work_state_ == 2 || last_work_state_ == 3) {
-  heartbeat_timeout = std::chrono::seconds(15);
-}
-if (now - last_heartbeat_ > heartbeat_timeout) {
-  DeviceDisconnect(handle_);
-} else {
-  HeartBeat(now);
-}
-```
-
-### 为什么需要修改 SDK
-
-官方 SDK 的心跳超时固定为 3 秒。LiDAR 切换工作模式时（例如电机减速停转），固件响应会短暂延迟，超过 3 秒后 SDK 误判设备断线，触发重连，固件在重连时自动恢复 Normal 模式——导致模式切换失败。
-
-延长超时至 15 秒可确保模式过渡期间会话保持存活。
-
-### SDK 编译安装
+首次构建需要访问 GitHub。离线环境先准备正确 checkout：
 
 ```bash
-cd ~/Livox-SDK/build
-cmake ..
-make -j$(nproc)
-sudo make install
+git clone --branch 'mod_set&range_filter' --single-branch \
+  https://github.com/85256638/Livox-SDK.git ~/Livox-SDK-pinned
+git -C ~/Livox-SDK-pinned checkout --detach \
+  fe1a68cd54be70219821e4186e66329d375d224f
+catkin_make -DPYTHON_EXECUTABLE=/usr/bin/python3 \
+  -DLIVOX_SDK_SOURCE_DIR=$HOME/Livox-SDK-pinned
 ```
 
-> 安装后静态库位于 `/usr/local/lib/liblivox_sdk_static.a`
+### SDK 关闭约束
+
+- 调用 SDK 全局 `Uninit()` 前先停止新的 SDK API 调用。
+- 不要从 SDK I/O callback 内直接调用 `Uninit()`，应调度到外部线程，避免线程自 `Join()`。
 
 ---
 
 ## 修改文件清单
 
-### Livox SDK（2 个文件）
+### Livox SDK（配套仓库）
 
-| 文件 | 改动 |
+| 文件组 | 改动 |
 |------|------|
-| `sdk_core/src/command_handler/command_channel.h` | 新增 `last_work_state_` 字段 |
-| `sdk_core/src/command_handler/command_channel.cpp` | 状态感知心跳超时 + 记录 work_state |
+| `sdk_core/src/command_handler/command_channel.*` | heartbeat 校验、transition deadline、exactly-once completion/cancel、payload RAII、ACK identity |
+| `sdk_core/src/command_handler/*_command_handler.*` | channel 容器同步、安全 detach 与 delegate 移除后的延迟回收 |
+| `sdk_core/src/comm/sdk_protocol.cpp` | 零长度 payload UB 与非法 payload 校验 |
+| `sdk_core/src/base/thread_base.h` | `<memory>` 直接依赖 |
 
 ### ROS Driver
 
@@ -548,12 +550,15 @@ sudo make install
 |------|------|
 | `srv/LidarMode.srv` | **新增** — 模式切换 Service 定义 |
 | `srv/LidarReboot.srv` | **新增** — 重启 Service 定义 |
-| `CMakeLists.txt` | 注册两个 srv |
+| `CMakeLists.txt` | 注册两个 srv，并链接固定 SDK CMake target |
+| `cmake/pinned_livox_sdk.cmake` | 固定 SDK fork/branch/SHA，校验 clean checkout，fail closed |
 | `livox_ros_driver/lds_lidar.h/.cpp` | 模式切换 + 重启 + 状态机抖动修复 |
-| `livox_ros_driver/livox_ros_driver.cpp` | 模式/重启 Service、AsyncSpinner、max_distance 参数、`livox/lidar_stats` 看板发布 |
+| `livox_ros_driver/livox_ros_driver.cpp` | 模式/重启 Service、AsyncSpinner、max_distance 参数、`livox/lidar_stats` 看板发布，以及显式停止 timer/spinner 后的正常关闭 |
 | `livox_ros_driver/lddc.h/.cpp` | 距离过滤 + 读取端 UAF 加锁 |
 | `livox_ros_driver/lds.h/.cpp` | 每雷达锁、丢包统计（仅异常打印）、`data_type` 硬化、写入端 UAF 加锁 |
 | `livox_ros_driver/ldq.cpp` | 队列释放置空 + 操作空指针兜底 |
+| `timesync/timesync.h/.cpp` | TimeSync 初始化/停止幂等化；退出标志原子化；先 stop/join 再 SDK `Uninit()` |
+| `timesync/user_uart/user_uart.h/.cpp` | UART Open/Close/Read 串行；空闲读取有界返回；完整检查 termios/fcntl/read 错误 |
 | `scripts/livox_stats_monitor.py` | **新增** — 独立终端的实时丢包看板 |
 
 ---
@@ -561,7 +566,7 @@ sudo make install
 ## 常见问题
 
 ### Q: 切到节电模式后立即自动恢复 Normal？
-确认使用的是修改版 Livox SDK。重新编译 SDK 后需要 `sudo make install` 安装，然后重新 `catkin_make` ROS Driver。
+查看 catkin configure 日志是否明确打印固定 SHA `fe1a68c...`。本分支不需要 `sudo make install` SDK；若仍链接到系统库，说明运行的不是这份 CMake/工作区。清理对应 catkin build 缓存后重新 `catkin_make`，不要只重编译旧 build 目录里的另一份源码。
 
 ### Q: handle 值怎么确定？
 启动驱动时观察终端日志 `Lidar[X] status_code[...] working state[...] feature[...]`，其中 X 就是 handle。单雷达通常为 0。
@@ -604,7 +609,9 @@ livox_ros_driver is a new ROS package, specially used to connect LiDAR products 
 
 ## 1. Install dependencies
 
-Before running livox_ros_driver, ROS and Livox-SDK must be installed.
+Before running this customized branch, ROS must be installed. The build fetches
+and links the pinned companion Livox-SDK itself; do not substitute an official
+or system-installed library.
 
 ### 1.1 ROS installation
 
@@ -618,17 +625,19 @@ For ROS installation, please refer to the ROS installation guide :
 
 &ensp;&ensp;&ensp;&ensp;(2) There are 7 to 8 steps in ROS installation, please read the installation guide in detail;
 
-### 1.2 Livox-SDK Installation
+### 1.2 Pinned Livox-SDK
 
-1. Download or clone [Livox-SDK](https://github.com/Livox-SDK/Livox-SDK) from Github to local;
-
-2. Refer to the corresponding [README.md](https://github.com/Livox-SDK/Livox-SDK/blob/master/README.md) document to install and run Livox-SDK;
+CMake uses `85256638/Livox-SDK`, branch `mod_set&range_filter`, commit
+`fe1a68cd54be70219821e4186e66329d375d224f`. It clones into the build directory
+and links the CMake target directly. A local checkout may be supplied with
+`-DLIVOX_SDK_SOURCE_DIR=/absolute/path`, but configure fails unless its HEAD and
+tracked worktree match the pin.
 
 ## 2. Get and build livox_ros_driver
 
 1. Get livox_ros_driver from GitHub :
 
-　　`git clone https://github.com/Livox-SDK/livox_ros_driver.git ws_livox/src`
+　　`git clone --branch 'updated_workingmode&set_rangefilter' --single-branch https://github.com/85256638/livox_ros_driver.git ws_livox/src/livox_ros_driver`
 
 &ensp;&ensp;&ensp;&ensp;***Note :***
 

@@ -1,5 +1,11 @@
 # 览沃 ROS 驱动程序（ [livox_ros_driver English README](https://github.com/Livox-SDK/livox_ros_driver/) ）
 
+> **定制分支提示**：`updated_workingmode&set_rangefilter` 必须配套
+> `85256638/Livox-SDK` 的 `mod_set&range_filter` 分支、commit
+> `fe1a68cd54be70219821e4186e66329d375d224f`。CMake 会在 build 目录获取并
+> 直接链接这个固定版本；不要安装或替换为官方 SDK/系统同名静态库。完整可靠性
+> 契约、离线构建和关闭约束见 [README.md](README.md) 顶部定制说明。
+
 览沃ROS驱动程序是一个全新的 ROS 包，专门用于连接览沃生产的 LiDAR 产品。该驱动程序可以在安装了
 ROS 环境（ indigo,kinetic,melodic ）的 ubuntu14.04/16.04/18.04 操作系统下运行。经测试可以运行览沃 ROS 驱动程序的硬件平台包括：intel x86 主流 cpu 平台，部分 ARM64 硬件平台（如，nvida TX2/Xavier 等）。
 
@@ -15,7 +21,7 @@ v2.6.0
 
 ## 1. 安装依赖
 
-运行览沃 ROS 驱动程序之前，必须安装 ROS 和 Livox-SDK。
+运行览沃 ROS 驱动程序之前必须安装 ROS；配套 Livox-SDK 由本分支的 CMake 固定并获取，无需安装系统 SDK。
 
 ### 1.1 ROS 环境安装
 
@@ -33,15 +39,16 @@ ROS 环境安装请参考 ROS 安装指南：
 
 ### 1.2 Livox-SDK 安装
 
-1. 从 Github 下载或者克隆 Livox-SDK 到本地；
-
-2. 参考对应的 README.md 文档安装和运行 Livox-SDK；
+无需手工 `sudo make install` SDK。首次 `catkin_make` 会克隆并校验上述固定
+fork/branch/SHA。离线时可传
+`-DLIVOX_SDK_SOURCE_DIR=/绝对路径/Livox-SDK`，但该 checkout 的 HEAD 和
+tracked 工作树必须与固定版本一致，否则 CMake 会直接失败。
 
 ## 2. 获取并构建览沃 ROS 驱动源代码包
 
 1. 从览沃 GitHub 获取览沃 ROS 驱动程序
 
-   `git clone https://github.com/Livox-SDK/livox_ros_driver.git ws_livox/src`
+   `git clone --branch 'updated_workingmode&set_rangefilter' --single-branch https://github.com/85256638/livox_ros_driver.git ws_livox/src/livox_ros_driver`
 
 &ensp;&ensp;&ensp;&ensp;***说明：***
 
