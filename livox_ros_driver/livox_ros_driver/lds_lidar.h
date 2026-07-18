@@ -62,6 +62,12 @@ class LdsLidar : public Lds {
   /** Called at 1 Hz: verify every in-progress mode request from actual state
    *  and re-send within its bounded retry budget. */
   void TickSleepModeVerification();
+  /** Called at 1 Hz: classify a disconnected device which is still
+   *  broadcasting, and (when enabled) clear/retry its local SDK handshake
+   *  session on a bounded schedule. */
+  void TickHandshakeRecovery(bool enable_recovery);
+  static int64_t HandshakeBroadcastFreshNs() { return 3000000000LL; }
+  static uint8_t HandshakeResetMaxAttempts() { return 3; }
   livox_status RequestLidarReboot(uint8_t handle, uint16_t timeout_ms = 100);
   /** Watchdog variant: reject if a planned mode request won the per-handle
    *  send race. Manual reboot remains an explicit override. */
@@ -79,6 +85,13 @@ class LdsLidar : public Lds {
   /** Per-lidar connection history. Lives outside LidarDevice (which ResetLidar
    *  memsets on disconnect) so it survives disconnect/reconnect cycles. Read by
    *  the stats dashboard. */
+  enum HandshakeLinkState {
+    kHandshakeLinkIdle = 0,
+    kHandshakeLinkBroadcastOnly,
+    kHandshakeLinkStuck,
+    kHandshakeLinkPowerCycleRequired
+  };
+
   struct LinkStat {
     uint32_t disconnect_count = 0;
     int64_t last_disconnect_ns = 0;  /**< steady_clock ns, 0 = never */
@@ -94,6 +107,36 @@ class LdsLidar : public Lds {
     uint32_t mode_fail_count = 0;      /**< mode switches that exhausted retries */
     int64_t mode_fail_wall_s = 0;      /**< wall-clock (time_t) of last such failure, 0=never */
     uint8_t mode_fail_mode = 0;        /**< mode it failed to enter (1/2/3) */
+    /** Broadcast/handshake state is independent of the heartbeat connection.
+     *  This makes the field failure "broadcast thread alive, control service
+     *  cannot handshake" visible even if this process has never connected. */
+    char broadcast_code[kBroadcastCodeSize] = {0};
+    uint64_t broadcast_count = 0;
+    int64_t last_broadcast_ns = 0;
+    int64_t broadcast_only_since_ns = 0;
+    HandshakeLinkState handshake_state = kHandshakeLinkIdle;
+    uint8_t handshake_reset_attempts = 0; /**< current episode, max 3 */
+    int64_t handshake_last_reset_try_ns = 0;
+    uint32_t handshake_reset_count = 0;   /**< accepted SDK session resets */
+    uint32_t handshake_reset_fail_count = 0;
+    int64_t handshake_last_reset_wall_s = 0;
+    uint32_t handshake_stuck_count = 0;   /**< episodes reaching STUCK */
+    int64_t handshake_stuck_wall_s = 0;
+    uint32_t power_cycle_required_count = 0;
+    int64_t power_cycle_required_wall_s = 0;
+    /** Exact reason from the paired SDK's handshake diagnostics. A handshake
+     *  ACK is not a public kEventConnect: DeviceInfo may still be pending, so
+     *  these events never clear the recovery budget. */
+    bool handshake_event_valid = false;
+    DeviceHandshakeEvent last_handshake_event = kDeviceHandshakeSuccess;
+    int32_t last_handshake_detail = 0;
+    int64_t last_handshake_event_wall_s = 0;
+    char last_handshake_ip[16] = {0};
+    uint32_t handshake_success_count = 0;
+    uint32_t handshake_timeout_count = 0;
+    uint32_t handshake_rejected_count = 0;
+    uint32_t handshake_network_error_count = 0;
+    uint32_t handshake_protocol_error_count = 0;
   };
   LinkStat link_stat_[kMaxLidarCount];
   /** SDK event callbacks update LinkStat concurrently with the 1 Hz dashboard
@@ -103,6 +146,7 @@ class LdsLidar : public Lds {
  private:
   void OnLidarConnectEvent(uint8_t handle, const char *broadcast_code);
   void OnLidarDisconnectEvent(uint8_t handle, const char *broadcast_code);
+  void OnLidarBroadcastEvent(uint8_t handle, const char *broadcast_code);
   livox_status RequestLidarRebootImpl(uint8_t handle, uint16_t timeout_ms,
                                       bool require_mode_idle);
 
@@ -139,6 +183,7 @@ class LdsLidar : public Lds {
   static void OnLidarDataCb(uint8_t handle, LivoxEthPacket *data,
                             uint32_t data_num, void *client_data);
   static void OnDeviceBroadcast(const BroadcastDeviceInfo *info);
+  static void OnDeviceHandshake(const DeviceHandshakeStatus *status);
   static void OnDeviceChange(const DeviceInfo *info, DeviceEvent type);
   static void StartSampleCb(livox_status status, uint8_t handle,
                             uint8_t response, void *clent_data);

@@ -42,6 +42,16 @@ using namespace std;
 namespace livox_ros {
 
 namespace {
+/** A Horizon normally broadcasts often while it is waiting for a handshake.
+ *  A gap longer than this starts a new diagnostic episode, rather than
+ *  carrying a stale HANDSHAKE_STUCK decision across a power/network outage. */
+const int64_t kBroadcastEpisodeGapNs = LdsLidar::HandshakeBroadcastFreshNs();
+const int64_t kHandshakeFirstResetNs = 5000000000LL;
+const int64_t kHandshakeResetIntervalNs = 10000000000LL;
+const int64_t kHandshakePowerCycleNs = 30000000000LL;
+const uint8_t kHandshakeResetMaxAttempts =
+    LdsLidar::HandshakeResetMaxAttempts();
+
 /** Fill buf with the current wall-clock time as HH:MM:SS. */
 void NowHms(char *buf, size_t len) {
   time_t t = time(nullptr);
@@ -57,6 +67,25 @@ void PrintLidarEvent(uint8_t handle, const char *bcode, const char *what) {
   printf("[LivoxEvent] %s Lidar[%d][%s] %s\n", ts, handle,
          (bcode && bcode[0]) ? bcode : "?", what);
 }
+
+const char *HandshakeEventName(DeviceHandshakeEvent event) {
+  switch (event) {
+    case kDeviceHandshakeSuccess:
+      return "SUCCESS_DEVICEINFO_PENDING";
+    case kDeviceHandshakeTimeout:
+      return "TIMEOUT";
+    case kDeviceHandshakeRejected:
+      return "REJECTED";
+    case kDeviceHandshakeNetworkError:
+      return "NETWORK_ERROR";
+    case kDeviceHandshakeProtocolError:
+      return "PROTOCOL_ERROR";
+    case kDeviceHandshakeReset:
+      return "RESET";
+    default:
+      return "UNKNOWN";
+  }
+}
 }  // namespace
 
 void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
@@ -69,7 +98,15 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
     return;  /** already counted as connected */
   }
   int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+  HandshakeLinkState previous_handshake_state = s.handshake_state;
+  uint8_t reset_attempts = s.handshake_reset_attempts;
+  int64_t handshake_since_ns = s.broadcast_only_since_ns;
   s.connect_since_ns = now;
+  s.broadcast_only_since_ns = 0;
+  s.handshake_state = kHandshakeLinkIdle;
+  s.handshake_reset_attempts = 0;
+  s.handshake_last_reset_try_ns = 0;
+  s.handshake_event_valid = false;
   if (s.last_disconnect_ns != 0) {
     long long down_s = (now - s.last_disconnect_ns) / 1000000000LL;
     char buf[48];
@@ -81,6 +118,17 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
   } else {
     PrintLidarEvent(handle, broadcast_code, "CONNECTED");
     HealthLogger::Get().LogEvent(handle, broadcast_code, "CONNECT", "");
+  }
+  if (previous_handshake_state >= kHandshakeLinkStuck || reset_attempts != 0) {
+    long long elapsed_s = handshake_since_ns == 0
+                              ? 0
+                              : (now - handshake_since_ns) / 1000000000LL;
+    char detail[80];
+    snprintf(detail, sizeof(detail), "after %llds, %u session reset(s)",
+             elapsed_s, reset_attempts);
+    PrintLidarEvent(handle, broadcast_code, "HANDSHAKE_RECOVERED");
+    HealthLogger::Get().LogEvent(handle, broadcast_code,
+                                 "HANDSHAKE_RECOVERED", detail);
   }
 }
 
@@ -102,8 +150,175 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
       std::chrono::steady_clock::now().time_since_epoch().count();
   s.connect_since_ns = 0;
   s.health_code = 0;  /** stale once disconnected */
+  s.last_broadcast_ns = 0;
+  s.broadcast_only_since_ns = 0;
+  s.handshake_state = kHandshakeLinkIdle;
+  s.handshake_reset_attempts = 0;
+  s.handshake_last_reset_try_ns = 0;
   PrintLidarEvent(handle, broadcast_code, "DISCONNECTED");
   HealthLogger::Get().LogEvent(handle, broadcast_code, "DISCONNECT", "");
+}
+
+void LdsLidar::OnLidarBroadcastEvent(uint8_t handle,
+                                     const char *broadcast_code) {
+  if (handle >= kMaxLidarCount || broadcast_code == nullptr ||
+      broadcast_code[0] == '\0') {
+    return;
+  }
+  int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+  bool new_episode = false;
+  {
+    lock_guard<mutex> lock(link_stat_lock_[handle]);
+    LinkStat &s = link_stat_[handle];
+    strncpy(s.broadcast_code, broadcast_code, sizeof(s.broadcast_code) - 1);
+    s.broadcast_code[sizeof(s.broadcast_code) - 1] = '\0';
+    s.broadcast_count++;
+    bool broadcast_gap =
+        s.last_broadcast_ns != 0 &&
+        now - s.last_broadcast_ns > kBroadcastEpisodeGapNs;
+    s.last_broadcast_ns = now;
+    if (s.connect_since_ns == 0 && s.broadcast_only_since_ns == 0) {
+      s.broadcast_only_since_ns = now;
+      s.handshake_state = kHandshakeLinkBroadcastOnly;
+      s.handshake_reset_attempts = 0;
+      s.handshake_last_reset_try_ns = 0;
+      s.handshake_event_valid = false;
+      new_episode = true;
+    } else if (s.connect_since_ns == 0 && broadcast_gap) {
+      /** Treat a broadcast gap as the end of the live episode even if the 1Hz
+       *  timer did not run during the gap. Historical counters remain. */
+      s.broadcast_only_since_ns = now;
+      s.handshake_state = kHandshakeLinkBroadcastOnly;
+      s.handshake_reset_attempts = 0;
+      s.handshake_last_reset_try_ns = 0;
+      s.handshake_event_valid = false;
+      new_episode = true;
+    }
+  }
+  if (new_episode) {
+    PrintLidarEvent(handle, broadcast_code, "BROADCAST_ONLY");
+    HealthLogger::Get().LogEvent(handle, broadcast_code, "BROADCAST_ONLY", "");
+  }
+}
+
+void LdsLidar::TickHandshakeRecovery(bool enable_recovery) {
+  const int64_t now =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  for (uint8_t handle = 0; handle < kMaxLidarCount; ++handle) {
+    bool request_reset = false;
+    bool became_stuck = false;
+    bool require_power_cycle = false;
+    uint8_t attempt = 0;
+    int64_t episode_since = 0;
+    char broadcast_code[kBroadcastCodeSize] = {0};
+    {
+      lock_guard<mutex> lock(link_stat_lock_[handle]);
+      LinkStat &s = link_stat_[handle];
+      if (s.connect_since_ns != 0 || s.broadcast_only_since_ns == 0 ||
+          s.last_broadcast_ns == 0) {
+        continue;
+      }
+      if (now - s.last_broadcast_ns > kBroadcastEpisodeGapNs) {
+        /** A never-connected lidar has no SDK disconnect edge. Expire only the
+         *  live episode here; cumulative stuck/reset/power evidence remains. */
+        s.broadcast_only_since_ns = 0;
+        s.handshake_state = kHandshakeLinkIdle;
+        s.handshake_reset_attempts = 0;
+        s.handshake_last_reset_try_ns = 0;
+        continue;
+      }
+      if (s.handshake_state == kHandshakeLinkPowerCycleRequired) {
+        continue;
+      }
+
+      episode_since = s.broadcast_only_since_ns;
+      int64_t episode_age = now - episode_since;
+      strncpy(broadcast_code, s.broadcast_code, sizeof(broadcast_code) - 1);
+
+      if (s.handshake_state == kHandshakeLinkBroadcastOnly &&
+          episode_age >= kHandshakeFirstResetNs) {
+        s.handshake_state = kHandshakeLinkStuck;
+        s.handshake_stuck_count++;
+        s.handshake_stuck_wall_s = static_cast<int64_t>(time(nullptr));
+        became_stuck = true;
+      }
+
+      bool latest_is_local_network_error =
+          s.handshake_event_valid &&
+          s.last_handshake_event == kDeviceHandshakeNetworkError;
+      if (!latest_is_local_network_error &&
+          s.handshake_reset_attempts >= kHandshakeResetMaxAttempts &&
+          episode_age >= kHandshakePowerCycleNs) {
+        s.handshake_state = kHandshakeLinkPowerCycleRequired;
+        s.power_cycle_required_count++;
+        s.power_cycle_required_wall_s = static_cast<int64_t>(time(nullptr));
+        attempt = s.handshake_reset_attempts;
+        require_power_cycle = true;
+      } else if (enable_recovery &&
+                 episode_age >= kHandshakeFirstResetNs &&
+                 s.handshake_reset_attempts < kHandshakeResetMaxAttempts &&
+                 (s.handshake_last_reset_try_ns == 0 ||
+                  now - s.handshake_last_reset_try_ns >=
+                      kHandshakeResetIntervalNs)) {
+        /** Reserve the attempt under the lock before calling into the SDK, so
+         *  two timer callbacks can never issue the same recovery attempt. */
+        s.handshake_last_reset_try_ns = now;
+        s.handshake_reset_attempts++;
+        attempt = s.handshake_reset_attempts;
+        request_reset = true;
+      }
+    }
+
+    if (became_stuck) {
+      PrintLidarEvent(handle, broadcast_code, "HANDSHAKE_STUCK");
+      HealthLogger::Get().LogEvent(handle, broadcast_code, "HANDSHAKE_STUCK",
+                                   "broadcast alive; no connection for 5s");
+    }
+    if (require_power_cycle) {
+      long long elapsed_s = (now - episode_since) / 1000000000LL;
+      char detail[96];
+      snprintf(detail, sizeof(detail),
+               "broadcast alive; %u session resets; stuck %llds",
+               attempt, elapsed_s);
+      PrintLidarEvent(handle, broadcast_code, "POWER_CYCLE_REQUIRED");
+      HealthLogger::Get().LogEvent(handle, broadcast_code,
+                                   "POWER_CYCLE_REQUIRED", detail);
+      printf("[LivoxRecover] Lidar[%d][%s] %s; physical power cycle "
+             "required\n", handle, broadcast_code, detail);
+    }
+    if (!request_reset) {
+      continue;
+    }
+
+    livox_status status = ResetLidarHandshakeSession(broadcast_code);
+    int64_t wall_now = static_cast<int64_t>(time(nullptr));
+    {
+      lock_guard<mutex> lock(link_stat_lock_[handle]);
+      LinkStat &s = link_stat_[handle];
+      /** The call may race a successful connect; totals remain useful history,
+       *  but current episode state is cleared by OnLidarConnectEvent. */
+      s.handshake_last_reset_wall_s = wall_now;
+      if (status == kStatusSuccess) {
+        s.handshake_reset_count++;
+      } else {
+        s.handshake_reset_fail_count++;
+        /** A rejected local cleanup is not a completed recovery cycle. Keep
+         *  it out of the three-attempt device power-cycle budget; otherwise a
+         *  driver/API bug could be misreported as a lidar firmware wedge. */
+        if (s.connect_since_ns == 0 &&
+            s.broadcast_only_since_ns == episode_since &&
+            s.handshake_reset_attempts != 0) {
+          s.handshake_reset_attempts--;
+        }
+      }
+    }
+    char detail[80];
+    snprintf(detail, sizeof(detail), "session reset %u/%u returned %d", attempt,
+             kHandshakeResetMaxAttempts, status);
+    printf("[LivoxRecover] Lidar[%d][%s] %s\n", handle, broadcast_code, detail);
+    HealthLogger::Get().LogEvent(handle, broadcast_code, "HANDSHAKE_RESET",
+                                 detail);
+  }
 }
 
 namespace {
@@ -944,6 +1159,7 @@ int LdsLidar::InitLdsLidar(std::vector<std::string> &broadcast_code_strs,
 
   SetBroadcastCallback(OnDeviceBroadcast);
   SetDeviceStateUpdateCallback(OnDeviceChange);
+  SetDeviceHandshakeCallback(OnDeviceHandshake);
 
   /** Add commandline input broadcast code */
   for (auto input_str : broadcast_code_strs) {
@@ -1027,6 +1243,7 @@ int LdsLidar::DeInitLdsLidar(void) {
     timesync_ = nullptr;
   }
 
+  SetDeviceHandshakeCallback(nullptr);
   Uninit();
   if (g_lds_ldiar == this) {
     g_lds_ldiar = nullptr;
@@ -1054,6 +1271,81 @@ void LdsLidar::OnLidarDataCb(uint8_t handle, LivoxEthPacket *data,
   }
 
   lds_lidar->StorageRawPacket(handle, eth_packet);
+}
+
+void LdsLidar::OnDeviceHandshake(const DeviceHandshakeStatus *status) {
+  if (status == nullptr || g_lds_ldiar == nullptr ||
+      status->handle >= kMaxLidarCount) {
+    return;
+  }
+
+  const uint8_t handle = status->handle;
+  bool log_event = false;
+  uint32_t event_count = 0;
+  char broadcast_code[kBroadcastCodeSize] = {0};
+  char ip[16] = {0};
+  {
+    /** SDK I/O-thread callback: only copy/counter work is done under this
+     *  short lock; formatting and disk logging happen after releasing it. */
+    lock_guard<mutex> lock(g_lds_ldiar->link_stat_lock_[handle]);
+    LinkStat &s = g_lds_ldiar->link_stat_[handle];
+    bool changed = !s.handshake_event_valid ||
+                   s.last_handshake_event != status->event ||
+                   s.last_handshake_detail != status->detail;
+    s.handshake_event_valid = true;
+    s.last_handshake_event = status->event;
+    s.last_handshake_detail = status->detail;
+    s.last_handshake_event_wall_s = static_cast<int64_t>(time(nullptr));
+    strncpy(s.last_handshake_ip, status->ip, sizeof(s.last_handshake_ip) - 1);
+    strncpy(ip, status->ip, sizeof(ip) - 1);
+    if (status->broadcast_code[0] != '\0') {
+      strncpy(s.broadcast_code, status->broadcast_code,
+              sizeof(s.broadcast_code) - 1);
+    }
+    strncpy(broadcast_code, s.broadcast_code, sizeof(broadcast_code) - 1);
+
+    switch (status->event) {
+      case kDeviceHandshakeSuccess:
+        event_count = ++s.handshake_success_count;
+        break;
+      case kDeviceHandshakeTimeout:
+        event_count = ++s.handshake_timeout_count;
+        break;
+      case kDeviceHandshakeRejected:
+        event_count = ++s.handshake_rejected_count;
+        break;
+      case kDeviceHandshakeNetworkError:
+        event_count = ++s.handshake_network_error_count;
+        break;
+      case kDeviceHandshakeProtocolError:
+        event_count = ++s.handshake_protocol_error_count;
+        break;
+      case kDeviceHandshakeReset:
+        /** Reset count is maintained from the API return in the recovery path;
+         *  detail here is the exact number of pending SDK sockets cleared. */
+        event_count = s.handshake_reset_count;
+        break;
+      default:
+        break;
+    }
+    /** Log diagnostic edges and periodic repeats without flooding journal at
+     *  the device's broadcast rate. */
+    log_event = changed || event_count <= 1 ||
+                (event_count != 0 && (event_count % 10) == 0);
+  }
+
+  if (!log_event) {
+    return;
+  }
+  char detail[128];
+  snprintf(detail, sizeof(detail), "HANDSHAKE_%s ip=%s detail=%d count=%u",
+           HandshakeEventName(status->event), ip[0] ? ip : "?",
+           status->detail, event_count);
+  char event_line[160];
+  snprintf(event_line, sizeof(event_line), "HANDSHAKE_%s",
+           HandshakeEventName(status->event));
+  PrintLidarEvent(handle, broadcast_code, detail);
+  HealthLogger::Get().LogEvent(handle, broadcast_code, event_line, detail);
 }
 
 void LdsLidar::OnDeviceBroadcast(const BroadcastDeviceInfo *info) {
@@ -1084,6 +1376,7 @@ void LdsLidar::OnDeviceBroadcast(const BroadcastDeviceInfo *info) {
   if (result == kStatusSuccess && handle < kMaxLidarCount) {
     SetDataCallback(handle, OnLidarDataCb, (void *)g_lds_ldiar);
     g_lds_ldiar->RememberBroadcastCode(handle, info->broadcast_code);
+    g_lds_ldiar->OnLidarBroadcastEvent(handle, info->broadcast_code);
 
     UserRawConfig config;
     if (g_lds_ldiar->GetRawConfig(info->broadcast_code, config)) {

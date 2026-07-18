@@ -180,6 +180,38 @@ static const char *LidarStateStr(uint8_t state) {
   }
 }
 
+static const char *HandshakeStateStr(LdsLidar::HandshakeLinkState state) {
+  switch (state) {
+    case LdsLidar::kHandshakeLinkBroadcastOnly:
+      return "BROADCAST_ONLY";
+    case LdsLidar::kHandshakeLinkStuck:
+      return "HANDSHAKE_STUCK";
+    case LdsLidar::kHandshakeLinkPowerCycleRequired:
+      return "POWER_CYCLE_REQUIRED";
+    default:
+      return "IDLE";
+  }
+}
+
+static const char *HandshakeEventStr(DeviceHandshakeEvent event) {
+  switch (event) {
+    case kDeviceHandshakeSuccess:
+      return "SUCCESS(DeviceInfo pending)";
+    case kDeviceHandshakeTimeout:
+      return "TIMEOUT";
+    case kDeviceHandshakeRejected:
+      return "REJECTED";
+    case kDeviceHandshakeNetworkError:
+      return "NETWORK_ERROR";
+    case kDeviceHandshakeProtocolError:
+      return "PROTOCOL_ERROR";
+    case kDeviceHandshakeReset:
+      return "RESET";
+    default:
+      return "UNKNOWN";
+  }
+}
+
 static const char *TempStr(uint32_t s) {
   return (s == 0) ? "OK" : (s == 1) ? "WARN" : "HOT!";
 }
@@ -270,6 +302,10 @@ void StatsTimerCb(const ros::TimerEvent &) {
   /** Verify/retry every in-progress mode switch from actual heartbeat state;
    *  this also bounds Normal requests whose ACK/state event was lost. */
   g_read_lidar->TickSleepModeVerification();
+  /** A device can keep broadcasting after its control/handshake service has
+   *  wedged. Track that separately from an ordinary disconnected device and,
+   *  when auto recovery is enabled, perform bounded local-session resets. */
+  g_read_lidar->TickHandshakeRecovery(g_auto_recover);
   static uint64_t prev_recv[kMaxLidarCount] = {0};
   static uint64_t prev_pub[kMaxLidarCount] = {0};
   static uint64_t prev_drop[kMaxLidarCount] = {0};
@@ -302,7 +338,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
 
   std::ostringstream ss;
   ss << "===== Livox LiDAR Stats (1Hz) =====\n";
-  ss << "handle  broadcast_code   state         temp  fan   motor recv/s  "
+  ss << "handle  broadcast_code   state                 temp  fan   motor recv/s  "
         "loss%    drop/s   disc  HB_lost   heartbeat\n";
   LdsLidar::LinkStat link_snapshot[kMaxLidarCount];
   bool any = false;
@@ -325,9 +361,16 @@ void StatsTimerCb(const ros::TimerEvent &) {
       link_snapshot[h] = g_read_lidar->link_stat_[h];
     }
     bool connected = (connect_state != kConnectStateOff);
+    LdsLidar::LinkStat &ls = link_snapshot[h];
     if (connected) {
       ever_seen[h] = true;
       strncpy(last_bcode[h], info.broadcast_code, kBdCodeSize);
+      last_bcode[h][kBdCodeSize] = '\0';
+    } else if (ls.last_broadcast_ns != 0 && ls.broadcast_code[0] != '\0') {
+      /** Do not require a successful first handshake before showing a device.
+       *  The problematic BROADCAST_ONLY case otherwise never gets a row. */
+      ever_seen[h] = true;
+      strncpy(last_bcode[h], ls.broadcast_code, kBdCodeSize);
       last_bcode[h][kBdCodeSize] = '\0';
     }
     /** Skip handles that have never connected; but keep showing a lidar once
@@ -337,8 +380,11 @@ void StatsTimerCb(const ros::TimerEvent &) {
       continue;
     }
     any = true;
-    LdsLidar::LinkStat &ls = link_snapshot[h];
     uint32_t disc = ls.disconnect_count;
+    bool broadcast_recent =
+        ls.last_broadcast_ns != 0 &&
+        now_ns - ls.last_broadcast_ns <=
+            LdsLidar::HandshakeBroadcastFreshNs();
     /** "hb_lost" = heartbeat loss duration: how long the most recent heartbeat
      *  outage lasted. Still down -> the still-growing down time; reconnected ->
      *  duration of the last completed outage; never dropped -> "--". */
@@ -607,7 +653,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
         st_str = "NO DATA";
       }
       snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-12s  %-4s  %-4s  %-4s  %6u  %7s  %6u   %4u  %8s  %9s\n",
+               "%-6d  %-15s  %-20s  %-4s  %-4s  %-4s  %6u  %7s  %6u   %4u  %8s  %9s\n",
                h, last_bcode[h], st_str, temp, fan, motor, d_recv, losspct,
                d_drop, disc, hb_lost.c_str(), heartbeat.c_str());
       if (do_snapshot) {
@@ -625,12 +671,17 @@ void StatsTimerCb(const ros::TimerEvent &) {
       /** Close any open silent episode; the DISCONNECT event already marks the
        *  transition, so no separate DATA row is needed here. */
       nodata_logged[h] = false;
+      const char *offline_state = "DISCONNECTED";
+      if (broadcast_recent &&
+          ls.handshake_state != LdsLidar::kHandshakeLinkIdle) {
+        offline_state = HandshakeStateStr(ls.handshake_state);
+      }
       snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-12s  %-4s  %-4s  %-4s  %6s  %7s  %6s   %4u  %8s  %9s\n",
-               h, last_bcode[h], "DISCONNECTED", "-", "-", "-", "-", losspct,
+               "%-6d  %-15s  %-20s  %-4s  %-4s  %-4s  %6s  %7s  %6s   %4u  %8s  %9s\n",
+               h, last_bcode[h], offline_state, "-", "-", "-", "-", losspct,
                "-", disc, hb_lost.c_str(), heartbeat.c_str());
       if (do_snapshot) {
-        hlog.LogSnapshot(h, last_bcode[h], "DISCONNECTED", "-", "-", "-", 0, "-",
+        hlog.LogSnapshot(h, last_bcode[h], offline_state, "-", "-", "-", 0, "-",
                          st.receive_packet_count, st.loss_packet_count,
                          st.queue_drop_count, loss_pct_d, disc);
       }
@@ -702,6 +753,50 @@ void StatsTimerCb(const ros::TimerEvent &) {
   }
   if (!rec_note.empty()) {
     ss << "Auto-recover:" << rec_note << "\n";
+  }
+
+  /** Broadcast/handshake footer. It contains both the active episode duration
+   *  and persistent counters, so a successful reconnect does not erase the
+   *  evidence that local session recovery was needed. */
+  bool handshake_heading = false;
+  for (uint8_t h = 0; h < kMaxLidarCount; h++) {
+    if (!ever_seen[h]) {
+      continue;
+    }
+    LdsLidar::LinkStat &ls = link_snapshot[h];
+    bool active = ls.handshake_state != LdsLidar::kHandshakeLinkIdle;
+    bool history = ls.handshake_reset_count != 0 ||
+                   ls.handshake_reset_fail_count != 0 ||
+                   ls.handshake_stuck_count != 0 ||
+                   ls.power_cycle_required_count != 0;
+    if (!active && !history) {
+      continue;
+    }
+    if (!handshake_heading) {
+      ss << "Handshake recovery:\n";
+      handshake_heading = true;
+    }
+    std::string duration =
+        (active && ls.broadcast_only_since_ns != 0)
+            ? FmtDur(now_ns - ls.broadcast_only_since_ns)
+            : "--";
+    ss << "  lidar " << static_cast<unsigned>(h) << ": "
+       << HandshakeStateStr(ls.handshake_state) << " " << duration
+       << ", reset " << static_cast<unsigned>(ls.handshake_reset_attempts)
+       << "/" << static_cast<unsigned>(LdsLidar::HandshakeResetMaxAttempts())
+       << " (accepted total=" << ls.handshake_reset_count
+       << ", failed=" << ls.handshake_reset_fail_count << ")"
+       << ", stuck=" << ls.handshake_stuck_count
+       << ", power-alert=" << ls.power_cycle_required_count;
+    if (active && !g_auto_recover) {
+      ss << ", auto-reset=disabled";
+    }
+    if (ls.handshake_event_valid) {
+      ss << ", last=" << HandshakeEventStr(ls.last_handshake_event)
+         << " detail=" << ls.last_handshake_detail
+         << " ip=" << (ls.last_handshake_ip[0] ? ls.last_handshake_ip : "?");
+    }
+    ss << "\n";
   }
 
   /** Mode-switch footer: requests that failed after all bounded retries
@@ -914,6 +1009,8 @@ int main(int argc, char **argv) {
     stats_timer = livox_node.createTimer(ros::Duration(1.0), StatsTimerCb);
     ROS_INFO("Publishing stats topic: livox/lidar_stats (1Hz)");
     ROS_INFO("Auto-recover (no-data/Config/Error watchdogs): %s",
+             g_auto_recover ? "ENABLED" : "disabled");
+    ROS_INFO("Handshake session recovery (broadcast-only watchdog): %s",
              g_auto_recover ? "ENABLED" : "disabled");
   }
 

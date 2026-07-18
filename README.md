@@ -12,6 +12,7 @@
 8. **零点洪泛防护** — 大丢包/掉线时限制零点回填，避免整片假点污染融合点云
 9. **自动恢复看门狗（可选）** — 检测到假活（`Normal` 但**没有点云发布**）、配置长期不完成或 `Error`（如电机故障）时按各自路径恢复该雷达，带重试上限防死循环
 10. **持久化健康日志（可选）** — 把健康事件与网络趋势落盘成 CSV（边沿事件 + 周期快照），供长期无人值守的趋势分析与故障取证
+11. **广播存活但握手卡死的识别与恢复** — 看板区分 `BROADCAST_ONLY / HANDSHAKE_STUCK / POWER_CYCLE_REQUIRED`；按单台雷达清理本地 session 并有限重试，仍失败时明确要求物理断电
 
 > **整个分支必须配套固定版 SDK。** Driver 的异步 callback context 生命周期依赖 SDK 的 exactly-once completion/cancellation 契约；不能只为模式切换换 SDK、再让其他功能链接任意同名库。
 
@@ -86,7 +87,7 @@ WantedBy=multi-user.target
 | 参数 | 生产值 | 原因 |
 |------|--------|------|
 | `monitor` | **`false`** | 后台服务**无图形界面**，自动弹 `gnome-terminal` 看板会弹不出来报错。想看看板时单独 `rosrun livox_ros_driver livox_stats_monitor.py` |
-| `auto_recover` | **`true`** | 无人值守时雷达故障（假活 / `Error`）**自动重启自愈**，不必等人 |
+| `auto_recover` | **`true`** | 无人值守时雷达故障（假活 / `Error` / 握手卡死）按各自路径自动恢复；握手仍失败时升级为物理断电告警 |
 | `health_log` | **`true`** | 健康事件 + 网络趋势**落盘取证**，供事后排查 |
 
 > 这三个值只对服务生效；你**手动 `roslaunch`** 时不带参数，仍是 `monitor:=true`（看板弹出）等默认值，两个场景各取所需、互不影响。
@@ -348,7 +349,7 @@ Auto-recover:  lidar 1: 1 reboot(s), last at 2026-06-26 13:46:08
 
 | 列 | 含义 |
 |----|------|
-| `state` | `Normal` 正常 / `NO DATA` **连着但没有点云发布出来**（假活——没收到数据，或收到了但驱动卡住没发布，两种都算；见下方）/ `DISCONNECTED` 掉线 / `PowerSaving` 节电 / `Error` 故障 |
+| `state` | `Normal` 正常 / `NO DATA` **连着但没有点云发布出来** / `DISCONNECTED` 广播也消失 / `BROADCAST_ONLY` 仅收到广播 / `HANDSHAKE_STUCK` 广播持续但握手连续失败 / `POWER_CYCLE_REQUIRED` 本地 session 已有限重试仍失败 / `PowerSaving` 节电 / `Error` 故障 |
 | `temp` | 温度状态 `OK` / `WARN`(偏高偏低) / `HOT!`(极端)。⚠️ 是状态码，**不是具体℃** |
 | `fan` | 风扇状态 `OK` 正常 / `WARN` **故障**（WARN 是风扇坏了，不是"在转"）|
 | `motor` | 电机（扫描)状态 `OK` 正常 / `WARN` 告警 / `ERR!` **错误，无法工作**（`ERR!` 意味着停止扫描、不再出点）|
@@ -363,13 +364,14 @@ Auto-recover:  lidar 1: 1 reboot(s), last at 2026-06-26 13:46:08
 
 #### 看板底部：历史事件（恢复后也一直记着）
 
-实时那几列只反映**当下**状态——一台雷达出过故障但又恢复了，列里就什么都看不出来了。所以看板底部有四类**历史汇总**（仅发生过时显示），从启动累计，方便发现"间歇性发作"的问题雷达：
+实时那几列只反映**当下**状态——一台雷达出过故障但又恢复了，列里就什么都看不出来了。所以看板底部有五类**历史汇总**（仅发生过时显示），从启动累计，方便发现"间歇性发作"的问题雷达：
 
 | 底部行 | 含义 |
 |--------|------|
 | `Temp changes` | 各台温度状态变化的次数 + 上次时间（频繁变化 = 散热不稳）|
 | `Fault events` | 各台进入 **motor/fan/dirty/volt/fw/system** 故障的次数 + 上次时间 + **是哪几项**（如 `motor+fan`、`dirty`）。`dirty` = 光窗脏污/遮挡（粉尘环境高频）。只记"从好变坏"那一下；**雷达恢复后这条仍保留** |
 | `Auto-recover` | 看门狗（`auto_recover`）给各台发过几次自动重启 + 上次时间。**只有真发生过自动重启才显示这行**（没开或没触发时不显示）|
+| `Handshake recovery` | 当前广播/握手状态及持续时间、session reset 次数、历史 stuck/power 告警，以及 SDK 最近一次 `TIMEOUT / REJECTED / NETWORK_ERROR / PROTOCOL_ERROR / RESET` 的 detail 和 IP；恢复后累计历史仍保留 |
 | `Mode switch` | 模式请求耗尽有限重试仍没切成的次数 + 上次时间（PowerSaving/Standby 最多 3 次，Normal 最多 7 次）。**只有真失败过才显示这行**；提示这台需人工介入 |
 
 > 排障套路：某台 `Fault events` 反复累加、或 `Auto-recover` 次数不断上涨，就是它在反复发作——结合 `Fault events` 的标签（比如老是 `motor+fan`）基本能锁定是风扇/电机硬件在衰竭，该停机物理检查/更换了。
@@ -402,7 +404,7 @@ Livox 的**心跳通道和点云数据通道是独立的**。偶尔会出现一�
 
 #### 可选：自动恢复看门狗（`auto_recover`）
 
-默认关闭。开启后，驱动对**三类故障**使用相互隔离的恢复路径：
+默认关闭。开启后，驱动对**四类故障**使用相互隔离的恢复路径：
 
 ```bash
 roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
@@ -442,11 +444,26 @@ roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
 
 - 只有恢复到 `Sampling` 且连续有点云发布约 60 秒，才清空本次 Config 重启预算，防止短暂重连绕过上限
 
-三类共同点：只处理**出问题的那一台**；每次重启动作打印 `[LivoxRecover]` 日志；动作次数会出现在看板底部 `Auto-recover` 行；启动时日志显示 `Auto-recover ... : ENABLED / disabled`。
+**情况 D：广播仍在，但握手/DeviceInfo 卡死** —— 这正是 Driver 和 Viewer 都连不上、断电后立即恢复的故障形态：
+
+| 时间（从首次连续广播起） | 状态/动作 |
+|------|------|
+| 0～5 秒 | `BROADCAST_ONLY`，等待正常握手完成 |
+| 约 5 秒 | `HANDSHAKE_STUCK`，清理该 broadcast code 的本地 pending/provisional session，重试 #1 |
+| 约 15 / 25 秒 | 仍未公开 Connect 时分别重试 #2 / #3 |
+| 约 30 秒 | 三次 reset 均已受理、广播仍新鲜且不是本机 `NETWORK_ERROR`：`POWER_CYCLE_REQUIRED` |
+| 广播超过 3 秒未再出现 | 回到普通 `DISCONNECTED`；历史告警保留 |
+
+- SDK 对同一 broadcast code 最多只保留一个 pending 握手；不会因每次广播都新建 socket
+- 握手 ACK 成功但 DeviceInfo/命令服务卡住属于 **provisional 半连接**，也可以定向清理，且不会向 Driver 制造一次假的 Disconnect
+- `NETWORK_ERROR` 会显示真实 socket errno/detail，并抑制“雷达必须断电”的误报；应先检查本机网卡、路由、端口占用
+- `auto_recover=false` 时仍识别并显示 `HANDSHAKE_STUCK`，但不声称已经执行 session reset，也不会升级为 `POWER_CYCLE_REQUIRED`
+
+前面三类恢复只处理**出问题的那一台**，硬件重启动作记入 `Auto-recover`；情况 D 的本地 session 清理与最终断电告警记入 `Handshake recovery`。启动日志会分别显示 `Auto-recover ... : ENABLED / disabled` 和 `Handshake session recovery ... : ENABLED / disabled`。
 
 > ⚠️ 这是驱动**自主重启硬件**的行为，所以默认关闭、需显式开启。无显示器的机器也能用（它和看板无关）。
 
-> **某台 `loss%` 偏高 → 重点排查那台的网线/接头/散热；某台 `state` 显示 `NO DATA` → Normal 却没有点云发布出来（假活），要警觉；某台 `DISCONNECTED` → 已掉线，可远程重启 `rosservice call /livox_lidar_reboot "{handle: N}"`。**
+> **某台 `loss%` 偏高 → 重点排查那台的网线/接头/散热；`NO DATA` → Normal 却没有点云发布；`HANDSHAKE_STUCK` → 控制服务卡住；`POWER_CYCLE_REQUIRED` → 软恢复已耗尽，此时命令通道不可用，必须给该雷达硬断电再上电。**
 
 #### 可选：持久化健康日志（`health_log`，长期无人值守用）
 
@@ -495,7 +512,7 @@ rostopic echo /livox/lidar_stats
 
 - fork：`https://github.com/85256638/Livox-SDK.git`
 - branch：`mod_set&range_filter`
-- commit：[`fe1a68cd54be70219821e4186e66329d375d224f`](https://github.com/85256638/Livox-SDK/commit/fe1a68cd54be70219821e4186e66329d375d224f)
+- commit：[`1a2686cf3032af5ae7455db1905f2cb8c1187468`](https://github.com/85256638/Livox-SDK/commit/1a2686cf3032af5ae7455db1905f2cb8c1187468)
 
 ### 配套 SDK 提供的保证
 
@@ -505,6 +522,10 @@ rostopic echo /livox/lidar_stats
 4. command payload 使用 RAII；断线清队列不会泄漏 Driver 的 callback context。ACK 同时核对 seq、command set 和 command id。
 5. LiDAR channel 查找/移除有同步；从 I/O callback 内断线时，channel 会保留到 raw delegate 真正移除后再析构，避免当前 callback 尚未返回就释放对象。
 6. 修复零长度协议 payload 的空指针 `memcpy` UB 和 `<memory>` 直接依赖缺失。
+7. 同一雷达最多一个 pending handshake；握手失败不再无限递增 `port_count`，端口固定在按 handle 分配的有限区间，长期故障不会 16 位回绕。
+8. 提供 `ResetLidarHandshakeSession(broadcast_code)`，在 SDK I/O 线程定向清理 pending 或 DeviceInfo 未完成的 provisional session，真正已 Connect 的设备拒绝清理。
+9. 提供握手诊断 callback，区分 timeout、设备拒绝、协议错误、本机 socket/network 错误和显式 reset，并携带 ret_code/errno/detail。
+10. 只有 DeviceInfo 成功才公开 `kEventConnect`；半连接清理不发假 Disconnect，`GetConnectedDevices` 也不暴露 provisional 设备。
 
 Driver 端的 context registry 只释放 SDK 已明确 callback/cancel 完成的 context，并保留 60 秒 tombstone 防御重复/迟到 callback 的地址复用；它不会凭“过了 N 秒”释放仍可能被 SDK 持有的裸指针。
 
@@ -518,12 +539,7 @@ Driver 端的 context registry 只释放 SDK 已明确 callback/cancel 完成的
 首次构建需要访问 GitHub。离线环境先准备正确 checkout：
 
 ```bash
-git clone --branch 'mod_set&range_filter' --single-branch \
-  https://github.com/85256638/Livox-SDK.git ~/Livox-SDK-pinned
-git -C ~/Livox-SDK-pinned checkout --detach \
-  fe1a68cd54be70219821e4186e66329d375d224f
-catkin_make -DPYTHON_EXECUTABLE=/usr/bin/python3 \
-  -DLIVOX_SDK_SOURCE_DIR=$HOME/Livox-SDK-pinned
+git clone --branch 'mod_set&range_filter' --single-branch https://github.com/85256638/Livox-SDK.git ~/Livox-SDK-pinned && git -C ~/Livox-SDK-pinned checkout --detach 1a2686cf3032af5ae7455db1905f2cb8c1187468 && catkin_make -DPYTHON_EXECUTABLE=/usr/bin/python3 -DLIVOX_SDK_SOURCE_DIR=$HOME/Livox-SDK-pinned
 ```
 
 ### SDK 关闭约束
@@ -543,6 +559,9 @@ catkin_make -DPYTHON_EXECUTABLE=/usr/bin/python3 \
 | `sdk_core/src/command_handler/*_command_handler.*` | channel 容器同步、安全 detach 与 delegate 移除后的延迟回收 |
 | `sdk_core/src/comm/sdk_protocol.cpp` | 零长度 payload UB 与非法 payload 校验 |
 | `sdk_core/src/base/thread_base.h` | `<memory>` 直接依赖 |
+| `sdk_core/src/device_discovery.*` | 握手去重、有界端口、timeout/errno/ret_code 诊断，以及 I/O 线程内定向 session reset |
+| `sdk_core/src/device_manager.*` | provisional/ready 分层；DeviceInfo 成功后才公开 Connect；半连接静默清理 |
+| `sdk_core/src/base/network/*/network_util.cpp` | socket 创建失败时保留真实 errno/WSA error，供诊断上报 |
 
 ### ROS Driver
 
@@ -552,8 +571,8 @@ catkin_make -DPYTHON_EXECUTABLE=/usr/bin/python3 \
 | `srv/LidarReboot.srv` | **新增** — 重启 Service 定义 |
 | `CMakeLists.txt` | 注册两个 srv，并链接固定 SDK CMake target |
 | `cmake/pinned_livox_sdk.cmake` | 固定 SDK fork/branch/SHA，校验 clean checkout，fail closed |
-| `livox_ros_driver/lds_lidar.h/.cpp` | 模式切换 + 重启 + 状态机抖动修复 |
-| `livox_ros_driver/livox_ros_driver.cpp` | 模式/重启 Service、AsyncSpinner、max_distance 参数、`livox/lidar_stats` 看板发布，以及显式停止 timer/spinner 后的正常关闭 |
+| `livox_ros_driver/lds_lidar.h/.cpp` | 模式切换 + 重启 + 状态机抖动修复 + 广播/握手状态机、session reset 与 SDK 诊断接线 |
+| `livox_ros_driver/livox_ros_driver.cpp` | 模式/重启 Service、AsyncSpinner、max_distance 参数、含握手状态/历史的 `livox/lidar_stats` 看板，以及显式停止 timer/spinner 后的正常关闭 |
 | `livox_ros_driver/lddc.h/.cpp` | 距离过滤 + 读取端 UAF 加锁 |
 | `livox_ros_driver/lds.h/.cpp` | 每雷达锁、丢包统计（仅异常打印）、`data_type` 硬化、写入端 UAF 加锁 |
 | `livox_ros_driver/ldq.cpp` | 队列释放置空 + 操作空指针兜底 |
@@ -566,7 +585,7 @@ catkin_make -DPYTHON_EXECUTABLE=/usr/bin/python3 \
 ## 常见问题
 
 ### Q: 切到节电模式后立即自动恢复 Normal？
-查看 catkin configure 日志是否明确打印固定 SHA `fe1a68c...`。本分支不需要 `sudo make install` SDK；若仍链接到系统库，说明运行的不是这份 CMake/工作区。清理对应 catkin build 缓存后重新 `catkin_make`，不要只重编译旧 build 目录里的另一份源码。
+查看 catkin configure 日志是否明确打印固定 SHA `1a2686c...`。本分支不需要 `sudo make install` SDK；若仍链接到系统库，说明运行的不是这份 CMake/工作区。清理对应 catkin build 缓存后重新 `catkin_make`，不要只重编译旧 build 目录里的另一份源码。
 
 ### Q: handle 值怎么确定？
 启动驱动时观察终端日志 `Lidar[X] status_code[...] working state[...] feature[...]`，其中 X 就是 handle。单雷达通常为 0。
@@ -628,7 +647,7 @@ For ROS installation, please refer to the ROS installation guide :
 ### 1.2 Pinned Livox-SDK
 
 CMake uses `85256638/Livox-SDK`, branch `mod_set&range_filter`, commit
-`fe1a68cd54be70219821e4186e66329d375d224f`. It clones into the build directory
+`1a2686cf3032af5ae7455db1905f2cb8c1187468`. It clones into the build directory
 and links the CMake target directly. A local checkout may be supplied with
 `-DLIVOX_SDK_SOURCE_DIR=/absolute/path`, but configure fails unless its HEAD and
 tracked worktree match the pin.
