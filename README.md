@@ -26,6 +26,42 @@
 - Git（首次构建会在 build 目录获取固定版 Livox SDK）
 - 不要预装或手工选择官方 SDK；CMake 会固定 fork、分支和精确 commit
 
+### 中国现场：Geph 一键更新 SDK + Driver
+
+仓库根目录提供 `update_livox_geph.sh`。先启动 Geph 并确认本机 SOCKS5 端口为 `127.0.0.1:9909`，然后执行：
+
+```bash
+bash ~/catkin_ws/src/livox_ros_driver/update_livox_geph.sh
+```
+
+脚本把“最新版本”定义为 GitHub 定制分支的最新 commit SHA，而不是一直不变的 SDK `2.3.0` 字符串。它会严格按以下顺序运行：
+
+1. 所有 `ls-remote / clone / fetch` 都显式使用 `socks5h://127.0.0.1:9909`，不修改全局 Git 配置。
+2. 检查并 fast-forward `~/Livox-SDK` 的 `mod_set&range_filter` 分支；版本变化时重新编译并安装。
+3. SDK 成功后再检查 `~/catkin_ws/src/livox_ros_driver` 的 `updated_workingmode&set_rangefilter` 分支。
+4. 校验 Driver 固定的 SDK SHA 与 SDK 分支最新 SHA 完全一致，再通过本地 SDK 编译 catkin 工作空间；CMake 不会自行无代理访问 GitHub。
+5. 版本和成功构建记录均未变化时跳过重复编译。
+
+默认不会重启正在生产运行的 Driver。需要编译成功后立即应用新二进制时执行：
+
+```bash
+bash ~/catkin_ws/src/livox_ros_driver/update_livox_geph.sh --restart-service
+```
+
+需要排查构建缓存或强制重编译时执行：
+
+```bash
+bash ~/catkin_ws/src/livox_ros_driver/update_livox_geph.sh --force
+```
+
+可通过环境变量覆盖路径和并行数，例如：
+
+```bash
+LIVOX_SDK_DIR=/home/txkj/Livox-SDK CATKIN_WS=/home/txkj/catkin_ws LIVOX_JOBS=4 bash /home/txkj/catkin_ws/src/livox_ros_driver/update_livox_geph.sh
+```
+
+> 安全策略：SDK 和 Driver 只允许 fast-forward；检测到 tracked 本地修改、本地未推送 commit、分支分叉或 SDK/Driver 尚未形成配套版本时会停止，不会执行 `reset --hard` 或删除用户文件。若远端恰好正在先后推送 SDK 与 Driver，脚本会提示稍后重新运行。
+
 ### 编译
 
 ```bash
