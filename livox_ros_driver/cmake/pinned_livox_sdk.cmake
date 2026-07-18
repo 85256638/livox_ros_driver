@@ -5,7 +5,7 @@ set(LIVOX_SDK_GIT_REPOSITORY
   "https://github.com/85256638/Livox-SDK.git")
 set(LIVOX_SDK_GIT_BRANCH "mod_set&range_filter")
 set(LIVOX_SDK_GIT_COMMIT
-  "1a2686cf3032af5ae7455db1905f2cb8c1187468")
+  "401b062a625cd8e30cf8abb9f010389044e486bc")
 set(LIVOX_SDK_SOURCE_DIR "" CACHE PATH
   "Optional local Livox-SDK checkout; it must be clean and at the pinned commit")
 

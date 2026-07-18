@@ -512,7 +512,7 @@ rostopic echo /livox/lidar_stats
 
 - fork：`https://github.com/85256638/Livox-SDK.git`
 - branch：`mod_set&range_filter`
-- commit：[`1a2686cf3032af5ae7455db1905f2cb8c1187468`](https://github.com/85256638/Livox-SDK/commit/1a2686cf3032af5ae7455db1905f2cb8c1187468)
+- commit：[`401b062a625cd8e30cf8abb9f010389044e486bc`](https://github.com/85256638/Livox-SDK/commit/401b062a625cd8e30cf8abb9f010389044e486bc)
 
 ### 配套 SDK 提供的保证
 
@@ -526,6 +526,7 @@ rostopic echo /livox/lidar_stats
 8. 提供 `ResetLidarHandshakeSession(broadcast_code)`，在 SDK I/O 线程定向清理 pending 或 DeviceInfo 未完成的 provisional session，真正已 Connect 的设备拒绝清理。
 9. 提供握手诊断 callback，区分 timeout、设备拒绝、协议错误、本机 socket/network 错误和显式 reset，并携带 ret_code/errno/detail。
 10. 只有 DeviceInfo 成功才公开 `kEventConnect`；半连接清理不发假 Disconnect，`GetConnectedDevices` 也不暴露 provisional 设备。
+11. GNU/GCC 构建不再携带 Clang 专用告警参数，固定长度诊断字段也避免触发 GCC 9 的 `-Werror=stringop-truncation`。
 
 Driver 端的 context registry 只释放 SDK 已明确 callback/cancel 完成的 context，并保留 60 秒 tombstone 防御重复/迟到 callback 的地址复用；它不会凭“过了 N 秒”释放仍可能被 SDK 持有的裸指针。
 
@@ -539,7 +540,7 @@ Driver 端的 context registry 只释放 SDK 已明确 callback/cancel 完成的
 首次构建需要访问 GitHub。离线环境先准备正确 checkout：
 
 ```bash
-git clone --branch 'mod_set&range_filter' --single-branch https://github.com/85256638/Livox-SDK.git ~/Livox-SDK-pinned && git -C ~/Livox-SDK-pinned checkout --detach 1a2686cf3032af5ae7455db1905f2cb8c1187468 && catkin_make -DPYTHON_EXECUTABLE=/usr/bin/python3 -DLIVOX_SDK_SOURCE_DIR=$HOME/Livox-SDK-pinned
+git clone --branch 'mod_set&range_filter' --single-branch https://github.com/85256638/Livox-SDK.git ~/Livox-SDK-pinned && git -C ~/Livox-SDK-pinned checkout --detach 401b062a625cd8e30cf8abb9f010389044e486bc && catkin_make -DPYTHON_EXECUTABLE=/usr/bin/python3 -DLIVOX_SDK_SOURCE_DIR=$HOME/Livox-SDK-pinned
 ```
 
 ### SDK 关闭约束
@@ -585,7 +586,7 @@ git clone --branch 'mod_set&range_filter' --single-branch https://github.com/852
 ## 常见问题
 
 ### Q: 切到节电模式后立即自动恢复 Normal？
-查看 catkin configure 日志是否明确打印固定 SHA `1a2686c...`。本分支不需要 `sudo make install` SDK；若仍链接到系统库，说明运行的不是这份 CMake/工作区。清理对应 catkin build 缓存后重新 `catkin_make`，不要只重编译旧 build 目录里的另一份源码。
+查看 catkin configure 日志是否明确打印固定 SHA `401b062...`。本分支不需要 `sudo make install` SDK；若仍链接到系统库，说明运行的不是这份 CMake/工作区。清理对应 catkin build 缓存后重新 `catkin_make`，不要只重编译旧 build 目录里的另一份源码。
 
 ### Q: handle 值怎么确定？
 启动驱动时观察终端日志 `Lidar[X] status_code[...] working state[...] feature[...]`，其中 X 就是 handle。单雷达通常为 0。
@@ -647,7 +648,7 @@ For ROS installation, please refer to the ROS installation guide :
 ### 1.2 Pinned Livox-SDK
 
 CMake uses `85256638/Livox-SDK`, branch `mod_set&range_filter`, commit
-`1a2686cf3032af5ae7455db1905f2cb8c1187468`. It clones into the build directory
+`401b062a625cd8e30cf8abb9f010389044e486bc`. It clones into the build directory
 and links the CMake target directly. A local checkout may be supplied with
 `-DLIVOX_SDK_SOURCE_DIR=/absolute/path`, but configure fails unless its HEAD and
 tracked worktree match the pin.
