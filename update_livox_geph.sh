@@ -19,19 +19,31 @@ DRIVER_DIR="${LIVOX_DRIVER_DIR:-${CATKIN_WS}/src/livox_ros_driver}"
 STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/livox-stack-updater"
 SDK_STAMP="${STATE_DIR}/sdk-installed-commit"
 DRIVER_STAMP="${STATE_DIR}/driver-built-revisions"
+SITE_CONFIG_PENDING_FILE="${STATE_DIR}/site-config-pending"
 ROS_SETUP="${LIVOX_ROS_SETUP:-/opt/ros/noetic/setup.bash}"
+PYTHON_EXECUTABLE="${LIVOX_PYTHON_EXECUTABLE:-/usr/bin/python3}"
 JOBS="${LIVOX_JOBS:-}"
 GIT_TIMEOUT_SEC="${LIVOX_GIT_TIMEOUT_SEC:-300}"
 
 FORCE_REBUILD=0
 RESTART_SERVICE=0
+PRESERVE_SITE_CONFIG=0
 FETCHED_HEAD=""
 ACTIVE_CLONE_TEMP=""
+SITE_CONFIG_PREPARED=0
+SITE_CONFIG_BACKUP_DIR=""
+SITE_CONFIG_PATCH=""
+SITE_CONFIG_STASH_SHA=""
+SITE_CONFIG_CHANGED_PATHS=()
+SITE_CONFIG_PATHS=(
+  "livox_ros_driver/config/livox_lidar_config_multi.json"
+  "livox_ros_driver/launch/livox_lidar_multi.launch"
+)
 ORIGINAL_ARGS=("$@")
 
 usage() {
   cat <<'EOF'
-Usage: update_livox_geph.sh [--force] [--restart-service]
+Usage: update_livox_geph.sh [--force] [--preserve-site-config] [--restart-service]
 
 Default environment:
   LIVOX_GEPH_PROXY=socks5h://127.0.0.1:9909
@@ -40,9 +52,10 @@ Default environment:
   CATKIN_WS=$HOME/catkin_ws
 
 Options:
-  --force             Rebuild SDK and Driver even when revisions are unchanged.
-  --restart-service   Restart livox-ros-driver after a successful build.
-  -h, --help          Show this help.
+  --force                 Rebuild even when revisions are unchanged.
+  --preserve-site-config  Preserve pit-specific multi-LiDAR JSON/launch edits.
+  --restart-service       Restart livox-ros-driver only after success.
+  -h, --help              Show this help.
 EOF
 }
 
@@ -53,6 +66,9 @@ while (($#)); do
       ;;
     --restart-service)
       RESTART_SERVICE=1
+      ;;
+    --preserve-site-config)
+      PRESERVE_SITE_CONFIG=1
       ;;
     -h|--help)
       usage
@@ -77,12 +93,23 @@ die() {
 }
 
 cleanup() {
+  local exit_status=$?
+  set +e
+  if ((SITE_CONFIG_PREPARED)); then
+    log "脚本提前退出，正在恢复工位 JSON/launch。"
+    if ! restore_site_config; then
+      exit_status=1
+      log "ERROR: 自动恢复未完全成功；请从备份核对工位文件：${SITE_CONFIG_BACKUP_DIR}"
+    fi
+  fi
   if [[ -n "${LIVOX_UPDATER_TEMP_COPY:-}" ]]; then
     rm -f -- "${LIVOX_UPDATER_TEMP_COPY}"
   fi
   if [[ -n "${ACTIVE_CLONE_TEMP}" && -d "${ACTIVE_CLONE_TEMP}" ]]; then
     rm -rf -- "${ACTIVE_CLONE_TEMP}"
   fi
+  trap - EXIT
+  exit "${exit_status}"
 }
 
 # Run from a temporary copy so updating the Driver repository cannot replace
@@ -95,24 +122,6 @@ if [[ -z "${LIVOX_UPDATER_TEMP_COPY:-}" ]]; then
   exec "${temp_script}" "${ORIGINAL_ARGS[@]}"
 fi
 trap cleanup EXIT
-
-[[ ${EUID} -ne 0 ]] || die "请使用普通用户运行；脚本只会在安装 SDK/重启服务时调用 sudo。"
-[[ "${GIT_TIMEOUT_SEC}" =~ ^[1-9][0-9]*$ ]] || die "LIVOX_GIT_TIMEOUT_SEC 必须是正整数。"
-[[ "${SDK_INSTALL_PREFIX}" == /* ]] || die "LIVOX_SDK_INSTALL_PREFIX 必须是绝对路径。"
-
-for command_name in git cmake timeout nproc sudo flock; do
-  command -v "${command_name}" >/dev/null 2>&1 || die "缺少命令：${command_name}"
-done
-if [[ -z "${JOBS}" ]]; then
-  JOBS="$(nproc)"
-fi
-[[ "${JOBS}" =~ ^[1-9][0-9]*$ ]] || die "LIVOX_JOBS 必须是正整数，当前值：${JOBS}"
-[[ -f "${ROS_SETUP}" ]] || die "找不到 ROS 环境：${ROS_SETUP}"
-[[ -x /usr/bin/python3 ]] || die "找不到 ROS Noetic 所需的 /usr/bin/python3。"
-
-mkdir -p "${STATE_DIR}" "${CATKIN_WS}/src"
-exec 9>"${STATE_DIR}/update.lock"
-flock -n 9 || die "已有另一个 Livox 更新任务正在运行。"
 
 GIT_PROXY=(
   git
@@ -156,6 +165,239 @@ check_origin() {
     die "${name} origin 不符合预期：${actual_url}"
 }
 
+site_config_other_changes() {
+  git -C "${DRIVER_DIR}" diff --name-only HEAD -- . \
+    ":(exclude)${SITE_CONFIG_PATHS[0]}" \
+    ":(exclude)${SITE_CONFIG_PATHS[1]}"
+}
+
+site_path_is_tracked_regular() {
+  local path="$1"
+  local stage_entry
+  local status_entry
+  local mode
+
+  stage_entry="$(git -C "${DRIVER_DIR}" ls-files --stage -- "${path}")"
+  [[ -n "${stage_entry}" ]] || return 1
+  mode="${stage_entry%% *}"
+  [[ "${mode}" == "100644" || "${mode}" == "100755" ]] || return 1
+  status_entry="$(git -C "${DRIVER_DIR}" ls-files -v -- "${path}")"
+  [[ "${status_entry%% *}" == "H" ]] || return 1
+  [[ -f "${DRIVER_DIR}/${path}" && ! -L "${DRIVER_DIR}/${path}" ]]
+}
+
+validate_site_config_scope() {
+  local other_changes
+  local path
+
+  ((PRESERVE_SITE_CONFIG)) || return 0
+  [[ -d "${DRIVER_DIR}/.git" ]] || return 0
+
+  for path in "${SITE_CONFIG_PATHS[@]}"; do
+    site_path_is_tracked_regular "${path}" ||
+      die "工位配置文件未被跟踪、被删除、不是普通文件或设置了 skip-worktree/assume-unchanged，无法自动保留：${path}"
+  done
+
+  if ! git -C "${DRIVER_DIR}" diff --cached --quiet -- \
+      "${SITE_CONFIG_PATHS[@]}"; then
+    die "工位 JSON/launch 存在 staged 修改；请先取消暂存，避免丢失 index 中间版本。"
+  fi
+
+  other_changes="$(site_config_other_changes)"
+  if [[ -n "${other_changes}" ]]; then
+    log "以下 tracked 修改不属于允许自动保留的两份工位配置："
+    printf '%s\n' "${other_changes}" >&2
+    die "为避免覆盖源码，已停止更新。"
+  fi
+}
+
+drop_site_config_stash_if_top() {
+  local current_stash=""
+
+  [[ -n "${SITE_CONFIG_STASH_SHA}" ]] || return 0
+  current_stash="$(git -C "${DRIVER_DIR}" rev-parse -q --verify refs/stash 2>/dev/null || true)"
+  if [[ "${current_stash}" == "${SITE_CONFIG_STASH_SHA}" ]]; then
+    git -C "${DRIVER_DIR}" stash drop -q "stash@{0}" ||
+      log "WARNING: 工位配置已恢复，但自动备份 stash 未能删除。"
+  else
+    log "WARNING: stash 列表在更新期间发生变化，保留自动备份 ${SITE_CONFIG_STASH_SHA}。"
+  fi
+}
+
+clear_site_config_pending() {
+  local pending_backup=""
+
+  [[ -f "${SITE_CONFIG_PENDING_FILE}" ]] || return 0
+  pending_backup="$(<"${SITE_CONFIG_PENDING_FILE}")"
+  [[ "${pending_backup}" == "${SITE_CONFIG_BACKUP_DIR}" ]] || return 1
+  rm -f -- "${SITE_CONFIG_PENDING_FILE}"
+}
+
+atomic_copy_file() {
+  local source="$1"
+  local target="$2"
+  local temporary="${target}.livox-updater.$$"
+
+  cp -p -- "${source}" "${temporary}" || return 1
+  mv -f -- "${temporary}" "${target}" || return 1
+}
+
+restore_site_config() {
+  local auxiliary_failure=0
+  local invalid_target=0
+  local path
+
+  ((SITE_CONFIG_PREPARED)) || return 0
+  if ! mkdir -p "${SITE_CONFIG_BACKUP_DIR}/upstream"; then
+    auxiliary_failure=1
+  fi
+  for path in "${SITE_CONFIG_CHANGED_PATHS[@]}"; do
+    if site_path_is_tracked_regular "${path}"; then
+      if ! mkdir -p "${SITE_CONFIG_BACKUP_DIR}/upstream/$(dirname "${path}")" ||
+          ! cp -p -- "${DRIVER_DIR}/${path}" \
+            "${SITE_CONFIG_BACKUP_DIR}/upstream/${path}"; then
+        auxiliary_failure=1
+      fi
+    else
+      invalid_target=1
+    fi
+    if ! mkdir -p "${DRIVER_DIR}/$(dirname "${path}")" ||
+        ! atomic_copy_file "${SITE_CONFIG_BACKUP_DIR}/original/${path}" \
+          "${DRIVER_DIR}/${path}"; then
+      log "ERROR: 无法原子恢复工位文件：${path}"
+      return 1
+    fi
+  done
+  for path in "${SITE_CONFIG_CHANGED_PATHS[@]}"; do
+    if ! cmp -s -- "${SITE_CONFIG_BACKUP_DIR}/original/${path}" \
+        "${DRIVER_DIR}/${path}"; then
+      log "ERROR: 工位文件恢复后校验不一致：${path}"
+      return 1
+    fi
+  done
+  if ! git -C "${DRIVER_DIR}" restore --staged -- \
+      "${SITE_CONFIG_CHANGED_PATHS[@]}" >/dev/null 2>&1; then
+    auxiliary_failure=1
+  fi
+  if ! clear_site_config_pending; then
+    log "ERROR: 工位文件已恢复，但无法清除 pending 事务。"
+    return 1
+  fi
+  SITE_CONFIG_PREPARED=0
+  if ((invalid_target)); then
+    log "ERROR: 上游删除或改变了工位配置文件类型；已恢复原文件但不会重启服务。"
+    log "ERROR: 请人工检查，备份目录：${SITE_CONFIG_BACKUP_DIR}"
+    return 1
+  fi
+  if ((auxiliary_failure)); then
+    log "ERROR: 工位原文件已恢复，但备份上游版本或 Git index 时发生错误；不会重启服务。"
+    return 1
+  fi
+  drop_site_config_stash_if_top
+  log "工位 JSON/launch 已按更新前原样恢复；持久备份：${SITE_CONFIG_BACKUP_DIR}"
+  return 0
+}
+
+prepare_site_config() {
+  local changed_output
+  local head_sha
+  local path
+  local stash_message
+
+  ((PRESERVE_SITE_CONFIG)) || return 0
+  [[ -d "${DRIVER_DIR}/.git" ]] || return 0
+  validate_site_config_scope
+
+  changed_output="$(git -C "${DRIVER_DIR}" diff --name-only HEAD -- \
+    "${SITE_CONFIG_PATHS[@]}")"
+  SITE_CONFIG_CHANGED_PATHS=()
+  while IFS= read -r path; do
+    [[ -n "${path}" ]] && SITE_CONFIG_CHANGED_PATHS+=("${path}")
+  done <<<"${changed_output}"
+
+  if ((${#SITE_CONFIG_CHANGED_PATHS[@]} == 0)); then
+    log "两份工位配置没有本地修改，无需暂存。"
+    return 0
+  fi
+
+  head_sha="$(git -C "${DRIVER_DIR}" rev-parse HEAD)"
+  SITE_CONFIG_BACKUP_DIR="${STATE_DIR}/site-config-backups/$(date '+%Y%m%d-%H%M%S')-$(short_sha "${head_sha}")-$$"
+  SITE_CONFIG_PATCH="${SITE_CONFIG_BACKUP_DIR}/local-changes.patch"
+  mkdir -p "${SITE_CONFIG_BACKUP_DIR}/base" "${SITE_CONFIG_BACKUP_DIR}/original"
+  for path in "${SITE_CONFIG_CHANGED_PATHS[@]}"; do
+    mkdir -p "${SITE_CONFIG_BACKUP_DIR}/base/$(dirname "${path}")"
+    mkdir -p "${SITE_CONFIG_BACKUP_DIR}/original/$(dirname "${path}")"
+    git -C "${DRIVER_DIR}" show "${head_sha}:${path}" >"${SITE_CONFIG_BACKUP_DIR}/base/${path}"
+    cp -p -- "${DRIVER_DIR}/${path}" \
+      "${SITE_CONFIG_BACKUP_DIR}/original/${path}"
+  done
+  atomic_write "${SITE_CONFIG_BACKUP_DIR}/base-sha" "${head_sha}"
+  atomic_write "${SITE_CONFIG_BACKUP_DIR}/driver-root" "${DRIVER_DIR}"
+  printf '%s\n' "${SITE_CONFIG_CHANGED_PATHS[@]}" >"${SITE_CONFIG_BACKUP_DIR}/changed-files.txt"
+  git -C "${DRIVER_DIR}" diff --binary --full-index HEAD -- \
+    "${SITE_CONFIG_CHANGED_PATHS[@]}" >"${SITE_CONFIG_PATCH}"
+  [[ -s "${SITE_CONFIG_PATCH}" ]] || die "无法生成工位配置差异备份。"
+
+  SITE_CONFIG_PREPARED=1
+  atomic_write "${SITE_CONFIG_PENDING_FILE}" "${SITE_CONFIG_BACKUP_DIR}"
+  stash_message="livox updater site config $(date '+%Y-%m-%d %H:%M:%S')"
+  git -C "${DRIVER_DIR}" \
+    -c user.name="Livox Stack Updater" \
+    -c user.email="livox-updater@localhost" \
+    stash push -q -m "${stash_message}" -- \
+    "${SITE_CONFIG_CHANGED_PATHS[@]}" ||
+    die "无法暂存工位配置；原文件备份位于 ${SITE_CONFIG_BACKUP_DIR}"
+  SITE_CONFIG_STASH_SHA="$(git -C "${DRIVER_DIR}" rev-parse -q --verify refs/stash)" ||
+    die "工位配置暂存后无法读取 stash。"
+  atomic_write "${SITE_CONFIG_BACKUP_DIR}/stash-commit" "${SITE_CONFIG_STASH_SHA}"
+  git -C "${DRIVER_DIR}" diff --quiet HEAD -- \
+    "${SITE_CONFIG_CHANGED_PATHS[@]}" ||
+    die "工位配置暂存后工作区仍不干净。"
+  log "已安全暂存工位 JSON/launch；备份：${SITE_CONFIG_BACKUP_DIR}"
+}
+
+recover_pending_site_config() {
+  local path
+  local pending_backup
+
+  [[ -f "${SITE_CONFIG_PENDING_FILE}" ]] || return 0
+  pending_backup="$(<"${SITE_CONFIG_PENDING_FILE}")"
+  [[ "${pending_backup}" == "${STATE_DIR}/site-config-backups/"* ]] ||
+    die "工位配置 pending 路径异常：${pending_backup}"
+  [[ -d "${pending_backup}/base" && -d "${pending_backup}/original" &&
+     -s "${pending_backup}/local-changes.patch" &&
+     -s "${pending_backup}/changed-files.txt" &&
+     -s "${pending_backup}/driver-root" ]] ||
+    die "工位配置 pending 备份不完整：${pending_backup}"
+  [[ "$(<"${pending_backup}/driver-root")" == "${DRIVER_DIR}" ]] ||
+    die "pending 备份属于另一个 Driver 目录：$(<"${pending_backup}/driver-root")"
+  [[ -d "${DRIVER_DIR}/.git" ]] ||
+    die "存在待恢复的工位配置，但 Driver 仓库不存在：${DRIVER_DIR}"
+
+  SITE_CONFIG_BACKUP_DIR="${pending_backup}"
+  SITE_CONFIG_PATCH="${pending_backup}/local-changes.patch"
+  SITE_CONFIG_CHANGED_PATHS=()
+  while IFS= read -r path; do
+    case "${path}" in
+      "${SITE_CONFIG_PATHS[0]}"|"${SITE_CONFIG_PATHS[1]}")
+        SITE_CONFIG_CHANGED_PATHS+=("${path}")
+        ;;
+      *)
+        die "pending 备份包含未授权路径：${path}"
+        ;;
+    esac
+  done <"${pending_backup}/changed-files.txt"
+  ((${#SITE_CONFIG_CHANGED_PATHS[@]} > 0)) ||
+    die "pending 备份没有工位配置路径。"
+  if [[ -s "${pending_backup}/stash-commit" ]]; then
+    SITE_CONFIG_STASH_SHA="$(<"${pending_backup}/stash-commit")"
+  fi
+  SITE_CONFIG_PREPARED=1
+  log "检测到上次中断留下的工位配置事务，正在先行恢复。"
+  restore_site_config ||
+    die "工位配置事务需要人工核对：${pending_backup}"
+}
+
 remote_branch_head() {
   local name="$1"
   local repository_url="$2"
@@ -178,6 +420,7 @@ sync_remote_branch() {
   local directory="$2"
   local repository_url="$3"
   local branch="$4"
+  local allow_tracked_changes="${5:-0}"
   local parent
 
   if [[ -e "${directory}" && ! -d "${directory}/.git" ]]; then
@@ -200,7 +443,9 @@ sync_remote_branch() {
   fi
 
   check_origin "${name}" "${directory}" "${repository_url}"
-  check_clean_checkout "${name}" "${directory}"
+  if ((!allow_tracked_changes)); then
+    check_clean_checkout "${name}" "${directory}"
+  fi
 
   log "通过 Geph 检查 ${name} 最新版本"
   timeout "${GIT_TIMEOUT_SEC}" "${GIT_PROXY[@]}" -C "${directory}" fetch \
@@ -334,7 +579,7 @@ build_driver_if_needed() {
   fi
 
   (cd "${CATKIN_WS}" && catkin_make --force-cmake -j"${JOBS}" -l"${JOBS}" \
-    -DPYTHON_EXECUTABLE=/usr/bin/python3 \
+    -DPYTHON_EXECUTABLE="${PYTHON_EXECUTABLE}" \
     -DCMAKE_POLICY_DEFAULT_CMP0079=NEW \
     -DLIVOX_SDK_SOURCE_DIR="${SDK_DIR}")
 
@@ -342,6 +587,32 @@ build_driver_if_needed() {
   atomic_write "${DRIVER_STAMP}" "${desired_stamp}"
   log "Driver 编译完成：$(short_sha "${driver_sha}")"
 }
+
+[[ ${EUID} -ne 0 ]] || die "请使用普通用户运行；脚本只会在安装 SDK/重启服务时调用 sudo。"
+[[ "${GIT_TIMEOUT_SEC}" =~ ^[1-9][0-9]*$ ]] || die "LIVOX_GIT_TIMEOUT_SEC 必须是正整数。"
+[[ "${SDK_INSTALL_PREFIX}" == /* ]] || die "LIVOX_SDK_INSTALL_PREFIX 必须是绝对路径。"
+for command_name in git flock cmp; do
+  command -v "${command_name}" >/dev/null 2>&1 || die "缺少命令：${command_name}"
+done
+mkdir -p "${STATE_DIR}" "${CATKIN_WS}/src"
+exec 9>"${STATE_DIR}/update.lock"
+flock -n 9 || die "已有另一个 Livox 更新任务正在运行。"
+
+# Recover a prior interrupted configuration transaction before checking ROS,
+# contacting GitHub or changing SDK/Driver state.
+recover_pending_site_config
+
+for command_name in cmake timeout nproc sudo; do
+  command -v "${command_name}" >/dev/null 2>&1 || die "缺少命令：${command_name}"
+done
+if [[ -z "${JOBS}" ]]; then
+  JOBS="$(nproc)"
+fi
+[[ "${JOBS}" =~ ^[1-9][0-9]*$ ]] || die "LIVOX_JOBS 必须是正整数，当前值：${JOBS}"
+[[ -f "${ROS_SETUP}" ]] || die "找不到 ROS 环境：${ROS_SETUP}"
+[[ -x "${PYTHON_EXECUTABLE}" ]] ||
+  die "找不到 ROS Noetic 所需的 Python：${PYTHON_EXECUTABLE}"
+validate_site_config_scope
 
 log "检查 Geph 代理与 GitHub 连通性：${PROXY_URL}"
 SDK_ADVERTISED_HEAD="$(remote_branch_head \
@@ -355,9 +626,16 @@ SDK_REMOTE_HEAD="${FETCHED_HEAD}"
 update_checkout "Livox-SDK" "${SDK_DIR}" "${SDK_BRANCH}" "${SDK_REMOTE_HEAD}"
 install_sdk_if_needed "${SDK_REMOTE_HEAD}"
 
-sync_remote_branch "livox_ros_driver" "${DRIVER_DIR}" "${DRIVER_URL}" "${DRIVER_BRANCH}"
+sync_remote_branch "livox_ros_driver" "${DRIVER_DIR}" "${DRIVER_URL}" \
+  "${DRIVER_BRANCH}" "${PRESERVE_SITE_CONFIG}"
 DRIVER_REMOTE_HEAD="${FETCHED_HEAD}"
+# Network fetch is intentionally complete before the site files are stashed.
+# This keeps the window in which a watchdog restart could see repository
+# defaults limited to the local fast-forward operation below.
+prepare_site_config
 update_checkout "livox_ros_driver" "${DRIVER_DIR}" "${DRIVER_BRANCH}" "${DRIVER_REMOTE_HEAD}"
+restore_site_config ||
+  die "工位配置未能安全恢复，已禁止 Driver 编译与服务重启。"
 
 # A paired SDK/Driver publish is not atomic on GitHub. Recheck both branch tips
 # after updating so a mid-run push cannot produce a build that is already stale.

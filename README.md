@@ -38,6 +38,19 @@
 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh"
 ```
 
+工位已经手工修改多雷达 JSON/launch 时，使用下面的一键命令保留配置、更新编译并在成功后重启：
+
+```bash
+LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --restart-service
+```
+
+`--preserve-site-config` 只允许并原样保留以下两个文件：
+
+- `livox_ros_driver/config/livox_lidar_config_multi.json`
+- `livox_ros_driver/launch/livox_lidar_multi.launch`
+
+脚本会先把工位原文件、更新前仓库版本和差异持久备份到 `~/.local/state/livox-stack-updater/site-config-backups/`，短暂暂存工位修改，fast-forward Driver 后立即恢复原文件，随后才编译或重启。远端对这两个文件的新版本也会保存在备份目录的 `upstream/` 中，但不会覆盖工位文件；其他任何 tracked 本地修改仍会使更新停止。若进程中断，下次运行会先恢复未完成的配置事务，再进行联网更新。该选项只接管 `git status` 中形如 ` M` 的未暂存修改；若文件已 staged，脚本会停止并要求先取消暂存。
+
 编译成功后立即应用新二进制：
 
 ```bash
@@ -69,7 +82,7 @@ LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh"
 - **资源影响**：编译会占用 CPU、内存和磁盘 I/O，负载较高时可能增加点云丢包；生产机器建议使用 `LIVOX_JOBS=2`，并在维护窗口重启。
 - **失败处理**：更新或编译失败时脚本不会主动重启，当前旧进程通常仍可继续运行；在重新编译成功前不要主动重启服务或主机，因为磁盘上的新二进制可能尚未完整生成。
 
-> 安全策略：SDK 和 Driver 只允许 fast-forward；检测到 tracked 本地修改（包括仓库内手工修改的 JSON/launch）、本地未推送 commit、分支分叉或 SDK/Driver 尚未形成配套版本时会停止，不会执行 `reset --hard` 或删除用户文件。Driver 使用本地配套 SDK 编译，CMake 不会自行无代理访问 GitHub。
+> 安全策略：SDK 和 Driver 只允许 fast-forward；默认遇到任何 tracked 本地修改都会停止。只有显式添加 `--preserve-site-config` 时，上述两份工位文件才允许自动备份和恢复；其他修改、本地未推送 commit、分支分叉或 SDK/Driver 尚未形成配套版本仍会停止。脚本不会执行 `reset --hard` 或删除用户文件，Driver 使用本地配套 SDK 编译，CMake 不会自行无代理访问 GitHub。
 
 ### 编译
 
