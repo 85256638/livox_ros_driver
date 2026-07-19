@@ -28,39 +28,48 @@
 
 ### 中国现场：Geph 一键更新 SDK + Driver
 
-仓库根目录提供 `update_livox_geph.sh`。先启动 Geph 并确认本机 SOCKS5 端口为 `127.0.0.1:9909`，然后执行：
+仓库根目录提供 `update_livox_geph.sh`。脚本把“最新版本”定义为 GitHub 定制分支的最新 commit SHA，而不是一直不变的 SDK `2.3.0` 字符串。所有远程 Git 操作都显式使用 `socks5h://127.0.0.1:9909`，不会修改全局 Git 配置；开始前必须先启动 Geph。
+
+#### 常用命令
+
+检查并更新 SDK，成功后再检查、更新和编译 Driver；默认不重启正在运行的服务：
 
 ```bash
-bash ~/catkin_ws/src/livox_ros_driver/update_livox_geph.sh
+bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh"
 ```
 
-脚本把“最新版本”定义为 GitHub 定制分支的最新 commit SHA，而不是一直不变的 SDK `2.3.0` 字符串。它会严格按以下顺序运行：
-
-1. 所有 `ls-remote / clone / fetch` 都显式使用 `socks5h://127.0.0.1:9909`，不修改全局 Git 配置。
-2. 检查并 fast-forward `~/Livox-SDK` 的 `mod_set&range_filter` 分支；版本变化时重新编译并安装。
-3. SDK 成功后再检查 `~/catkin_ws/src/livox_ros_driver` 的 `updated_workingmode&set_rangefilter` 分支。
-4. 校验 Driver 固定的 SDK SHA 与 SDK 分支最新 SHA 完全一致，再通过本地 SDK 编译 catkin 工作空间；CMake 不会自行无代理访问 GitHub。
-5. 版本和成功构建记录均未变化时跳过重复编译。
-
-默认不会重启正在生产运行的 Driver。需要编译成功后立即应用新二进制时执行：
+编译成功后立即应用新二进制：
 
 ```bash
-bash ~/catkin_ws/src/livox_ros_driver/update_livox_geph.sh --restart-service
+bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --restart-service
 ```
 
-需要排查构建缓存或强制重编译时执行：
+`--restart-service` 不是另一种启动方式；它只是在全部更新和编译成功后，代为执行 `sudo systemctl restart livox-ros-driver`。不带该参数时，可在确认完成后手动重启：
 
 ```bash
-bash ~/catkin_ws/src/livox_ros_driver/update_livox_geph.sh --force
+sudo systemctl restart livox-ros-driver
 ```
 
-可通过环境变量覆盖路径和并行数，例如：
+版本未变化时脚本会跳过重复构建；需要强制重编译时执行：
 
 ```bash
-LIVOX_SDK_DIR=/home/txkj/Livox-SDK CATKIN_WS=/home/txkj/catkin_ws LIVOX_JOBS=4 bash /home/txkj/catkin_ws/src/livox_ros_driver/update_livox_geph.sh
+bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --force
 ```
 
-> 安全策略：SDK 和 Driver 只允许 fast-forward；检测到 tracked 本地修改、本地未推送 commit、分支分叉或 SDK/Driver 尚未形成配套版本时会停止，不会执行 `reset --hard` 或删除用户文件。若远端恰好正在先后推送 SDK 与 Driver，脚本会提示稍后重新运行。
+生产运行期间建议降低并行数，减少编译对点云接收的影响：
+
+```bash
+LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh"
+```
+
+#### Driver 正在运行时会发生什么
+
+- **不带 `--restart-service`**：当前进程不会停止，仍运行内存中的旧版代码；源码和磁盘上的二进制完成更新后，需要手动重启才会生效。
+- **带 `--restart-service`**：更新和编译期间旧进程继续运行；只有全部成功后才重启服务，此时会短暂断流并重新握手连接雷达。
+- **资源影响**：编译会占用 CPU、内存和磁盘 I/O，负载较高时可能增加点云丢包；生产机器建议使用 `LIVOX_JOBS=2`，并在维护窗口重启。
+- **失败处理**：更新或编译失败时脚本不会主动重启，当前旧进程通常仍可继续运行；在重新编译成功前不要主动重启服务或主机，因为磁盘上的新二进制可能尚未完整生成。
+
+> 安全策略：SDK 和 Driver 只允许 fast-forward；检测到 tracked 本地修改（包括仓库内手工修改的 JSON/launch）、本地未推送 commit、分支分叉或 SDK/Driver 尚未形成配套版本时会停止，不会执行 `reset --hard` 或删除用户文件。Driver 使用本地配套 SDK 编译，CMake 不会自行无代理访问 GitHub。
 
 ### 编译
 
