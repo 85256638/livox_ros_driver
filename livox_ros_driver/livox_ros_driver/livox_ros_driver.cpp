@@ -33,6 +33,7 @@
 #include <ros/ros.h>
 #include <std_msgs/String.h>
 #include "health_logger.h"
+#include "recovery_event_json.h"
 #include "lddc.h"
 #include "lds_hub.h"
 #include "lds_lidar.h"
@@ -165,6 +166,13 @@ bool LidarRebootServiceCb(livox_ros_driver::LidarReboot::Request &req,
 
 /** Publisher for the per-second stats dashboard (std_msgs/String). */
 static ros::Publisher g_stats_pub;
+/** Machine-readable recovery topics consumed by the independent relay power
+ *  manager.  The request topic is latched and every request has a stable
+ *  event_id; the manager additionally watches the 1 Hz state topic so a
+ *  restart cannot miss a still-active POWER_CYCLE_REQUIRED episode. */
+static ros::Publisher g_power_cycle_request_pub;
+static ros::Publisher g_recovery_state_pub;
+static uint64_t g_driver_instance_id = 0;
 /** When true, the stats timer auto-recovers a lidar that is connected/Normal
  *  but has produced no point cloud for a while (restart sampling, then reboot). */
 static bool g_auto_recover = false;
@@ -210,6 +218,62 @@ static const char *HandshakeEventStr(DeviceHandshakeEvent event) {
     default:
       return "UNKNOWN";
   }
+}
+
+static const char *ConnectStateStr(LidarConnectState state) {
+  switch (state) {
+    case kConnectStateOff:
+      return "Off";
+    case kConnectStateOn:
+      return "On";
+    case kConnectStateConfig:
+      return "Config";
+    case kConnectStateSampling:
+      return "Sampling";
+    default:
+      return "?";
+  }
+}
+
+static void PublishRecoveryState(
+    uint8_t handle, const char *broadcast_code, bool connected,
+    LidarConnectState connect_state, uint8_t lidar_state,
+    const LdsLidar::LinkStat &link, bool broadcast_fresh, bool publishing,
+    uint64_t published_packets) {
+  if (!g_recovery_state_pub) {
+    return;
+  }
+  std_msgs::String msg;
+  msg.data = BuildLidarRecoveryStateJson(
+      static_cast<int64_t>(time(nullptr)), g_driver_instance_id, handle,
+      broadcast_code, connected, ConnectStateStr(connect_state),
+      LidarStateStr(lidar_state), HandshakeStateStr(link.handshake_state),
+      broadcast_fresh, publishing, published_packets,
+      link.power_cycle_required_count, link.power_cycle_required_wall_s);
+  g_recovery_state_pub.publish(msg);
+}
+
+static void PublishPowerCycleRequest(uint8_t handle, const char *broadcast_code,
+                                     const LdsLidar::LinkStat &link,
+                                     bool broadcast_fresh) {
+  if (!g_power_cycle_request_pub || !broadcast_code || !broadcast_code[0]) {
+    return;
+  }
+  const long long detected_at =
+      static_cast<long long>(link.power_cycle_required_wall_s);
+  std::ostringstream event_id;
+  event_id << broadcast_code << ":" << g_driver_instance_id << ":"
+           << detected_at << ":" << link.power_cycle_required_count;
+  const std::string event_id_text = event_id.str();
+  std_msgs::String msg;
+  msg.data = BuildPowerCycleRequestJson(
+      event_id_text.c_str(), static_cast<int64_t>(time(nullptr)), detected_at,
+      g_driver_instance_id, handle, broadcast_code, broadcast_fresh,
+      link.handshake_reset_attempts, link.power_cycle_required_count);
+  g_power_cycle_request_pub.publish(msg);
+  ROS_ERROR("[LivoxPowerCycle] published request event_id=%s lidar[%u][%s]",
+            event_id_text.c_str(), static_cast<unsigned>(handle),
+            broadcast_code);
 }
 
 static const char *TempStr(uint32_t s) {
@@ -321,6 +385,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
   static uint8_t config_reboots[kMaxLidarCount] = {0};  /**< bounded reboots for the Config episode */
   static uint32_t config_healthy_secs[kMaxLidarCount] = {0}; /**< sustained published recovery before budget reset */
   static bool nodata_logged[kMaxLidarCount] = {false};  /**< a NODATA onset event has been logged for the current silent episode */
+  static uint32_t emitted_power_cycle_count[kMaxLidarCount] = {0};
 
   int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
 
@@ -418,10 +483,13 @@ void StatsTimerCb(const ros::TimerEvent &) {
     const char *sys = MotorStr(em.lidar_error_code.system_status);
     double loss_pct_d = tot ? (100.0 * st.loss_packet_count / tot) : 0.0;
     char line[256];
+    bool publishing_now = false;
     if (connected) {
       uint32_t d_recv = (uint32_t)(st.receive_packet_count - prev_recv[h]);
       uint32_t d_pub = (uint32_t)(st.publish_packet_count - prev_pub[h]);
       uint32_t d_drop = (uint32_t)(st.queue_drop_count - prev_drop[h]);
+      publishing_now =
+          (connect_state == kConnectStateSampling && d_pub > 0);
       prev_recv[h] = st.receive_packet_count;
       prev_pub[h] = st.publish_packet_count;
       prev_drop[h] = st.queue_drop_count;
@@ -686,6 +754,18 @@ void StatsTimerCb(const ros::TimerEvent &) {
                          st.queue_drop_count, loss_pct_d, disc);
       }
     }
+    /** Publish a compact, machine-readable state independently of the human
+     *  dashboard.  The relay manager uses current state as a second guard
+     *  against acting on a delayed or replayed request. */
+    PublishRecoveryState(h, last_bcode[h], connected, connect_state,
+                         info.state, ls, broadcast_recent, publishing_now,
+                         st.publish_packet_count);
+    if (ls.handshake_state ==
+            LdsLidar::kHandshakeLinkPowerCycleRequired &&
+        ls.power_cycle_required_count > emitted_power_cycle_count[h]) {
+      PublishPowerCycleRequest(h, last_bcode[h], ls, broadcast_recent);
+      emitted_power_cycle_count[h] = ls.power_cycle_required_count;
+    }
     ss << line;
   }
   if (!any) {
@@ -836,6 +916,7 @@ int main(int argc, char **argv) {
   }
   ros::init(argc, argv, "livox_lidar_publisher");
   ros::NodeHandle livox_node;
+  g_driver_instance_id = ros::WallTime::now().toNSec();
 
   ROS_INFO("Livox Ros Driver Version: %s", LIVOX_ROS_DRIVER_VERSION_STRING);
   /** Check sdk version */
@@ -1006,8 +1087,14 @@ int main(int argc, char **argv) {
   ros::Timer stats_timer;
   if (data_src == kSourceRawLidar) {
     g_stats_pub = livox_node.advertise<std_msgs::String>("livox/lidar_stats", 1);
+    g_power_cycle_request_pub = livox_node.advertise<std_msgs::String>(
+        "livox/power_cycle_request", 16, true);
+    g_recovery_state_pub = livox_node.advertise<std_msgs::String>(
+        "livox/lidar_recovery_state", 32);
     stats_timer = livox_node.createTimer(ros::Duration(1.0), StatsTimerCb);
     ROS_INFO("Publishing stats topic: livox/lidar_stats (1Hz)");
+    ROS_INFO("Publishing recovery topics: livox/power_cycle_request (latched) "
+             "and livox/lidar_recovery_state (1Hz)");
     ROS_INFO("Auto-recover (no-data/Config/Error watchdogs): %s",
              g_auto_recover ? "ENABLED" : "disabled");
     ROS_INFO("Handshake session recovery (broadcast-only watchdog): %s",

@@ -1,8 +1,8 @@
 # 览沃 ROS 驱动程序（ [livox_ros_driver English README](https://github.com/Livox-SDK/livox_ros_driver/) ）
 
-> **定制分支提示**：`updated_workingmode&set_rangefilter` 必须配套
-> `85256638/Livox-SDK` 的 `mod_set&range_filter` 分支、commit
-> `fe1a68cd54be70219821e4186e66329d375d224f`。CMake 会在 build 目录获取并
+> **定制分支提示**：`network-relay-added` 必须配套
+> `85256638/Livox-SDK` 的 `network-relay-added` 分支、commit
+> `e45774c5d4f2edab96dd6d61479167784d7df8c9`。CMake 会在 build 目录获取并
 > 直接链接这个固定版本；不要安装或替换为官方 SDK/系统同名静态库。完整可靠性
 > 契约、离线构建和关闭约束见 [README.md](README.md) 顶部定制说明。
 
@@ -48,7 +48,7 @@ tracked 工作树必须与固定版本一致，否则 CMake 会直接失败。
 
 1. 从览沃 GitHub 获取览沃 ROS 驱动程序
 
-   `git clone --branch 'updated_workingmode&set_rangefilter' --single-branch https://github.com/85256638/livox_ros_driver.git ws_livox/src/livox_ros_driver`
+   `git clone --branch 'network-relay-added' --single-branch https://github.com/85256638/livox_ros_driver.git ws_livox/src/livox_ros_driver`
 
 &ensp;&ensp;&ensp;&ensp;***说明：***
 

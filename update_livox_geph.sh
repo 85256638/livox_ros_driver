@@ -9,9 +9,9 @@ IFS=$'\n\t'
 
 PROXY_URL="${LIVOX_GEPH_PROXY:-socks5h://127.0.0.1:9909}"
 SDK_URL="${LIVOX_SDK_URL:-https://github.com/85256638/Livox-SDK.git}"
-SDK_BRANCH="${LIVOX_SDK_BRANCH:-mod_set&range_filter}"
+SDK_BRANCH="${LIVOX_SDK_BRANCH:-network-relay-added}"
 DRIVER_URL="${LIVOX_DRIVER_URL:-https://github.com/85256638/livox_ros_driver.git}"
-DRIVER_BRANCH="${LIVOX_DRIVER_BRANCH:-updated_workingmode&set_rangefilter}"
+DRIVER_BRANCH="${LIVOX_DRIVER_BRANCH:-network-relay-added}"
 SDK_DIR="${LIVOX_SDK_DIR:-${HOME}/Livox-SDK}"
 SDK_INSTALL_PREFIX="${LIVOX_SDK_INSTALL_PREFIX:-/usr/local}"
 CATKIN_WS="${CATKIN_WS:-${HOME}/catkin_ws}"
@@ -34,6 +34,8 @@ SITE_CONFIG_PREPARED=0
 SITE_CONFIG_BACKUP_DIR=""
 SITE_CONFIG_PATCH=""
 SITE_CONFIG_STASH_SHA=""
+POWER_MANAGER_WAS_ACTIVE=0
+POWER_MANAGER_STOPPED_BY_UPDATER=0
 SITE_CONFIG_CHANGED_PATHS=()
 SITE_CONFIG_PATHS=(
   "livox_ros_driver/config/livox_lidar_config_multi.json"
@@ -54,7 +56,8 @@ Default environment:
 Options:
   --force                 Rebuild even when revisions are unchanged.
   --preserve-site-config  Preserve pit-specific multi-LiDAR JSON/launch edits.
-  --restart-service       Restart livox-ros-driver only after success.
+  --restart-service       Apply services after success; safely stop/restart
+                          an active/starting livox-power-cycle-manager.
   -h, --help              Show this help.
 EOF
 }
@@ -102,6 +105,15 @@ cleanup() {
       log "ERROR: 自动恢复未完全成功；请从备份核对工位文件：${SITE_CONFIG_BACKUP_DIR}"
     fi
   fi
+  if ((POWER_MANAGER_WAS_ACTIVE && POWER_MANAGER_STOPPED_BY_UPDATER)); then
+    log "脚本异常退出，正在恢复此前运行的 livox-power-cycle-manager。"
+    if sudo systemctl start livox-power-cycle-manager.service; then
+      POWER_MANAGER_STOPPED_BY_UPDATER=0
+    else
+      exit_status=1
+      log "ERROR: livox-power-cycle-manager 恢复启动失败，请立即人工检查。"
+    fi
+  fi
   if [[ -n "${LIVOX_UPDATER_TEMP_COPY:-}" ]]; then
     rm -f -- "${LIVOX_UPDATER_TEMP_COPY}"
   fi
@@ -144,6 +156,11 @@ atomic_write() {
   local temporary="${target}.tmp.$$"
   printf '%s\n' "${value}" >"${temporary}"
   mv -f -- "${temporary}" "${target}"
+}
+
+power_manager_active_state() {
+  systemctl show livox-power-cycle-manager.service \
+    --property=ActiveState --value 2>/dev/null || printf 'not-found\n'
 }
 
 check_clean_checkout() {
@@ -657,8 +674,26 @@ fi
 build_driver_if_needed "${DRIVER_REMOTE_HEAD}" "${CURRENT_SDK_SHA}"
 
 if ((RESTART_SERVICE)); then
+  POWER_MANAGER_STATE="$(power_manager_active_state)"
+  case "${POWER_MANAGER_STATE}" in
+    active|activating|reloading|deactivating)
+      POWER_MANAGER_WAS_ACTIVE=1
+      log "先安全停止 livox-power-cycle-manager（若正在 OFF，会先补回 ON）"
+      POWER_MANAGER_STOPPED_BY_UPDATER=1
+      sudo systemctl stop livox-power-cycle-manager.service
+      POWER_MANAGER_STATE="$(power_manager_active_state)"
+      [[ "${POWER_MANAGER_STATE}" == "inactive" || \
+         "${POWER_MANAGER_STATE}" == "failed" ]] ||
+        die "livox-power-cycle-manager 未能安全停止（state=${POWER_MANAGER_STATE}），拒绝重启 Driver。"
+      ;;
+  esac
   log "重启 livox-ros-driver 服务"
   sudo systemctl restart livox-ros-driver
+  if ((POWER_MANAGER_WAS_ACTIVE)); then
+    log "Driver 已恢复，重新启动 livox-power-cycle-manager 服务"
+    sudo systemctl start livox-power-cycle-manager.service
+    POWER_MANAGER_STOPPED_BY_UPDATER=0
+  fi
 fi
 
 log "全部完成：SDK $(short_sha "${CURRENT_SDK_SHA}")，Driver $(short_sha "${DRIVER_REMOTE_HEAD}")"

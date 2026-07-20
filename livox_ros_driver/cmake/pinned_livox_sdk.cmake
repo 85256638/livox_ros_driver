@@ -3,9 +3,9 @@
 # arbitrary system library or fall back to the official default branch.
 set(LIVOX_SDK_GIT_REPOSITORY
   "https://github.com/85256638/Livox-SDK.git")
-set(LIVOX_SDK_GIT_BRANCH "mod_set&range_filter")
+set(LIVOX_SDK_GIT_BRANCH "network-relay-added")
 set(LIVOX_SDK_GIT_COMMIT
-  "401b062a625cd8e30cf8abb9f010389044e486bc")
+  "e45774c5d4f2edab96dd6d61479167784d7df8c9")
 set(LIVOX_SDK_SOURCE_DIR "" CACHE PATH
   "Optional local Livox-SDK checkout; it must be clean and at the pinned commit")
 

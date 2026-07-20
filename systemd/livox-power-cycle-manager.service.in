@@ -1,0 +1,45 @@
+[Unit]
+Description=Livox fail-safe CORX relay power-cycle manager
+Documentation=file://@DRIVER_DIR@/README.md
+Wants=network-online.target livox-ros-driver.service
+After=network-online.target livox-ros-driver.service
+PartOf=livox-ros-driver.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@HOME@
+Environment=HOME=@HOME@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=ROS_MASTER_URI=http://127.0.0.1:11311
+Environment=ROS_HOSTNAME=localhost
+Environment=ROS_HOME=@STATE_DIR@/ros
+Environment=ROS_LOG_DIR=@STATE_DIR@/ros-log
+ExecStartPre=/bin/bash -lc 'source /opt/ros/noetic/setup.bash && source @CATKIN_WS@/devel/setup.bash && rosrun livox_ros_driver livox_power_cycle_manager.py --state-db @STATE_DB@ --repair-obligations'
+ExecStart=/bin/bash -lc 'source /opt/ros/noetic/setup.bash && source @CATKIN_WS@/devel/setup.bash && exec rosrun livox_ros_driver livox_power_cycle_manager.py --config @CONFIG@ --state-db @STATE_DB@'
+ExecStopPost=/bin/bash -lc 'source /opt/ros/noetic/setup.bash && source @CATKIN_WS@/devel/setup.bash && rosrun livox_ros_driver livox_power_cycle_manager.py --state-db @STATE_DB@ --repair-obligations'
+Restart=always
+RestartSec=10
+TimeoutStartSec=600
+TimeoutStopSec=300
+SendSIGKILL=no
+KillSignal=SIGINT
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=@STATE_DIR@
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

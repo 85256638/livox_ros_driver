@@ -1,0 +1,48 @@
+{
+  "schema_version": 2,
+  "mode": "observe",
+  "state_db": "~/.local/state/livox-power-cycle-manager/state.sqlite3",
+  "topics": {
+    "request": "/livox/power_cycle_request",
+    "state": "/livox/lidar_recovery_state",
+    "status": "/livox/power_cycle_status",
+    "heartbeat": "/livox/power_cycle_heartbeat"
+  },
+  "policy": {
+    "off_seconds": 10,
+    "boot_timeout_seconds": 180,
+    "healthy_seconds": 10,
+    "minimum_cycle_interval_seconds": 1800,
+    "max_cycles_per_24_hours": 3,
+    "event_max_age_seconds": 600,
+    "status_stale_seconds": 5,
+    "connect_timeout_seconds": 3,
+    "command_timeout_seconds": 3,
+    "command_retries": 3,
+    "restore_retries": 5,
+    "restore_deadline_seconds": 90,
+    "ensure_on_retry_seconds": 30,
+    "precheck_retry_seconds": 60,
+    "precheck_max_attempts": 5
+  },
+  "power_groups": {
+    "pit-x-four-lidars": {
+      "label": "4台雷达共享供电-请替换广播码、继电器IP与通道",
+      "enabled": false,
+      "members": [
+        "EXAMPLE00000001",
+        "EXAMPLE00000002",
+        "EXAMPLE00000003",
+        "EXAMPLE00000004"
+      ],
+      "relay": {
+        "protocol": "legacy_tcp",
+        "host": "192.0.2.55",
+        "port": 50000,
+        "channel": 1,
+        "address": 1,
+        "allow_omitted_status_checksum": false
+      }
+    }
+  }
+}
