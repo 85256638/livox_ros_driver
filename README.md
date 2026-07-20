@@ -13,7 +13,7 @@
 9. **自动恢复看门狗（可选）** — 检测到假活（`Normal` 但**没有点云发布**）、配置长期不完成或 `Error`（如电机故障）时按各自路径恢复该雷达，带重试上限防死循环
 10. **持久化健康日志（可选）** — 把健康事件与网络趋势落盘成 CSV（边沿事件 + 周期快照），供长期无人值守的趋势分析与故障取证
 11. **广播存活但握手卡死的识别与恢复** — 看板区分 `BROADCAST_ONLY / HANDSHAKE_STUCK / POWER_CYCLE_REQUIRED`；按单台雷达清理本地 session 并有限重试，仍失败时明确要求物理断电
-12. **共享电源组硬恢复闭环（可选、默认只观察）** — 独立守护进程把共用一个继电器通道的 4 台雷达建成一个 `power_group`；任一成员需要硬恢复时整组只断/上电一次，SQLite 按组持久化补上电义务、冷却与次数上限，并以 4 台全部持续恢复点云作为最终成功判据
+12. **共享电源组硬恢复闭环（可选、默认关闭）** — Driver 包内的独立 ROS manager 节点把共用一个继电器通道的 4 台雷达建成一个 `power_group`；通过 multi launch 的单一布尔开关启停，任一成员需要硬恢复时整组只断/上电一次，SQLite 按组持久化补上电义务、冷却与次数上限，并以 4 台全部持续恢复点云作为最终成功判据
 
 > **整个分支必须配套固定版 SDK。** Driver 的异步 callback context 生命周期依赖 SDK 的 exactly-once completion/cancellation 契约；不能只为模式切换换 SDK、再让其他功能链接任意同名库。
 
@@ -33,10 +33,10 @@
 
 #### 常用命令
 
-脚本默认同时跟踪 SDK 与 Driver 的 `network-relay-added` 分支。尚未取得新版脚本、当前仍在旧分支的工位，先运行下面这一条迁移命令；它只通过代理 fetch 新脚本，由新版脚本负责备份现场文件、切换分支、更新编译和安全重启，不会先 checkout 覆盖现场文件：
+脚本默认同时跟踪 SDK 与 Driver 的 `network-relay-added` 分支。尚未取得集成版脚本、当前仍在旧分支或旧独立 manager unit 的工位，运行下面这一条迁移命令；它先通过代理 fetch 新脚本并完成保配置更新/编译，再安装或迁移 Driver 安全钩子，最后复查并重启，不会先 checkout 覆盖现场文件：
 
 ```bash
-if [ -d "$HOME/Livox-SDK/.git" ]; then git -C "$HOME/Livox-SDK" remote set-url origin https://github.com/85256638/Livox-SDK.git || exit 1; fi && git -C "$HOME/catkin_ws/src/livox_ros_driver" remote set-url origin https://github.com/85256638/livox_ros_driver.git && git -c http.proxy=socks5h://127.0.0.1:9909 -c https.proxy=socks5h://127.0.0.1:9909 -C "$HOME/catkin_ws/src/livox_ros_driver" fetch origin "refs/heads/network-relay-added:refs/remotes/origin/network-relay-added" && git -C "$HOME/catkin_ws/src/livox_ros_driver" show "origin/network-relay-added:update_livox_geph.sh" > /tmp/update_livox_geph.sh && LIVOX_JOBS=2 bash /tmp/update_livox_geph.sh --preserve-site-config --restart-service
+if [ -d "$HOME/Livox-SDK/.git" ]; then git -C "$HOME/Livox-SDK" remote set-url origin https://github.com/85256638/Livox-SDK.git || exit 1; fi && git -C "$HOME/catkin_ws/src/livox_ros_driver" remote set-url origin https://github.com/85256638/livox_ros_driver.git && git -c http.proxy=socks5h://127.0.0.1:9909 -c https.proxy=socks5h://127.0.0.1:9909 -C "$HOME/catkin_ws/src/livox_ros_driver" fetch origin "refs/heads/network-relay-added:refs/remotes/origin/network-relay-added" && git -C "$HOME/catkin_ws/src/livox_ros_driver" show "origin/network-relay-added:update_livox_geph.sh" > /tmp/update_livox_geph.sh && LIVOX_JOBS=2 bash /tmp/update_livox_geph.sh --preserve-site-config && bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" && LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --restart-service
 ```
 
 全新工位尚无 Driver 仓库时，使用这一条完成代理 clone 和首次配套构建；首次部署服务前不自动重启：
@@ -57,12 +57,12 @@ bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh"
 LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --restart-service
 ```
 
-`--preserve-site-config` 只允许并原样保留以下两个文件：
+`--preserve-site-config` 只允许自动处理以下两个现场文件：
 
 - `livox_ros_driver/config/livox_lidar_config_multi.json`
 - `livox_ros_driver/launch/livox_lidar_multi.launch`
 
-脚本会先把工位原文件、更新前仓库版本和差异持久备份到 `~/.local/state/livox-stack-updater/site-config-backups/`，短暂暂存工位修改，fast-forward Driver 后立即恢复原文件，随后才编译或重启。远端对这两个文件的新版本也会保存在备份目录的 `upstream/` 中，但不会覆盖工位文件；其他任何 tracked 本地修改仍会使更新停止。若进程中断，下次运行会先恢复未完成的配置事务，再进行联网更新。该选项只接管 `git status` 中形如 ` M` 的未暂存修改；若文件已 staged，脚本会停止并要求先取消暂存。
+脚本会先把工位原文件、更新前仓库版本和差异持久备份到 `~/.local/state/livox-stack-updater/site-config-backups/`，短暂暂存工位修改，再 fast-forward Driver。多雷达 JSON 会字节级原样恢复；multi launch 会用“现场原文件 / 更新前 HEAD / 更新后上游”做三方合并，使现场参数和新版继电器 include 同时保留。只有无冲突、XML 合法、`LIVOX_RELAY_LAUNCH_INTEGRATION` 唯一、include 精确透传开关且 child launch 仍是固定路径的 armed-only 单节点结构时才继续编译；否则恢复现场旧 launch、保留候选文件并禁止编译和重启。其他任何 tracked 本地修改仍会使更新停止。若进程中断，下次运行会先恢复未完成的配置事务。该选项只接管未暂存修改；若文件已 staged，脚本会停止并要求先取消暂存。继电器现场配置位于仓库外的 `~/.config/livox/power_cycle.json`，更新天然不会覆盖，不需要加入保留列表。
 
 编译成功后立即应用新二进制：
 
@@ -70,13 +70,13 @@ LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --
 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --restart-service
 ```
 
-`--restart-service` 不是另一种启动方式；它只是在全部更新和编译成功后应用新版本。如果可选的 `livox-power-cycle-manager` 正在运行或正处于启动/自动重启窗口，脚本会先安全停止它（处于 OFF 窗口时会先补回 ON），确认停止后才重启 `livox-ros-driver`，最后重新启动 manager；没有安装或没有运行该服务时不受影响。不带该参数时，可在确认完成后手动重启：
+`--restart-service` 不是另一种启动方式；它只是在全部更新和编译成功后重启 `livox-ros-driver`。集成版 manager 由同一个 launch 管理，不再单独启动或重启。不带该参数时，只有在集成版安全钩子已经安装并通过检查后，才可手动重启：
 
 ```bash
 sudo systemctl restart livox-ros-driver
 ```
 
-安装最新版 power-cycle unit 后，它通过 `PartOf=livox-ros-driver.service` 跟随 Driver 的显式 stop/restart，并在退出后再次执行独立补 ON，所以以上单独一条 Driver 重启命令也是安全的。若本次更新包含 `systemd/livox-power-cycle-manager.service.in` 变更，必须重新运行后文安装脚本使新版 unit 生效；在此之前，已启用 manager 的工位应继续优先使用带 `--restart-service` 的一键更新命令。
+如果系统仍加载、启用或运行旧的独立 `livox-power-cycle-manager.service`，新版更新器会拒绝 `--restart-service`，绝不会让旧 manager 与 launch manager 并发。此时先运行后文的新版安装脚本；它会安全停止旧 unit、按 SQLite 补 ON、禁用并删除旧 unit，再给 `livox-ros-driver.service` 安装配置无关的启动前/停止后补 ON 钩子。安全 drop-in 未加载时也一律拒绝重启，即使 launch 默认是 `false`；这样既不会遗漏历史 SQLite 补 ON 义务，也不会被 systemd 的额外 roslaunch 参数绕过默认开关。
 
 版本未变化时脚本会跳过重复构建；需要强制重编译时执行：
 
@@ -92,8 +92,8 @@ LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh"
 
 #### Driver 正在运行时会发生什么
 
-- **不带 `--restart-service`**：当前 Driver 和 manager 都不会停止，仍运行内存中的旧版代码；源码和磁盘上的二进制完成更新后，需要手动重启才会生效。最新版 unit 会让 manager 跟随 Driver 的显式重启；尚未重装新版 unit 时不要单独重启 Driver。
-- **带 `--restart-service`**：更新和编译期间旧进程继续运行；只有全部成功后才重启服务，此时会短暂断流并重新握手连接雷达。
+- **不带 `--restart-service`**：当前 Driver 不会停止，仍运行内存中的旧版代码；源码和磁盘上的二进制完成更新后，需要手动重启才会生效。若旧独立 manager unit 尚未迁移，必须先运行新版安装脚本，不能直接重启到集成版。
+- **带 `--restart-service`**：更新和编译期间旧进程继续运行；只有全部成功且旧 unit/安全钩子检查通过后才重启 Driver，此时会短暂断流并重新握手连接雷达；launch 开关为 `true` 时 manager 随 Driver 一起启动。
 - **资源影响**：编译会占用 CPU、内存和磁盘 I/O，负载较高时可能增加点云丢包；生产机器建议使用 `LIVOX_JOBS=2`，并在维护窗口重启。
 - **失败处理**：更新或编译失败时脚本不会主动重启，当前旧进程通常仍可继续运行；在重新编译成功前不要主动重启服务或主机，因为磁盘上的新二进制可能尚未完整生成。
 
@@ -540,31 +540,32 @@ roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
 
 #### 可选：`POWER_CYCLE_REQUIRED` 自动继电器硬恢复
 
-这一层专门处理“广播仍在、Driver/Viewer 均握手失败、给雷达真正断电后恢复”的现场故障。当前电气接线中 4 台雷达共用一个继电器通道，所以软件也按**共享电源组**管理：任意一台或多台成员进入 `POWER_CYCLE_REQUIRED`，都会让该组 4 台执行一次整体断电、整体上电，不尝试判断或控制单台供电。实现采用**独立进程**，没有把继电器 TCP 通信塞进驱动或 SDK 线程：
+这一层专门处理“广播仍在、Driver/Viewer 均握手失败、给雷达真正断电后恢复”的现场故障。当前电气接线中 4 台雷达共用一个继电器通道，所以软件也按**共享电源组**管理：任意一台或多台成员进入 `POWER_CYCLE_REQUIRED`，都会让该组 4 台执行一次整体断电、整体上电，不尝试判断或控制单台供电。功能已经放入 `livox_ros_driver` 包并由 `livox_lidar_multi.launch` 管理，但继电器 TCP/SQLite 仍运行在独立 ROS Python 进程中，不进入 C++ 点云收包线程；继电器网络异常不会直接破坏点云进程内存或阻塞 SDK callback：
 
 1. Driver 在状态首次进入 `POWER_CYCLE_REQUIRED` 时发布带唯一 `event_id` 的 `/livox/power_cycle_request`，同时以 1 Hz 发布 `/livox/lidar_recovery_state`。
 2. `livox_power_cycle_manager.py` 只接受配置中 `power_groups.<组名>.members` 明确列出的 broadcast code，并校验状态时间戳、离线字段和同一 episode 身份；继电器预检查后还必须收到该触发成员的新一帧 `POWER_CYCLE_REQUIRED` 状态。同组一个或多个成员同时触发都会合并为该物理通道的一次恢复，不要求其余成员在 OFF 前保持健康。
 3. 现场上位机/PLC 已在任一雷达异常时中断测量流程，而且该继电器通道只给这 4 台雷达供电，因此硬恢复不再等待额外的 `SAFE_TO_CYCLE` 许可。守护进程通过状态复核、组级去重/冷却/次数上限及继电器状态检查后，直接控制该电源组映射的**单个继电器通道**；不提供“全部关闭”命令，也不改动另外 3 个继电器输出。
-4. 发送 OFF 前先按物理供电端点把“该通道必须恢复 ON”及 4 个成员快照提交到 SQLite；OFF、ON 都通过独立 B0 查询确认。systemd 每次启动都会在解析现场 JSON、连接 ROS 之前执行紧急补上电；仍有任何补上电义务时，全局禁止新的 OFF。
+4. 发送 OFF 前先按物理供电端点把“该通道必须恢复 ON”及 4 个成员快照提交到 SQLite；OFF、ON 都通过独立 B0 查询确认。Driver 的 systemd 安全钩子会在每次启动前和停止后执行与现场 JSON/ROS 无关的紧急补上电，并为协议重试保留 600 秒启动超时；仍有任何补上电义务时，全局禁止新的 OFF。
 5. 上电后必须等待该组 **4 个 members 全部**回到 `Normal + Sampling` 并连续发布点云 10 秒，才记为 `RECOVERY_VERIFIED`；只恢复触发故障的那台、只收到继电器 `OK!`，都不算整组恢复成功。
 
-自动控制需要这些条件同时成立：服务已安装、`mode=armed`、电源组 `enabled=true`、本次事件状态复核通过，并且没有触发组级冷却、24 小时次数上限或继电器安全检查。它不订阅 PLC/上位机许可 topic；检测到一台或多台成员仍为 `POWER_CYCLE_REQUIRED` 后即可自主恢复。安装后的模板仍是 `mode=observe`、示例电源组为 `enabled=false`，**不会发起新的 OFF**；但如果 SQLite 中已有“必须恢复 ON”的历史义务，任何模式都会优先发送/确认 ON，这是失效保护而不是新循环。
+自动控制需要这些条件同时成立：Driver 安全钩子已安装、launch 的 `relay_power_cycle_enable=true`、JSON 中目标电源组 `enabled=true`、本次事件状态复核通过，并且没有触发组级冷却、24 小时次数上限或继电器安全检查。它不订阅 PLC/上位机许可 topic；检测到一台或多台成员仍为 `POWER_CYCLE_REQUIRED` 后即可自主恢复。
 
-##### 首次部署（安全观察模式）
+launch 开关是日常唯一总开关：
 
-先完成新版 Driver 编译，再安装服务；脚本不会覆盖已有配置或 SQLite 记录：
+- `false`（默认）：完全不启动 manager，不读取继电器 JSON，不连接继电器，更不会发送 OFF。
+- `true`：launch 强制把 Driver 的 `/auto_recover` 设为 `true`，并以 `required=true`、`armed` 模式启动 manager；JSON 顶层旧 `mode` 字段仅为命令行兼容项，不决定 launch 是否武装。
+
+无论 launch 开关是什么，只要 SQLite 留有历史“必须恢复 ON”义务，已安装的 systemd 启动前/停止后钩子都会优先尝试并确认 ON。这是中断恢复，不是一次新的断电循环。
+
+##### 首次部署与配置
+
+先完成新版 Driver 编译，再运行一次安装脚本。它会创建缺失的外部 JSON、给现有 `livox-ros-driver.service` 安装补 ON 安全钩子，并安全迁移/删除旧的独立 manager unit；不会覆盖已有 JSON/SQLite，不会启用 launch 开关，也不会自动重启 Driver。生产 Driver unit 必须使用同一普通用户、`Type=simple`、`Restart=always`、`KillMode=control-group`、`RemainAfterExit=no` 和 `SendSIGKILL=yes`，否则安装器 fail closed：
 
 ```bash
 bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh"
 ```
 
-若安装脚本发现保留下来的现有配置已经是 `armed`，会在安装/启动 unit 前 fail closed，避免重装意外恢复整组断电自动化。只有共享通道映射、电气验收、4 台同时冷启动浪涌和无人值守恢复策略均已确认时，才可显式授权重装：
-
-```bash
-LIVOX_ALLOW_ARMED_INSTALL=1 bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh"
-```
-
-生成的现场配置是 `~/.config/livox/power_cycle.json`。配置格式为 `schema_version=2`：在 `power_groups` 下建立一个共享电源组，`members` **必须恰好填写共用供电的 4 个完整 15 位 broadcast code**，并只为该组填写一次实际继电器 IP、端口和 1～4 通道。模板中的组名、广播码、`.55` 和通道均只是占位示例，不能据此推断现场接线；同一个 broadcast code 不允许加入多个组。如果机器上已存在旧版 `schema_version=1` / `lidars` 配置，安装脚本会保留而不会覆盖它，必须先人工备份并迁移成新版结构，校验通过后才能启动服务。
+生成的现场配置是 `~/.config/livox/power_cycle.json`，与雷达白名单 JSON 分开并位于 Git 仓库外，所以一键更新不会覆盖。配置格式为 `schema_version=2`：在 `power_groups` 下建立一个共享电源组，`members` **必须恰好填写共用供电的 4 个完整 15 位 broadcast code**，并只为该组填写一次实际继电器 IP、端口和 1～4 通道；完成验收后把该组的 `enabled` 改为 `true`。模板中的组名、广播码、`192.0.2.55` 和通道 1 都只是不可直接使用的占位示例，不能据此推断现场接线；同一个 broadcast code 不允许加入多个组。如果机器上已有旧版 `schema_version=1` / `lidars` 配置，安装脚本会保留而不会覆盖，必须先人工备份并迁移。
 
 修改后只做本地格式/安全约束校验：
 
@@ -578,19 +579,25 @@ python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/livox_pow
 source /opt/ros/noetic/setup.bash && source "$HOME/catkin_ws/devel/setup.bash" && rosrun livox_ros_driver livox_power_cycle_manager.py --config "$HOME/.config/livox/power_cycle.json" --check-relays
 ```
 
-观察服务与真实故障事件：
+观察集成 manager 与真实故障事件：
 
 ```bash
-sudo journalctl -u livox-power-cycle-manager -f
+sudo journalctl -u livox-ros-driver -f
 ```
 
-在有人值守的维护窗口完成人工接线验收，确认所配通道平时确实为 ON、断开时只让这 4 台雷达掉电且没有其他负载、恢复 ON 后 4 台点云全部恢复。全部确认后，才把配置顶层的 `"mode": "observe"` 改为 `"mode": "armed"`，再次执行上面的 `--validate-config` 和 `--check-relays`，最后应用：
+在有人值守的维护窗口完成人工接线验收，确认所配通道平时确实为 ON、断开时只让这 4 台雷达掉电且没有其他负载、恢复 ON 后 4 台点云全部恢复。全部确认后，把 `livox_lidar_multi.launch` 中这一项改为 `true`：
+
+```xml
+<arg name="relay_power_cycle_enable" default="true"/>
+```
+
+再次执行上面的 `--validate-config` 和 `--check-relays`，最后只需重启原 Driver 服务：
 
 ```bash
-sudo systemctl restart livox-power-cycle-manager && systemctl is-active livox-power-cycle-manager
+sudo systemctl restart livox-ros-driver && systemctl is-active livox-ros-driver
 ```
 
-`observe` 期间看到的新事件只记为 `OBSERVED`，不会发起 OFF，也不会被当成已经处理成功；持久补上电不受 observe 限制。改为 `armed` 并重启后，如果同一故障仍被 Driver 的 1 Hz 状态确认存在，才会进入真实控制流程。
+需要停用时，把同一 launch 参数改回 `false` 并重启 `livox-ros-driver`；manager 不再启动，systemd 停止后钩子仍会先处理任何遗留补 ON 义务。不要再手工启动 `livox-power-cycle-manager.service`，集成版没有这个独立服务。
 
 ##### 默认工业安全策略
 
@@ -613,9 +620,9 @@ sudo systemctl restart livox-power-cycle-manager && systemctl is-active livox-po
 | 断电后异常 | ON 无法确认时保留持久化 obligation，每 30 秒继续尝试并发出 CRITICAL；systemd 启动前先独立补 ON，配置损坏也不会跳过；补 ON 未完成前禁止任何新 OFF |
 | 告警存续 | 每个物理端点的活动 CRITICAL 独立存入 SQLite，重启后在 `MANAGER_READY` 之后重新发布；只有该端点后续完成 `RECOVERY_VERIFIED` 才自动清除 |
 
-配置和状态均在仓库外：更新 Driver 不会覆盖 `~/.config/livox/power_cycle.json`。生产安装把审计/去重数据库唯一固定为 `~/.local/state/livox-power-cycle-manager/state.sqlite3`，配置中的 `state_db` 必须解析到同一路径，否则安装脚本 fail closed，避免启动前补 ON 查错数据库。不要删除、替换或手工修改该 SQLite 文件，否则会丢失冷却预算和补上电义务；未知/旧版数据库结构会被严格拒绝而不会静默重建。`update_livox_geph.sh --restart-service` 在该服务已运行或正在自动重启时会先安全停止它，重启 Driver 后再恢复 manager。
+配置和状态均在仓库外：更新 Driver 不会覆盖 `~/.config/livox/power_cycle.json`。生产安装把审计/去重数据库唯一固定为 `~/.local/state/livox-power-cycle-manager/state.sqlite3`，配置中的 `state_db` 必须解析到同一路径，否则安装脚本 fail closed，避免启动前补 ON 查错数据库。不要删除、替换或手工修改该 SQLite 文件，否则会丢失冷却预算和补上电义务；未知/旧版数据库结构会被严格拒绝而不会静默重建。manager 与 Driver 同启同停，但仍持有独立进程锁和物理端点锁。
 
-卸载同样不是直接删 unit：安装脚本的 `--uninstall` 会先安全停止 manager，运行一次与配置无关的持久补 ON，并且只有确认成功后才禁用和删除服务；任何一步失败都会保留 unit 和 SQLite，等待继续恢复。
+卸载同样不是直接删文件：先把 launch 开关改回 `false` 并安全停止 Driver，再执行 `bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" --uninstall`。脚本只接受 Driver 已处于 `inactive/failed`，独立补 ON 成功后才删除 Driver drop-in；任何一步失败都会保留安全钩子，现场 JSON 和 SQLite 始终保留。
 
 查看自动硬恢复的最近状态可继续使用原看板（新版 `livox_stats_monitor.py` 会追加 `Power-cycle manager` 区域，并把超过 30 秒未收到独立心跳显示为 `MANAGER_STALE`），也可以查看结构化状态与独立心跳 topic：
 
@@ -627,21 +634,21 @@ rostopic echo /livox/power_cycle_status
 rostopic echo /livox/power_cycle_heartbeat
 ```
 
-维护时若要用图形化科星调试软件手工改变同一台继电器，先停止自动守护进程，关闭 GUI 后再恢复，保证现场始终只有一个控制写入者：
+维护时若要用图形化科星调试软件手工改变同一台继电器，必须在维护窗口先停止整个 Driver 服务（会中断点云；停止后安全钩子会补 ON），关闭 GUI 后再恢复 Driver，保证现场始终只有一个控制写入者：
 
 ```bash
-sudo systemctl stop livox-power-cycle-manager
+sudo systemctl stop livox-ros-driver
 ```
 
 ```bash
-sudo systemctl start livox-power-cycle-manager
+sudo systemctl start livox-ros-driver
 ```
 
 > 继电器返回的 ON/OFF 是控制器逻辑状态，不是负载端电压/电流反馈。正式武装前必须在有人值守的维护窗口验证“关掉通道 X 时恰好是配置中的 4 个 broadcast code 全部消失、没有其他设备掉电；恢复 ON 后 4 台点云全部恢复”，并确认该通道正常状态为 ON。若需要证明接触器没有粘连，应增加独立电压/电流反馈，软件不能凭 TCP 状态替代该硬件证据。
 
 > 对真正长期无人值守的现场，电气层最好再做成硬件看门狗/时间继电器控制的**单稳态断电脉冲**：OFF 最长 10 秒后由硬件自动回 ON，并实测控制器掉电、主机死机和网络中断时的默认状态也是 ON。SQLite 补上电只能覆盖软件进程重启，不能替代这层硬件失效保护。
 
-> **armed 的电气硬前置**：按 4 台雷达同时冷启动的实测峰值核算浪涌和稳态总电流；继电器触点/外接接触器必须满足实际直流电压、直流分断能力和负载类型，不能只看交流额定值；电源余量、线缆截面积、端子、保险/断路器及压降均须覆盖 4 台合计负载。任何一项未由电气工程师验收，都只能保持 `observe`。
+> **armed 的电气硬前置**：按 4 台雷达同时冷启动的实测峰值核算浪涌和稳态总电流；继电器触点/外接接触器必须满足实际直流电压、直流分断能力和负载类型，不能只看交流额定值；电源余量、线缆截面积、端子、保险/断路器及压降均须覆盖 4 台合计负载。任何一项未由电气工程师验收，都必须保持 launch 开关为 `false`。
 
 > ROS 1 topic 本身没有认证。服务固定使用本机 `127.0.0.1:11311`，现场仍应把 ROS master 和继电器控制网放在受控 VLAN/防火墙内，只允许 manager 主机访问继电器端口，不要把 11311/50000 暴露到办公网或公网；白名单和状态复核都不能替代网络访问控制。
 

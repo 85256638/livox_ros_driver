@@ -10,7 +10,9 @@ import tempfile
 import threading
 import time
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -401,6 +403,124 @@ class ConfigTests(unittest.TestCase):
             )
 
 
+class ManagerCliTests(unittest.TestCase):
+    @staticmethod
+    def _write_config(path, state_db, mode):
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "mode": mode,
+                    "state_db": str(state_db),
+                    "power_groups": {
+                        GROUP_ID: {
+                            "enabled": True,
+                            "members": list(MEMBERS),
+                            "relay": {
+                                "protocol": "legacy_tcp",
+                                "host": "127.0.0.1",
+                                "port": 50000,
+                                "channel": 1,
+                            },
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_cli_mode_override_wins_over_json_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            state_db = Path(tmp) / "state.sqlite3"
+            for json_mode, cli_mode in (
+                ("observe", "armed"),
+                ("armed", "observe"),
+            ):
+                with self.subTest(json_mode=json_mode, cli_mode=cli_mode):
+                    self._write_config(path, state_db, json_mode)
+                    received = []
+
+                    def fake_run(config):
+                        received.append(config)
+                        return 0
+
+                    with mock.patch.object(
+                        manager, "run_ros", side_effect=fake_run
+                    ):
+                        result = manager.main(
+                            [
+                                "--config",
+                                str(path),
+                                "--mode",
+                                cli_mode,
+                            ]
+                        )
+                    self.assertEqual(result, 0)
+                    self.assertEqual(len(received), 1)
+                    self.assertEqual(received[0].mode, cli_mode)
+
+    def test_repair_before_start_runs_before_damaged_json_is_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_db = Path(tmp) / "state.sqlite3"
+            damaged = Path(tmp) / "damaged.json"
+            damaged.write_text("{not-json", encoding="utf-8")
+            calls = []
+
+            def fake_repair(path):
+                calls.append(("repair", path))
+                return 0
+
+            original_load = manager.load_config
+
+            def recording_load(path):
+                calls.append(("load", path))
+                return original_load(path)
+
+            with mock.patch.object(
+                manager,
+                "repair_obligations_without_config",
+                side_effect=fake_repair,
+            ), mock.patch.object(
+                manager, "load_config", side_effect=recording_load
+            ):
+                result = manager.main(
+                    [
+                        "--config",
+                        str(damaged),
+                        "--state-db",
+                        str(state_db),
+                        "--repair-before-start",
+                    ]
+                )
+
+            self.assertEqual(result, 2)
+            self.assertEqual([name for name, _value in calls], ["repair", "load"])
+            self.assertEqual(
+                calls[0][1],
+                os.path.abspath(str(state_db)),
+            )
+
+    def test_failed_startup_repair_prevents_json_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_db = Path(tmp) / "state.sqlite3"
+            load = mock.Mock(side_effect=AssertionError("JSON must not be read"))
+            with mock.patch.object(
+                manager, "repair_obligations_without_config", return_value=1
+            ), mock.patch.object(manager, "load_config", load):
+                result = manager.main(
+                    [
+                        "--config",
+                        str(Path(tmp) / "damaged.json"),
+                        "--state-db",
+                        str(state_db),
+                        "--repair-before-start",
+                    ]
+                )
+            self.assertEqual(result, 2)
+            load.assert_not_called()
+
+
 class DeploymentTests(unittest.TestCase):
     def test_updater_targets_paired_network_relay_branches(self):
         updater = (ROOT / "update_livox_geph.sh").read_text(
@@ -453,38 +573,33 @@ class DeploymentTests(unittest.TestCase):
             self.assertEqual(first, expected)
             self.assertEqual(second, expected)
 
-    def test_systemd_template_is_hardened_and_installer_renders_every_token(self):
+    def test_driver_dropin_and_installer_migrate_legacy_unit_safely(self):
         template = (
-            ROOT / "systemd" / "livox-power-cycle-manager.service.in"
+            ROOT / "systemd" / "livox-ros-driver-power-cycle.conf.in"
         ).read_text(encoding="utf-8")
         installer = (ROOT / "install_livox_power_cycle_service.sh").read_text(
             encoding="utf-8"
         )
         tokens = {
-            "@USER@",
-            "@GROUP@",
             "@HOME@",
-            "@CATKIN_WS@",
-            "@CONFIG@",
-            "@STATE_DIR@",
+            "@MANAGER_SOURCE@",
             "@STATE_DB@",
-            "@DRIVER_DIR@",
         }
         self.assertEqual(
             {word for word in tokens if word in template}, tokens
         )
         for token in tokens:
             self.assertIn("s|%s|" % token, installer)
-        self.assertIn("NoNewPrivileges=true", template)
-        self.assertIn("PartOf=livox-ros-driver.service", template)
-        self.assertIn("ProtectHome=read-only", template)
-        self.assertIn("ReadWritePaths=@STATE_DIR@", template)
-        self.assertNotIn("LIVOX_POWER_LOCK_DIR", template)
-        self.assertNotIn("RuntimeDirectory=", template)
+        self.assertIn("ExecStartPre=/usr/bin/python3", template)
+        self.assertIn("ExecStopPost=/usr/bin/python3", template)
+        self.assertIn("TimeoutStartSec=600", template)
         self.assertIn("TimeoutStopSec=300", template)
-        self.assertIn("SendSIGKILL=no", template)
         self.assertEqual(template.count("--repair-obligations"), 2)
-        self.assertIn("ExecStopPost=", template)
+        self.assertNotIn("--config", template)
+        self.assertNotIn("rosrun", template)
+        self.assertFalse(
+            (ROOT / "systemd" / "livox-power-cycle-manager.service.in").exists()
+        )
         self.assertIn(
             'STATE_DIR="${HOME}/.local/state/livox-power-cycle-manager"',
             installer,
@@ -492,17 +607,107 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn(
             '[[ "${CONFIG_STATE_DB}" == "${STATE_DB}" ]]', installer
         )
-        self.assertIn("unit 已保留，禁止卸载", installer)
-        self.assertNotIn(
-            'systemctl disable --now "${UNIT_NAME}" 2>/dev/null || true',
+        self.assertIn(
+            'TEMPLATE_FILE="${SCRIPT_DIR}/systemd/livox-ros-driver-power-cycle.conf.in"',
             installer,
         )
-        updater = (ROOT / "update_livox_geph.sh").read_text(encoding="utf-8")
-        self.assertIn("POWER_MANAGER_STOPPED_BY_UPDATER", updater)
         self.assertIn(
-            "脚本异常退出，正在恢复此前运行的 livox-power-cycle-manager",
-            updater,
+            'LEGACY_UNIT_NAME="livox-power-cycle-manager.service"', installer
         )
+        self.assertIn('sudo systemctl stop "${LEGACY_UNIT_NAME}"', installer)
+        self.assertIn('sudo systemctl disable "${LEGACY_UNIT_NAME}"', installer)
+        self.assertIn('sudo rm -f -- "${LEGACY_UNIT_PATH}"', installer)
+        self.assertIn('repair_obligations ||', installer)
+        self.assertIn('sudo systemctl start "${LEGACY_UNIT_NAME}"', installer)
+        self.assertIn(
+            'DRIVER_LOAD_STATE="$(unit_load_state "${DRIVER_UNIT_NAME}")"',
+            installer,
+        )
+        self.assertIn("DRIVER_RESTART_POLICY=", installer)
+        self.assertIn('== "always"', installer)
+        self.assertIn("DRIVER_KILL_MODE=", installer)
+        self.assertIn('== "control-group"', installer)
+        self.assertIn("DRIVER_SERVICE_TYPE=", installer)
+        self.assertIn('== "simple"', installer)
+        self.assertIn("DRIVER_REMAIN_AFTER_EXIT=", installer)
+        self.assertIn('== "no"', installer)
+        self.assertIn("DropInPaths", installer)
+        self.assertNotIn("systemctl restart \"${DRIVER_UNIT_NAME}\"", installer)
+
+    def test_launch_switch_uses_stable_armed_only_child_launch(self):
+        main_path = (
+            ROOT / "livox_ros_driver" / "launch" / "livox_lidar_multi.launch"
+        )
+        child_path = (
+            ROOT / "livox_ros_driver" / "launch" / "livox_power_cycle.launch"
+        )
+        main_text = main_path.read_text(encoding="utf-8")
+        main_root = ET.parse(main_path).getroot()
+        child_root = ET.parse(child_path).getroot()
+
+        self.assertEqual(main_text.count("LIVOX_RELAY_LAUNCH_INTEGRATION"), 1)
+        main_args = {
+            row.attrib["name"]: row.attrib.get("default")
+            for row in main_root.findall("arg")
+        }
+        self.assertEqual(main_args["relay_power_cycle_enable"], "false")
+        self.assertNotIn("relay_power_cycle_config", main_args)
+        self.assertNotIn("relay_power_cycle_state_db", main_args)
+
+        include = next(
+            row
+            for row in main_root.findall("include")
+            if row.attrib.get("file")
+            == "$(find livox_ros_driver)/launch/livox_power_cycle.launch"
+        )
+        include_args = {
+            row.attrib["name"]: row.attrib.get("value")
+            for row in include.findall("arg")
+        }
+        self.assertEqual(
+            include_args,
+            {"enable": "$(arg relay_power_cycle_enable)"},
+        )
+        main_children = list(main_root)
+        driver_node = next(
+            row
+            for row in main_root.findall("node")
+            if row.attrib.get("name") == "livox_driver"
+        )
+        self.assertLess(main_children.index(include), main_children.index(driver_node))
+
+        child_args = {
+            row.attrib["name"]: row.attrib.get("default")
+            for row in child_root.findall("arg")
+        }
+        self.assertEqual(child_args["enable"], "false")
+        self.assertEqual(set(child_args), {"enable"})
+        groups = child_root.findall("group")
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].attrib, {"if": "$(arg enable)"})
+        self.assertEqual(child_root.findall("node"), [])
+        nodes = child_root.findall(".//node")
+        self.assertEqual(len(nodes), 1)
+        node = nodes[0]
+        self.assertEqual(node.attrib.get("name"), "livox_power_cycle_manager")
+        self.assertEqual(node.attrib.get("required"), "true")
+        self.assertNotIn("respawn", node.attrib)
+        self.assertIn("--mode armed", node.attrib.get("args", ""))
+        self.assertIn("--repair-before-start", node.attrib.get("args", ""))
+        self.assertIn(
+            "--config $(env HOME)/.config/livox/power_cycle.json",
+            node.attrib.get("args", ""),
+        )
+        self.assertIn(
+            "--state-db $(env HOME)/.local/state/livox-power-cycle-manager/state.sqlite3",
+            node.attrib.get("args", ""),
+        )
+        auto_recover = groups[0].find("param")
+        self.assertIsNotNone(auto_recover)
+        self.assertEqual(auto_recover.attrib.get("name"), "/auto_recover")
+        self.assertEqual(auto_recover.attrib.get("value"), "true")
+        self.assertEqual(auto_recover.attrib.get("type"), "bool")
+        self.assertNotIn("unless", child_path.read_text(encoding="utf-8"))
 
 
 class LegacyRelayClientTests(unittest.TestCase):
@@ -1365,9 +1570,17 @@ class CoreTests(unittest.TestCase):
 
             def publish_recovery():
                 _wait_until(
-                    lambda: _FakeRelay.transitions[-2:] == [False, True],
+                    lambda: any(
+                        row["state"] == "POWER_ON_CONFIRMED"
+                        for row in statuses
+                    ),
                     timeout=1,
                 )
+                # POWER_ON_CONFIRMED is emitted immediately before the core
+                # captures its post-ON verification timestamp. Avoid racing
+                # that boundary and accidentally publishing all test health
+                # frames a few microseconds too early.
+                time.sleep(0.02)
                 _publish_health(core, repeats=6)
 
             feeder = threading.Thread(target=publish_recovery)

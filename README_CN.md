@@ -5,6 +5,12 @@
 > `e45774c5d4f2edab96dd6d61479167784d7df8c9`。CMake 会在 build 目录获取并
 > 直接链接这个固定版本；不要安装或替换为官方 SDK/系统同名静态库。完整可靠性
 > 契约、离线构建和关闭约束见 [README.md](README.md) 顶部定制说明。
+>
+> 本分支的共享继电器恢复已集成进 Driver 包：由
+> `livox_lidar_multi.launch` 的 `relay_power_cycle_enable` 单一开关控制，现场继电器
+> 地址、通道和 4 台雷达 broadcast code 独立保存在
+> `~/.config/livox/power_cycle.json`，不随 Git 更新覆盖。首次安装、安全迁移和启停
+> 步骤见 [README.md 的自动继电器硬恢复章节](README.md#可选power_cycle_required-自动继电器硬恢复)。
 
 览沃ROS驱动程序是一个全新的 ROS 包，专门用于连接览沃生产的 LiDAR 产品。该驱动程序可以在安装了
 ROS 环境（ indigo,kinetic,melodic ）的 ubuntu14.04/16.04/18.04 操作系统下运行。经测试可以运行览沃 ROS 驱动程序的硬件平台包括：intel x86 主流 cpu 平台，部分 ARM64 硬件平台（如，nvida TX2/Xavier 等）。

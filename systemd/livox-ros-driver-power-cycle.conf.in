@@ -1,0 +1,14 @@
+[Service]
+# LIVOX_POWER_CYCLE_SAFETY_DROPIN_V1
+# These hooks intentionally do not parse the site relay JSON and do not depend
+# on ROS/catkin.  The SQLite obligation contains an immutable snapshot of the
+# physical relay endpoint that must be restored ON after an interrupted cycle.
+Environment=HOME=@HOME@
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=/usr/bin/python3 @MANAGER_SOURCE@ --state-db @STATE_DB@ --repair-obligations
+ExecStopPost=/usr/bin/python3 @MANAGER_SOURCE@ --state-db @STATE_DB@ --repair-obligations
+# One endpoint repair may legitimately consume the 90 s protocol deadline;
+# keep enough headroom for durable DB work and more than one persisted endpoint.
+TimeoutStartSec=600
+TimeoutStopSec=300
+SendSIGKILL=yes

@@ -2812,7 +2812,21 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--state-db",
         default=None,
-        help="authoritative state DB path (systemd uses this for pre-config ON repair)",
+        help="authoritative state DB path (required by --repair-before-start)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("observe", "armed"),
+        default=None,
+        help="override the JSON mode (ROS launch uses this as its sole daily switch)",
+    )
+    parser.add_argument(
+        "--repair-before-start",
+        action="store_true",
+        help=(
+            "repair every persisted must-be-ON obligation using the explicit "
+            "--state-db before reading the site JSON or starting ROS"
+        ),
     )
     parser.add_argument(
         "--repair-obligations",
@@ -2850,6 +2864,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except (OSError, sqlite3.Error, StateStoreError) as exc:
             print("Emergency ON repair failed: %s" % exc, file=sys.stderr)
             return 2
+    if args.repair_before_start:
+        if state_db_override is None:
+            print(
+                "Configuration error: --repair-before-start requires an "
+                "explicit --state-db; refusing to guess the safety database",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            repair_result = repair_obligations_without_config(
+                state_db_override
+            )
+        except (OSError, sqlite3.Error, StateStoreError) as exc:
+            print("Startup ON repair failed: %s" % exc, file=sys.stderr)
+            return 2
+        if repair_result != 0:
+            print(
+                "Startup ON repair failed; refusing to read configuration or "
+                "permit a new OFF",
+                file=sys.stderr,
+            )
+            return 2
     try:
         config = load_config(args.config)
     except ConfigurationError as exc:
@@ -2867,6 +2903,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             return 2
         config = replace(config, state_db=state_db_override)
+    if args.mode is not None:
+        config = replace(config, mode=args.mode)
+    if config.mode == "armed" and not any(
+        item.enabled for item in config.power_groups.values()
+    ):
+        print(
+            "Configuration error: mode=armed requires at least one explicitly "
+            "enabled power group",
+            file=sys.stderr,
+        )
+        return 2
     if args.validate_config:
         enabled_groups = sum(
             1 for item in config.power_groups.values() if item.enabled

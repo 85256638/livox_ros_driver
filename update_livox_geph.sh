@@ -34,12 +34,15 @@ SITE_CONFIG_PREPARED=0
 SITE_CONFIG_BACKUP_DIR=""
 SITE_CONFIG_PATCH=""
 SITE_CONFIG_STASH_SHA=""
-POWER_MANAGER_WAS_ACTIVE=0
-POWER_MANAGER_STOPPED_BY_UPDATER=0
 SITE_CONFIG_CHANGED_PATHS=()
+SITE_JSON_PATH="livox_ros_driver/config/livox_lidar_config_multi.json"
+SITE_LAUNCH_PATH="livox_ros_driver/launch/livox_lidar_multi.launch"
+RELAY_CHILD_PATH="livox_ros_driver/launch/livox_power_cycle.launch"
+SITE_LAUNCH_MARKER="LIVOX_RELAY_LAUNCH_INTEGRATION"
+DRIVER_SAFETY_DROPIN="/etc/systemd/system/livox-ros-driver.service.d/20-livox-power-cycle-safety.conf"
 SITE_CONFIG_PATHS=(
-  "livox_ros_driver/config/livox_lidar_config_multi.json"
-  "livox_ros_driver/launch/livox_lidar_multi.launch"
+  "${SITE_JSON_PATH}"
+  "${SITE_LAUNCH_PATH}"
 )
 ORIGINAL_ARGS=("$@")
 
@@ -55,9 +58,10 @@ Default environment:
 
 Options:
   --force                 Rebuild even when revisions are unchanged.
-  --preserve-site-config  Preserve pit-specific multi-LiDAR JSON/launch edits.
-  --restart-service       Apply services after success; safely stop/restart
-                          an active/starting livox-power-cycle-manager.
+  --preserve-site-config  Preserve the pit multi-LiDAR JSON byte-for-byte and
+                          safely three-way merge local multi-launch edits.
+  --restart-service       Restart livox-ros-driver only after success, legacy
+                          unit removal, and safety drop-in installation.
   -h, --help              Show this help.
 EOF
 }
@@ -99,19 +103,10 @@ cleanup() {
   local exit_status=$?
   set +e
   if ((SITE_CONFIG_PREPARED)); then
-    log "脚本提前退出，正在恢复工位 JSON/launch。"
+    log "脚本提前退出，正在原样恢复工位 JSON 并安全恢复现场 launch。"
     if ! restore_site_config; then
       exit_status=1
       log "ERROR: 自动恢复未完全成功；请从备份核对工位文件：${SITE_CONFIG_BACKUP_DIR}"
-    fi
-  fi
-  if ((POWER_MANAGER_WAS_ACTIVE && POWER_MANAGER_STOPPED_BY_UPDATER)); then
-    log "脚本异常退出，正在恢复此前运行的 livox-power-cycle-manager。"
-    if sudo systemctl start livox-power-cycle-manager.service; then
-      POWER_MANAGER_STOPPED_BY_UPDATER=0
-    else
-      exit_status=1
-      log "ERROR: livox-power-cycle-manager 恢复启动失败，请立即人工检查。"
     fi
   fi
   if [[ -n "${LIVOX_UPDATER_TEMP_COPY:-}" ]]; then
@@ -158,9 +153,142 @@ atomic_write() {
   mv -f -- "${temporary}" "${target}"
 }
 
-power_manager_active_state() {
-  systemctl show livox-power-cycle-manager.service \
-    --property=ActiveState --value 2>/dev/null || printf 'not-found\n'
+inspect_legacy_power_manager_unit() {
+  local listed_name=""
+  local listed_state=""
+  local listing=""
+  LEGACY_POWER_MANAGER_LOAD_STATE="$(systemctl show \
+    livox-power-cycle-manager.service --property=LoadState --value \
+    2>/dev/null || true)"
+  LEGACY_POWER_MANAGER_ACTIVE_STATE="$(systemctl show \
+    livox-power-cycle-manager.service --property=ActiveState --value \
+    2>/dev/null || true)"
+  LEGACY_POWER_MANAGER_ENABLE_STATE="$(systemctl is-enabled \
+    livox-power-cycle-manager.service 2>/dev/null || true)"
+  [[ -n "${LEGACY_POWER_MANAGER_LOAD_STATE}" ]] ||
+    LEGACY_POWER_MANAGER_LOAD_STATE="unknown"
+  [[ -n "${LEGACY_POWER_MANAGER_ACTIVE_STATE}" ]] ||
+    LEGACY_POWER_MANAGER_ACTIVE_STATE="unknown"
+  if [[ -z "${LEGACY_POWER_MANAGER_ENABLE_STATE}" ]]; then
+    if listing="$(systemctl list-unit-files --no-legend --no-pager \
+        livox-power-cycle-manager.service 2>/dev/null)"; then
+      if [[ -z "${listing//[[:space:]]/}" ]]; then
+        LEGACY_POWER_MANAGER_ENABLE_STATE="not-found"
+      elif [[ "${listing}" != *$'\n'* ]]; then
+        IFS=$' \t' read -r listed_name listed_state _ <<<"${listing}"
+        if [[ "${listed_name}" == "livox-power-cycle-manager.service" &&
+              -n "${listed_state}" ]]; then
+          LEGACY_POWER_MANAGER_ENABLE_STATE="${listed_state}"
+        else
+          LEGACY_POWER_MANAGER_ENABLE_STATE="unknown"
+        fi
+      else
+        LEGACY_POWER_MANAGER_ENABLE_STATE="unknown"
+      fi
+    else
+      LEGACY_POWER_MANAGER_ENABLE_STATE="unknown"
+    fi
+  fi
+  if [[ "${LEGACY_POWER_MANAGER_ENABLE_STATE}" == "not-found" ]]; then
+    [[ "${LEGACY_POWER_MANAGER_LOAD_STATE}" != "unknown" ]] ||
+      LEGACY_POWER_MANAGER_LOAD_STATE="not-found"
+    [[ "${LEGACY_POWER_MANAGER_ACTIVE_STATE}" != "unknown" ]] ||
+      LEGACY_POWER_MANAGER_ACTIVE_STATE="inactive"
+  fi
+}
+
+validate_driver_safety_dropin() {
+  local current_user
+  local driver_kill_mode
+  local driver_environment
+  local driver_remain_after_exit
+  local driver_restart
+  local driver_send_sigkill
+  local driver_type
+  local driver_user
+  local expected_repair_command
+  local exec_start_pre
+  local exec_stop_post
+  local metadata
+  local mode
+  local owner
+  local timeout_start
+  local timeout_stop
+  local environment_token
+  local home_entries=0
+
+  DRIVER_DROPIN_PATHS="$(systemctl show livox-ros-driver.service \
+    --property=DropInPaths --value 2>/dev/null || true)"
+  [[ " ${DRIVER_DROPIN_PATHS} " == *" ${DRIVER_SAFETY_DROPIN} "* ]] ||
+    die "systemd 尚未加载安全 drop-in：${DRIVER_SAFETY_DROPIN}。请先运行新版 ${DRIVER_DIR}/install_livox_power_cycle_service.sh。"
+  [[ -f "${DRIVER_SAFETY_DROPIN}" && ! -L "${DRIVER_SAFETY_DROPIN}" ]] ||
+    die "安全 drop-in 不是普通 root 文件或是符号链接：${DRIVER_SAFETY_DROPIN}"
+  metadata="$(stat -Lc '%u %a' "${DRIVER_SAFETY_DROPIN}")" ||
+    die "无法读取安全 drop-in 权限：${DRIVER_SAFETY_DROPIN}"
+  owner="${metadata%% *}"
+  mode="${metadata##* }"
+  [[ "${owner}" == "0" && "${mode}" =~ ^[0-7]{3,4}$ ]] ||
+    die "安全 drop-in 所有者或权限格式异常：uid=${owner}, mode=${mode}"
+  (( (8#${mode} & 8#022) == 0 )) ||
+    die "安全 drop-in 可被 group/other 写入，拒绝信任：mode=${mode}"
+
+  expected_repair_command="/usr/bin/python3 ${DRIVER_DIR}/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py --state-db ${HOME}/.local/state/livox-power-cycle-manager/state.sqlite3 --repair-obligations"
+  [[ "$(grep -Fxc -- '# LIVOX_POWER_CYCLE_SAFETY_DROPIN_V1' "${DRIVER_SAFETY_DROPIN}")" == "1" ]] ||
+    die "安全 drop-in 缺少唯一版本标记。"
+  [[ "$(grep -Fxc -- "ExecStartPre=${expected_repair_command}" "${DRIVER_SAFETY_DROPIN}")" == "1" ]] ||
+    die "安全 drop-in 的 ExecStartPre 与当前仓库/固定状态库不一致。"
+  [[ "$(grep -Fxc -- "ExecStopPost=${expected_repair_command}" "${DRIVER_SAFETY_DROPIN}")" == "1" ]] ||
+    die "安全 drop-in 的 ExecStopPost 与当前仓库/固定状态库不一致。"
+  [[ "$(grep -Fxc -- 'TimeoutStartSec=600' "${DRIVER_SAFETY_DROPIN}")" == "1" &&
+     "$(grep -Fxc -- 'TimeoutStopSec=300' "${DRIVER_SAFETY_DROPIN}")" == "1" &&
+     "$(grep -Fxc -- 'SendSIGKILL=yes' "${DRIVER_SAFETY_DROPIN}")" == "1" ]] ||
+    die "安全 drop-in 的超时/强制终止设置不符合当前安全契约。"
+
+  current_user="$(id -un)"
+  driver_user="$(systemctl show livox-ros-driver.service --property=User --value 2>/dev/null || true)"
+  driver_restart="$(systemctl show livox-ros-driver.service --property=Restart --value 2>/dev/null || true)"
+  driver_kill_mode="$(systemctl show livox-ros-driver.service --property=KillMode --value 2>/dev/null || true)"
+  driver_type="$(systemctl show livox-ros-driver.service --property=Type --value 2>/dev/null || true)"
+  driver_remain_after_exit="$(systemctl show livox-ros-driver.service --property=RemainAfterExit --value 2>/dev/null || true)"
+  driver_send_sigkill="$(systemctl show livox-ros-driver.service --property=SendSIGKILL --value 2>/dev/null || true)"
+  [[ "${driver_user}" == "${current_user}" &&
+     "${driver_restart}" == "always" &&
+     "${driver_kill_mode}" == "control-group" &&
+     "${driver_type}" == "simple" &&
+     "${driver_remain_after_exit}" == "no" &&
+     "${driver_send_sigkill}" == "yes" ]] ||
+    die "Driver unit 有效属性不满足集成 manager 契约（User=${driver_user:-unset}, Restart=${driver_restart:-unset}, KillMode=${driver_kill_mode:-unset}, Type=${driver_type:-unset}, RemainAfterExit=${driver_remain_after_exit:-unset}, SendSIGKILL=${driver_send_sigkill:-unset}）。"
+
+  driver_environment="$(systemctl show livox-ros-driver.service --property=Environment --value 2>/dev/null || true)"
+  while IFS= read -r environment_token; do
+    if [[ "${environment_token}" == HOME=* ]]; then
+      ((home_entries += 1))
+      [[ "${environment_token}" == "HOME=${HOME}" ]] ||
+        die "Driver unit 的有效 ${environment_token} 与当前 HOME=${HOME} 不一致。"
+    fi
+  done < <(printf '%s\n' "${driver_environment}" | tr ' ' '\n')
+  [[ ${home_entries} -eq 1 ]] ||
+    die "Driver unit 必须且只能有一个有效 HOME=${HOME}；当前 Environment=${driver_environment:-unset}。"
+
+  timeout_start="$(systemctl show livox-ros-driver.service --property=TimeoutStartUSec --value 2>/dev/null || true)"
+  timeout_stop="$(systemctl show livox-ros-driver.service --property=TimeoutStopUSec --value 2>/dev/null || true)"
+  case "${timeout_start}" in
+    10min|600s|600000000us|600000000) ;;
+    *) die "Driver unit 有效 TimeoutStartUSec=${timeout_start:-unset}，预期 600 秒。" ;;
+  esac
+  case "${timeout_stop}" in
+    5min|300s|300000000us|300000000) ;;
+    *) die "Driver unit 有效 TimeoutStopUSec=${timeout_stop:-unset}，预期 300 秒。" ;;
+  esac
+
+  exec_start_pre="$(systemctl show livox-ros-driver.service \
+    --property=ExecStartPre --value 2>/dev/null || true)"
+  exec_stop_post="$(systemctl show livox-ros-driver.service \
+    --property=ExecStopPost --value 2>/dev/null || true)"
+  [[ "${exec_start_pre}" == *"${expected_repair_command}"* ]] ||
+    die "systemd 的有效 ExecStartPre 已被其他配置覆盖，拒绝重启。"
+  [[ "${exec_stop_post}" == *"${expected_repair_command}"* ]] ||
+    die "systemd 的有效 ExecStopPost 已被其他配置覆盖，拒绝重启。"
 }
 
 check_clean_checkout() {
@@ -222,7 +350,7 @@ validate_site_config_scope() {
 
   other_changes="$(site_config_other_changes)"
   if [[ -n "${other_changes}" ]]; then
-    log "以下 tracked 修改不属于允许自动保留的两份工位配置："
+    log "以下 tracked 修改不属于允许自动保留的工位 multi-LiDAR JSON/launch："
     printf '%s\n' "${other_changes}" >&2
     die "为避免覆盖源码，已停止更新。"
   fi
@@ -259,35 +387,273 @@ atomic_copy_file() {
   mv -f -- "${temporary}" "${target}" || return 1
 }
 
+launch_has_relay_marker() {
+  local path="$1"
+  local contents
+
+  [[ -f "${path}" ]] || return 1
+  contents="$(<"${path}")" || return 1
+  [[ "${contents}" == *"${SITE_LAUNCH_MARKER}"* ]]
+}
+
+validate_relay_launch_integration() {
+  local path="$1"
+
+  "${PYTHON_EXECUTABLE}" - "${path}" "${SITE_LAUNCH_MARKER}" <<'PY'
+import os
+import sys
+import xml.etree.ElementTree as ET
+
+path, marker = sys.argv[1:]
+try:
+    with open(path, "rb") as stream:
+        raw = stream.read()
+    text = raw.decode("utf-8-sig")
+    root = ET.parse(path).getroot()
+except (OSError, UnicodeError, ET.ParseError) as exc:
+    raise SystemExit("launch XML validation failed: %s" % exc)
+
+marker_count = text.count(marker)
+if marker_count != 1:
+    raise SystemExit(
+        "launch must contain marker %s exactly once (found %d)"
+        % (marker, marker_count)
+    )
+
+relay_enable_args = [
+    node for node in root.findall("arg")
+    if node.get("name") == "relay_power_cycle_enable"
+]
+relay_includes = [
+    node for node in root.iter("include")
+    if node.get("file", "")
+    == "$(find livox_ros_driver)/launch/livox_power_cycle.launch"
+]
+other_power_cycle_includes = [
+    node for node in root.iter("include")
+    if "power_cycle" in node.get("file", "").lower()
+    and node not in relay_includes
+]
+inline_manager_nodes = [
+    node for node in root.iter("node")
+    if node.get("type") == "livox_power_cycle_manager.py"
+    or node.get("name") == "livox_power_cycle_manager"
+]
+if len(relay_enable_args) != 1:
+    raise SystemExit(
+        "launch must contain arg relay_power_cycle_enable exactly once (found %d)"
+        % len(relay_enable_args)
+    )
+if relay_enable_args[0].get("default", "").strip().lower() not in (
+    "true", "false"
+):
+    raise SystemExit(
+        "relay_power_cycle_enable default must be literal true or false"
+    )
+if len(relay_includes) != 1:
+    raise SystemExit(
+        "launch must include livox_power_cycle.launch exactly once (found %d)"
+        % len(relay_includes)
+    )
+if other_power_cycle_includes or inline_manager_nodes:
+    raise SystemExit(
+        "multi launch contains a second/legacy power-cycle integration"
+    )
+
+relay_include = relay_includes[0]
+expected_child_args = (("enable", "$(arg relay_power_cycle_enable)"),)
+if len(relay_include.findall("arg")) != len(expected_child_args):
+    raise SystemExit("livox_power_cycle.launch include has unexpected child args")
+for name, expected_value in expected_child_args:
+    matches = [
+        node for node in relay_include.findall("arg")
+        if node.get("name") == name
+    ]
+    if len(matches) != 1 or matches[0].get("value") != expected_value:
+        raise SystemExit(
+            "livox_power_cycle.launch include must pass %s=%s exactly once"
+            % (name, expected_value)
+        )
+
+driver_nodes = [
+    node for node in root.findall("node")
+    if node.get("name") == "livox_driver"
+]
+if len(driver_nodes) != 1:
+    raise SystemExit(
+        "launch must contain direct livox_driver node exactly once (found %d)"
+        % len(driver_nodes)
+    )
+children = list(root)
+if children.index(relay_include) > children.index(driver_nodes[0]):
+    raise SystemExit(
+        "livox_power_cycle.launch include must appear before livox_driver"
+    )
+PY
+}
+
+validate_relay_child_launch() {
+  local path="$1"
+
+  "${PYTHON_EXECUTABLE}" - "${path}" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+path = sys.argv[1]
+try:
+    with open(path, "rb") as stream:
+        raw = stream.read()
+    text = raw.decode("utf-8-sig")
+    root = ET.parse(path).getroot()
+except (OSError, UnicodeError, ET.ParseError) as exc:
+    raise SystemExit("relay child launch validation failed: %s" % exc)
+
+if text.count("LIVOX_POWER_CYCLE_CHILD_V1") != 1:
+    raise SystemExit("relay child launch marker must occur exactly once")
+root_args = root.findall("arg")
+if len(root_args) != 1 or root_args[0].get("name") != "enable":
+    raise SystemExit("relay child launch must expose only the enable arg")
+if root_args[0].get("default", "").strip().lower() != "false":
+    raise SystemExit("relay child enable default must be false")
+groups = root.findall("group")
+if len(groups) != 1 or groups[0].attrib != {"if": "$(arg enable)"}:
+    raise SystemExit("relay child must contain one armed-only enable group")
+if [node.tag for node in list(root)] != ["arg", "group"]:
+    raise SystemExit("relay child root may contain only enable arg and armed group")
+if root.findall("node") or root.findall(".//group[@unless]"):
+    raise SystemExit("disabled relay child must not start any node")
+group = groups[0]
+if [node.tag for node in list(group)] != ["param", "node"]:
+    raise SystemExit("armed relay group may contain only auto_recover and manager")
+params = group.findall("param")
+if len(params) != 1 or params[0].attrib != {
+    "name": "/auto_recover",
+    "type": "bool",
+    "value": "true",
+}:
+    raise SystemExit("armed relay group must force /auto_recover=true")
+nodes = group.findall("node")
+if len(nodes) != 1:
+    raise SystemExit("armed relay group must contain exactly one manager node")
+node = nodes[0]
+expected_node_attrs = (
+    ("name", "livox_power_cycle_manager"),
+    ("pkg", "livox_ros_driver"),
+    ("type", "livox_power_cycle_manager.py"),
+    ("output", "screen"),
+    ("required", "true"),
+)
+for name, value in expected_node_attrs:
+    if node.get(name) != value:
+        raise SystemExit("relay manager node has invalid %s" % name)
+if set(node.attrib) != set(name for name, _value in expected_node_attrs) | {"args"}:
+    raise SystemExit("relay manager node contains unexpected attributes")
+expected_args = (
+    "--config $(env HOME)/.config/livox/power_cycle.json "
+    "--state-db $(env HOME)/.local/state/livox-power-cycle-manager/state.sqlite3 "
+    "--mode armed --repair-before-start"
+)
+if node.get("args") != expected_args:
+    raise SystemExit("relay manager args do not use the fixed safety paths")
+PY
+}
+
+validate_driver_restart_safety() {
+  local launch_path="${DRIVER_DIR}/${SITE_LAUNCH_PATH}"
+
+  inspect_legacy_power_manager_unit
+  if [[ "${LEGACY_POWER_MANAGER_LOAD_STATE}" != "not-found" ||
+        "${LEGACY_POWER_MANAGER_ACTIVE_STATE}" != "inactive" ||
+        "${LEGACY_POWER_MANAGER_ENABLE_STATE}" != "not-found" ]]; then
+    die "检测到旧的独立 livox-power-cycle-manager.service（load=${LEGACY_POWER_MANAGER_LOAD_STATE}, enabled=${LEGACY_POWER_MANAGER_ENABLE_STATE}, active=${LEGACY_POWER_MANAGER_ACTIVE_STATE}）。集成版更新器不会自动停止、禁用或重启该 unit；请先运行新版 ${DRIVER_DIR}/install_livox_power_cycle_service.sh 完成安全迁移，再重新执行本更新命令。"
+  fi
+
+  validate_relay_launch_integration "${launch_path}" ||
+    die "当前 multi launch 的继电器集成结构无效，拒绝重启 Driver。"
+  validate_relay_child_launch "${DRIVER_DIR}/${RELAY_CHILD_PATH}" ||
+    die "当前继电器 child launch 的安全结构无效，拒绝重启 Driver。"
+  validate_driver_safety_dropin
+}
+
 restore_site_config() {
+  local require_relay_integration="${1:-0}"
   local auxiliary_failure=0
   local invalid_target=0
+  local launch_merge_applied=0
+  local launch_merge_failure=0
+  local launch_restored_without_merge=0
+  local candidate_source
+  local desired_source
+  local merge_status
   local path
+  local upstream_source
 
   ((SITE_CONFIG_PREPARED)) || return 0
   if ! mkdir -p "${SITE_CONFIG_BACKUP_DIR}/upstream"; then
     auxiliary_failure=1
   fi
   for path in "${SITE_CONFIG_CHANGED_PATHS[@]}"; do
+    upstream_source="${SITE_CONFIG_BACKUP_DIR}/upstream/${path}"
+    candidate_source="${SITE_CONFIG_BACKUP_DIR}/candidate/${path}"
+    desired_source="${SITE_CONFIG_BACKUP_DIR}/original/${path}"
+
     if site_path_is_tracked_regular "${path}"; then
       if ! mkdir -p "${SITE_CONFIG_BACKUP_DIR}/upstream/$(dirname "${path}")" ||
           ! cp -p -- "${DRIVER_DIR}/${path}" \
-            "${SITE_CONFIG_BACKUP_DIR}/upstream/${path}"; then
+            "${upstream_source}"; then
         auxiliary_failure=1
       fi
     else
       invalid_target=1
     fi
+
+    if [[ "${path}" == "${SITE_LAUNCH_PATH}" && -f "${upstream_source}" ]]; then
+      if ((require_relay_integration)) ||
+          launch_has_relay_marker "${upstream_source}"; then
+        if ! validate_relay_launch_integration "${upstream_source}"; then
+          log "ERROR: 新版上游 launch 的继电器集成结构无效：${upstream_source}"
+          launch_merge_failure=1
+        elif ! mkdir -p "${SITE_CONFIG_BACKUP_DIR}/candidate/$(dirname "${path}")" ||
+            ! cp -p -- "${SITE_CONFIG_BACKUP_DIR}/original/${path}" \
+              "${candidate_source}"; then
+          auxiliary_failure=1
+          launch_merge_failure=1
+        else
+          merge_status=0
+          if git merge-file -p \
+              "${SITE_CONFIG_BACKUP_DIR}/original/${path}" \
+              "${SITE_CONFIG_BACKUP_DIR}/base/${path}" \
+              "${upstream_source}" >"${candidate_source}"; then
+            if validate_relay_launch_integration "${candidate_source}"; then
+              desired_source="${candidate_source}"
+              launch_merge_applied=1
+            else
+              log "ERROR: launch 三方合并候选未通过 XML/继电器集成校验：${candidate_source}"
+              launch_merge_failure=1
+            fi
+          else
+            merge_status=$?
+            log "ERROR: launch 三方合并存在冲突或执行失败（rc=${merge_status}）；候选已保留：${candidate_source}"
+            launch_merge_failure=1
+          fi
+        fi
+      else
+        log "当前 launch 尚无继电器集成标记；按中断恢复规则原样恢复现场 launch，下一次更新将重新尝试安全合并。"
+        launch_restored_without_merge=1
+      fi
+    elif [[ "${path}" == "${SITE_LAUNCH_PATH}" ]] &&
+        ((require_relay_integration)); then
+      log "ERROR: 无法取得新版上游 launch，不能验证继电器集成。"
+      launch_merge_failure=1
+    fi
+
     if ! mkdir -p "${DRIVER_DIR}/$(dirname "${path}")" ||
-        ! atomic_copy_file "${SITE_CONFIG_BACKUP_DIR}/original/${path}" \
+        ! atomic_copy_file "${desired_source}" \
           "${DRIVER_DIR}/${path}"; then
       log "ERROR: 无法原子恢复工位文件：${path}"
       return 1
     fi
-  done
-  for path in "${SITE_CONFIG_CHANGED_PATHS[@]}"; do
-    if ! cmp -s -- "${SITE_CONFIG_BACKUP_DIR}/original/${path}" \
-        "${DRIVER_DIR}/${path}"; then
+    if ! cmp -s -- "${desired_source}" "${DRIVER_DIR}/${path}"; then
       log "ERROR: 工位文件恢复后校验不一致：${path}"
       return 1
     fi
@@ -306,12 +672,23 @@ restore_site_config() {
     log "ERROR: 请人工检查，备份目录：${SITE_CONFIG_BACKUP_DIR}"
     return 1
   fi
+  if ((launch_merge_failure)); then
+    log "ERROR: 已恢复更新前的现场 launch，但未能安全取得新版继电器 launch 集成；禁止编译和重启服务。"
+    log "ERROR: 请人工核对 original/base/upstream/candidate：${SITE_CONFIG_BACKUP_DIR}"
+    return 1
+  fi
   if ((auxiliary_failure)); then
     log "ERROR: 工位原文件已恢复，但备份上游版本或 Git index 时发生错误；不会重启服务。"
     return 1
   fi
   drop_site_config_stash_if_top
-  log "工位 JSON/launch 已按更新前原样恢复；持久备份：${SITE_CONFIG_BACKUP_DIR}"
+  if ((launch_merge_applied)); then
+    log "工位配置恢复完成：修改过的 multi-LiDAR JSON 已按原字节保留，修改过的 multi launch 已安全三方合并；持久备份：${SITE_CONFIG_BACKUP_DIR}"
+  elif ((launch_restored_without_merge)); then
+    log "工位配置中断恢复完成：修改过的 JSON/launch 已原样恢复；持久备份：${SITE_CONFIG_BACKUP_DIR}"
+  else
+    log "工位配置恢复完成：修改过的 multi-LiDAR JSON 已按原字节保留，launch 无本地修改或无需合并；持久备份：${SITE_CONFIG_BACKUP_DIR}"
+  fi
   return 0
 }
 
@@ -333,7 +710,7 @@ prepare_site_config() {
   done <<<"${changed_output}"
 
   if ((${#SITE_CONFIG_CHANGED_PATHS[@]} == 0)); then
-    log "两份工位配置没有本地修改，无需暂存。"
+    log "工位 multi-LiDAR JSON/launch 没有本地修改，无需暂存。"
     return 0
   fi
 
@@ -370,7 +747,7 @@ prepare_site_config() {
   git -C "${DRIVER_DIR}" diff --quiet HEAD -- \
     "${SITE_CONFIG_CHANGED_PATHS[@]}" ||
     die "工位配置暂存后工作区仍不干净。"
-  log "已安全暂存工位 JSON/launch；备份：${SITE_CONFIG_BACKUP_DIR}"
+  log "已安全暂存工位 multi-LiDAR JSON/launch；修改过的 JSON 将原样恢复，修改过的 launch 将与新版做三方合并；备份：${SITE_CONFIG_BACKUP_DIR}"
 }
 
 recover_pending_site_config() {
@@ -608,7 +985,9 @@ build_driver_if_needed() {
 [[ ${EUID} -ne 0 ]] || die "请使用普通用户运行；脚本只会在安装 SDK/重启服务时调用 sudo。"
 [[ "${GIT_TIMEOUT_SEC}" =~ ^[1-9][0-9]*$ ]] || die "LIVOX_GIT_TIMEOUT_SEC 必须是正整数。"
 [[ "${SDK_INSTALL_PREFIX}" == /* ]] || die "LIVOX_SDK_INSTALL_PREFIX 必须是绝对路径。"
-for command_name in git flock cmp; do
+[[ -x "${PYTHON_EXECUTABLE}" ]] ||
+  die "找不到用于安全校验现场 launch XML 的 Python：${PYTHON_EXECUTABLE}"
+for command_name in git flock cmp grep id stat tr; do
   command -v "${command_name}" >/dev/null 2>&1 || die "缺少命令：${command_name}"
 done
 mkdir -p "${STATE_DIR}" "${CATKIN_WS}/src"
@@ -627,8 +1006,6 @@ if [[ -z "${JOBS}" ]]; then
 fi
 [[ "${JOBS}" =~ ^[1-9][0-9]*$ ]] || die "LIVOX_JOBS 必须是正整数，当前值：${JOBS}"
 [[ -f "${ROS_SETUP}" ]] || die "找不到 ROS 环境：${ROS_SETUP}"
-[[ -x "${PYTHON_EXECUTABLE}" ]] ||
-  die "找不到 ROS Noetic 所需的 Python：${PYTHON_EXECUTABLE}"
 validate_site_config_scope
 
 log "检查 Geph 代理与 GitHub 连通性：${PROXY_URL}"
@@ -651,8 +1028,12 @@ DRIVER_REMOTE_HEAD="${FETCHED_HEAD}"
 # defaults limited to the local fast-forward operation below.
 prepare_site_config
 update_checkout "livox_ros_driver" "${DRIVER_DIR}" "${DRIVER_BRANCH}" "${DRIVER_REMOTE_HEAD}"
-restore_site_config ||
+restore_site_config 1 ||
   die "工位配置未能安全恢复，已禁止 Driver 编译与服务重启。"
+validate_relay_launch_integration "${DRIVER_DIR}/${SITE_LAUNCH_PATH}" ||
+  die "更新后的 multi launch 未通过继电器集成校验，已禁止 Driver 编译与服务重启。"
+validate_relay_child_launch "${DRIVER_DIR}/${RELAY_CHILD_PATH}" ||
+  die "更新后的继电器 child launch 未通过安全校验，已禁止 Driver 编译与服务重启。"
 
 # A paired SDK/Driver publish is not atomic on GitHub. Recheck both branch tips
 # after updating so a mid-run push cannot produce a build that is already stale.
@@ -674,29 +1055,13 @@ fi
 build_driver_if_needed "${DRIVER_REMOTE_HEAD}" "${CURRENT_SDK_SHA}"
 
 if ((RESTART_SERVICE)); then
-  POWER_MANAGER_STATE="$(power_manager_active_state)"
-  case "${POWER_MANAGER_STATE}" in
-    active|activating|reloading|deactivating)
-      POWER_MANAGER_WAS_ACTIVE=1
-      log "先安全停止 livox-power-cycle-manager（若正在 OFF，会先补回 ON）"
-      POWER_MANAGER_STOPPED_BY_UPDATER=1
-      sudo systemctl stop livox-power-cycle-manager.service
-      POWER_MANAGER_STATE="$(power_manager_active_state)"
-      [[ "${POWER_MANAGER_STATE}" == "inactive" || \
-         "${POWER_MANAGER_STATE}" == "failed" ]] ||
-        die "livox-power-cycle-manager 未能安全停止（state=${POWER_MANAGER_STATE}），拒绝重启 Driver。"
-      ;;
-  esac
+  validate_driver_restart_safety
   log "重启 livox-ros-driver 服务"
   sudo systemctl restart livox-ros-driver
-  if ((POWER_MANAGER_WAS_ACTIVE)); then
-    log "Driver 已恢复，重新启动 livox-power-cycle-manager 服务"
-    sudo systemctl start livox-power-cycle-manager.service
-    POWER_MANAGER_STOPPED_BY_UPDATER=0
-  fi
 fi
 
 log "全部完成：SDK $(short_sha "${CURRENT_SDK_SHA}")，Driver $(short_sha "${DRIVER_REMOTE_HEAD}")"
 if ((!RESTART_SERVICE)); then
-  log "如需应用新二进制，请执行：sudo systemctl restart livox-ros-driver"
+  log "若尚未安装集成版安全钩子，请先运行：bash ${DRIVER_DIR}/install_livox_power_cycle_service.sh"
+  log "确认安全钩子已安装后再执行：sudo systemctl restart livox-ros-driver"
 fi
