@@ -1549,12 +1549,22 @@ class CorxLegacyTcpClient:
         expected = _double_checksum(frame[2:7])
         warning: Optional[str] = None
         if frame[7:9] != expected:
-            if not (
+            if frame[7] == expected[0] and frame[8] == 0xAA:
+                # Field-captured CX-5104E-L firmware verifies the B0 payload
+                # with the correct first checksum byte, but uses a fixed AA
+                # tail instead of the documented doubled checksum byte.  This
+                # remains deliberately narrow: the payload checksum, address,
+                # end marker and four-channel mask are all still validated.
+                warning = (
+                    "accepted verified first-byte B0 checksum with fixed AA tail"
+                )
+            elif (
                 self.target.allow_omitted_status_checksum
                 and frame[7:9] == b"\x00\x00"
             ):
+                warning = "accepted explicitly allowed omitted B0 checksum (00 00)"
+            else:
                 raise RelayProtocolError("CORX B0 status checksum mismatch")
-            warning = "accepted explicitly allowed omitted B0 checksum (00 00)"
         mask = int.from_bytes(frame[4:6], "big")
         if mask & ~0x0F:
             raise RelayProtocolError("CORX B0 status contains bits outside 4 channels")

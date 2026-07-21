@@ -59,7 +59,9 @@ class _RelayHandler(socketserver.BaseRequestHandler):
                 status_checksum = state.status_checksum
             body = bytes((0xB0, 1)) + mask.to_bytes(2, "big") + b"\x0D"
             checksum = manager._double_checksum(body)
-            if status_checksum is not None:
+            if callable(status_checksum):
+                checksum = status_checksum(body)
+            elif status_checksum is not None:
                 checksum = status_checksum
             self.request.sendall(b"\xAA\xBB" + body + checksum)
         elif data[2] == 0xA1 and len(data) >= 10:
@@ -757,6 +759,57 @@ class LegacyRelayClientTests(unittest.TestCase):
             states, warning = compatible.query()
             self.assertTrue(states[0])
             self.assertIsNotNone(warning)
+
+    def test_field_aa_tail_status_checksum_supports_state_transitions(self):
+        def field_checksum(body):
+            return bytes((sum(body) & 0xFF, 0xAA))
+
+        with _RunningRelay(status_checksum=field_checksum) as relay:
+            client = manager.CorxLegacyTcpClient(
+                _group(relay.port),
+                _policy(
+                    connect_timeout_seconds=1,
+                    command_timeout_seconds=1,
+                    command_retries=2,
+                ),
+            )
+            states, warning = client.query()
+            self.assertEqual(states, (True, True, True, True))
+            self.assertIn("fixed AA tail", warning)
+            client.ensure_state(False)
+            self.assertFalse(client.query()[0][0])
+            client.ensure_state(True)
+            self.assertTrue(client.query()[0][0])
+
+    def test_field_aa_tail_acceptance_is_narrow(self):
+        client = manager.CorxLegacyTcpClient(_group(), manager.Policy())
+
+        for mask in range(0x10):
+            body = bytes((0xB0, 1, 0, mask, 0x0D))
+            first = sum(body) & 0xFF
+            frame = b"\xAA\xBB" + body + bytes((first, 0xAA))
+            with self.subTest(mask=mask), mock.patch.object(
+                client, "_exchange", return_value=frame
+            ):
+                states, warning = client.query()
+                self.assertEqual(
+                    states,
+                    tuple(bool(mask & (1 << bit)) for bit in range(4)),
+                )
+                self.assertIn("fixed AA tail", warning)
+
+        invalid_frames = (
+            bytes.fromhex("AA BB B0 01 00 0F 0D CC AA"),
+            bytes.fromhex("AA BB B0 01 00 0F 0D CD AB"),
+            bytes.fromhex("AA BB B0 02 00 0F 0D CE AA"),
+            bytes.fromhex("AA BB B0 01 00 10 0D CE AA"),
+            bytes.fromhex("AA BB B0 01 00 0F 0E CE AA"),
+        )
+        for frame in invalid_frames:
+            with self.subTest(frame=frame.hex()), mock.patch.object(
+                client, "_exchange", return_value=frame
+            ), self.assertRaises(manager.RelayProtocolError):
+                client.query()
 
     def test_nonzero_bad_status_checksum_is_rejected_even_with_opt_in(self):
         with _RunningRelay(status_checksum=b"\x12\x34") as relay:

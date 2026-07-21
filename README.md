@@ -606,7 +606,7 @@ sudo systemctl restart livox-ros-driver && systemctl is-active livox-ros-driver
 | 白名单 | 未加入 `members`、电源组禁用、广播码不合法或一个成员跨组重复，一律 fail closed |
 | 当前状态复核 | 状态时间戳必须新鲜且符合离线/未发布特征；本次触发成员的 driver instance、发生时间和次数必须精确匹配，并在继电器预检查后再次收到该成员同一个 `POWER_CYCLE_REQUIRED` episode 的新状态；不以其余 3 台健康作为 OFF 前置条件，多台同时异常也按同一电源组执行一次恢复 |
 | 测量联锁边界 | 上位机/PLC 在任一雷达异常时已负责中断测量；继电器通道只给这 4 台雷达供电，因此 manager 不再要求或等待额外的 `SAFE_TO_CYCLE` 许可 |
-| 协议确认 | 私有 TCP `B0` 状态校验默认严格；只有实机固件按协议省略校验并精确返回 `00 00` 时，才允许对单个电源组显式设置 `allow_omitted_status_checksum=true`，并保留 WARN；任何非零错误校验仍一律拒绝 |
+| 协议确认 | 私有 TCP `B0` 状态查询接受完整 `CH/CL`；同时兼容 CX-5104E-L 实机确认的“正确 `CH` + 固定 `AA` 尾字节”（例如全开状态 `... 0D CD AA`），并保留 WARN。该兼容仍严格校验首校验字节、地址、`0D` 结束位和四路状态范围；错误 `CH`、未知非 `AA` 尾字节及越界状态一律拒绝。只有固件精确返回 `00 00` 时，才需对单个电源组显式设置 `allow_omitted_status_checksum=true` |
 | 旁路通道保护 | OFF 前记录另外 3 路继电器状态，目标路 OFF 和恢复 ON 后都再次查询；任一非目标路发生变化立即中止并报 `NON_TARGET_STATE_CHANGED`，软件绝不尝试改动它们 |
 | 影响范围 | 任一成员触发后，映射通道上的 4 台雷达都会短暂断流；不会尝试伪装成“只重启一台” |
 | 断电时间 | 共享通道 OFF 确认后保持 10 秒，再恢复 ON |
