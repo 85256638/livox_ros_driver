@@ -287,6 +287,195 @@ python_validator() {
                 self.assertIn("禁止编译和重启服务", result.stderr)
 
 
+class UpdaterBranchTrackingTests(unittest.TestCase):
+    TARGET_BRANCH = "network-relay-added"
+    LEGACY_BRANCH = "legacy-sdk"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = UPDATER.read_text(encoding="utf-8")
+        cls.bash = _find_bash()
+        cls.branch_functions = "\n".join(
+            _function(cls.source, name)
+            for name in (
+                "log",
+                "die",
+                "short_sha",
+                "check_clean_checkout",
+                "ensure_branch_upstream",
+                "update_checkout",
+            )
+        )
+
+    def setUp(self):
+        if self.bash is None:
+            self.skipTest("Bash is unavailable")
+
+    @staticmethod
+    def _git(repo, *args, check=True):
+        return _run(["git", "-C", str(repo)] + list(args), check=check)
+
+    def _prepare_single_branch_clone(self, root):
+        origin = root / "origin.git"
+        seed = root / "seed"
+        checkout = root / "checkout"
+        _run(["git", "init", "--bare", str(origin)])
+        _run(["git", "init", str(seed)])
+        self._git(seed, "config", "user.name", "Updater Test")
+        self._git(seed, "config", "user.email", "updater@example.invalid")
+        self._git(seed, "config", "core.autocrlf", "false")
+        (seed / "version.txt").write_text("legacy\n", encoding="utf-8")
+        self._git(seed, "add", "version.txt")
+        self._git(seed, "commit", "-m", "legacy")
+        self._git(seed, "branch", "-M", self.LEGACY_BRANCH)
+        self._git(seed, "remote", "add", "origin", str(origin))
+        self._git(seed, "push", "origin", self.LEGACY_BRANCH)
+        self._git(seed, "checkout", "-b", self.TARGET_BRANCH)
+        (seed / "version.txt").write_text("target\n", encoding="utf-8")
+        self._git(seed, "add", "version.txt")
+        self._git(seed, "commit", "-m", "target")
+        target_sha = self._git(seed, "rev-parse", "HEAD").stdout.strip()
+        self._git(seed, "push", "origin", self.TARGET_BRANCH)
+
+        _run(
+            [
+                "git",
+                "clone",
+                "--branch",
+                self.LEGACY_BRANCH,
+                "--single-branch",
+                str(origin),
+                str(checkout),
+            ]
+        )
+        self._git(
+            checkout,
+            "fetch",
+            "origin",
+            "+refs/heads/%s:refs/remotes/origin/%s"
+            % (self.TARGET_BRANCH, self.TARGET_BRANCH),
+        )
+        fetch_refspecs = self._git(
+            checkout, "config", "--get-all", "remote.origin.fetch"
+        ).stdout.splitlines()
+        self.assertIn(
+            "+refs/heads/%s:refs/remotes/origin/%s"
+            % (self.LEGACY_BRANCH, self.LEGACY_BRANCH),
+            fetch_refspecs,
+        )
+        self.assertNotIn(
+            "+refs/heads/%s:refs/remotes/origin/%s"
+            % (self.TARGET_BRANCH, self.TARGET_BRANCH),
+            fetch_refspecs,
+        )
+        return checkout, target_sha
+
+    def _run_update_checkout(self, root, checkout, target_sha):
+        harness = root / "branch-update-test.sh"
+        q = lambda value: shlex.quote(_bash_path(value))
+        harness.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -Eeuo pipefail\n"
+            "export PATH=/usr/bin:/mingw64/bin:$PATH\n"
+            + self.branch_functions
+            + "\nupdate_checkout 'Livox-SDK' %s %s %s\n"
+            % (
+                q(checkout),
+                shlex.quote(self.TARGET_BRANCH),
+                shlex.quote(target_sha),
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        return _run(
+            [self.bash, "--noprofile", "--norc", _bash_path(harness)],
+            check=False,
+        )
+
+    def _assert_repaired_tracking(self, checkout, target_sha):
+        self.assertEqual(
+            self._git(checkout, "rev-parse", "HEAD").stdout.strip(),
+            target_sha,
+        )
+        self.assertEqual(
+            self._git(checkout, "branch", "--show-current").stdout.strip(),
+            self.TARGET_BRANCH,
+        )
+        self.assertEqual(
+            self._git(
+                checkout,
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ).stdout.strip(),
+            "origin/%s" % self.TARGET_BRANCH,
+        )
+        self.assertEqual(
+            self._git(
+                checkout,
+                "config",
+                "--get",
+                "branch.%s.remote" % self.TARGET_BRANCH,
+            ).stdout.strip(),
+            "origin",
+        )
+        self.assertEqual(
+            self._git(
+                checkout,
+                "config",
+                "--get",
+                "branch.%s.merge" % self.TARGET_BRANCH,
+            ).stdout.strip(),
+            "refs/heads/%s" % self.TARGET_BRANCH,
+        )
+        fetch_refspecs = self._git(
+            checkout, "config", "--get-all", "remote.origin.fetch"
+        ).stdout.splitlines()
+        self.assertEqual(
+            fetch_refspecs.count(
+                "+refs/heads/%s:refs/remotes/origin/%s"
+                % (self.TARGET_BRANCH, self.TARGET_BRANCH)
+            ),
+            1,
+        )
+        self.assertIn(
+            "+refs/heads/%s:refs/remotes/origin/%s"
+            % (self.LEGACY_BRANCH, self.LEGACY_BRANCH),
+            fetch_refspecs,
+        )
+
+    def test_single_branch_clone_can_create_and_track_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout, target_sha = self._prepare_single_branch_clone(root)
+            result = self._run_update_checkout(root, checkout, target_sha)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self._assert_repaired_tracking(checkout, target_sha)
+
+            second = self._run_update_checkout(root, checkout, target_sha)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self._assert_repaired_tracking(checkout, target_sha)
+
+    def test_retry_repairs_branch_left_without_upstream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout, target_sha = self._prepare_single_branch_clone(root)
+            self._git(checkout, "checkout", "-b", self.TARGET_BRANCH)
+            failed = self._git(
+                checkout,
+                "branch",
+                "--set-upstream-to=origin/%s" % self.TARGET_BRANCH,
+                self.TARGET_BRANCH,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+
+            result = self._run_update_checkout(root, checkout, target_sha)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self._assert_repaired_tracking(checkout, target_sha)
+
+
 class UpdaterEmbeddedValidationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

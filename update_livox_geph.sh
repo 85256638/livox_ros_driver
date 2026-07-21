@@ -850,6 +850,34 @@ sync_remote_branch() {
   [[ "${FETCHED_HEAD}" =~ ^[0-9a-f]{40}$ ]] || die "无法解析 ${name} 远端版本。"
 }
 
+ensure_branch_upstream() {
+  local name="$1"
+  local directory="$2"
+  local branch="$3"
+  local current_upstream
+
+  current_upstream="$(git -C "${directory}" rev-parse --abbrev-ref \
+    --symbolic-full-name "${branch}@{upstream}" 2>/dev/null || true)"
+  [[ "${current_upstream}" == "origin/${branch}" ]] && return
+
+  # An explicit command-line fetch refspec creates refs/remotes/origin/<branch>
+  # for that invocation, but it does not update remote.origin.fetch.  Git then
+  # refuses --set-upstream-to in repositories originally cloned with
+  # --single-branch.  Let Git recognize normal/wildcard refspecs first; only
+  # persist the exact missing branch mapping when that capability check fails.
+  if git -C "${directory}" branch \
+      --set-upstream-to="origin/${branch}" "${branch}" >/dev/null 2>&1; then
+    return
+  fi
+
+  log "${name} origin 尚未跟踪分支 ${branch}，正在补充分支映射。"
+  git -C "${directory}" remote set-branches --add origin "${branch}" ||
+    die "无法让 ${name} origin 跟踪分支：${branch}"
+  git -C "${directory}" branch \
+    --set-upstream-to="origin/${branch}" "${branch}" ||
+    die "无法设置 ${name} 上游分支。"
+}
+
 update_checkout() {
   local name="$1"
   local directory="$2"
@@ -868,9 +896,11 @@ update_checkout() {
     fi
     git -C "${directory}" checkout -b "${branch}" "${local_sha}" ||
       die "无法创建 ${name} 本地分支：${branch}"
-    git -C "${directory}" branch --set-upstream-to="origin/${branch}" "${branch}" ||
-      die "无法设置 ${name} 上游分支。"
   fi
+
+  # Run for both a newly created branch and a branch left behind by a previous
+  # interrupted migration (created locally but missing its upstream).
+  ensure_branch_upstream "${name}" "${directory}" "${branch}"
 
   check_clean_checkout "${name}" "${directory}"
   local_sha="$(git -C "${directory}" rev-parse HEAD)"
