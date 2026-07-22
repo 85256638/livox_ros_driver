@@ -130,6 +130,21 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
   }
   lock_guard<mutex> lock(link_stat_lock_[handle]);
   LinkStat &s = link_stat_[handle];
+  const bool identity_changed =
+      s.broadcast_code[0] != '\0' && broadcast_code != nullptr &&
+      broadcast_code[0] != '\0' &&
+      strncmp(s.broadcast_code, broadcast_code,
+              sizeof(s.broadcast_code)) != 0;
+  if (identity_changed) {
+    /** A connect event can occasionally be the first callback observed for a
+     *  reused handle.  Establish the physical identity here as well as in the
+     *  broadcast path so old process history cannot survive that ordering. */
+    s = LinkStat();
+  }
+  if (broadcast_code != nullptr && broadcast_code[0] != '\0') {
+    strncpy(s.broadcast_code, broadcast_code, sizeof(s.broadcast_code) - 1);
+    s.broadcast_code[sizeof(s.broadcast_code) - 1] = '\0';
+  }
   if (s.connect_since_ns != 0) {
     return;  /** already counted as connected */
   }
@@ -148,6 +163,7 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
   s.handshake_reset_completed_ns = 0;
   s.handshake_event_valid = false;
   s.handshake_last_network_error_ns = 0;
+  s.power_cycle_required_counted_this_episode = false;
   if (s.last_disconnect_ns != 0) {
     long long down_s = (now - s.last_disconnect_ns) / 1000000000LL;
     char buf[48];
@@ -201,6 +217,7 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
   s.handshake_reset_completed = false;
   s.handshake_reset_completed_ns = 0;
   s.handshake_last_network_error_ns = 0;
+  s.power_cycle_required_counted_this_episode = false;
   PrintLidarEvent(handle, broadcast_code, "DISCONNECTED");
   HealthLogger::Get().LogEvent(handle, broadcast_code, "DISCONNECT", "");
 }
@@ -216,6 +233,16 @@ void LdsLidar::OnLidarBroadcastEvent(uint8_t handle,
   {
     lock_guard<mutex> lock(link_stat_lock_[handle]);
     LinkStat &s = link_stat_[handle];
+    const bool identity_changed =
+        s.broadcast_code[0] != '\0' &&
+        strncmp(s.broadcast_code, broadcast_code,
+                sizeof(s.broadcast_code)) != 0;
+    if (identity_changed) {
+      /** SDK handles are reusable.  Never let a newly assigned physical lidar
+       *  inherit health, disconnect, handshake, or recovery history from the
+       *  previous broadcast code which occupied this slot. */
+      s = LinkStat();
+    }
     strncpy(s.broadcast_code, broadcast_code, sizeof(s.broadcast_code) - 1);
     s.broadcast_code[sizeof(s.broadcast_code) - 1] = '\0';
     s.broadcast_count++;
@@ -234,6 +261,7 @@ void LdsLidar::OnLidarBroadcastEvent(uint8_t handle,
       s.handshake_reset_completed_ns = 0;
       s.handshake_event_valid = false;
       s.handshake_last_network_error_ns = 0;
+      s.power_cycle_required_counted_this_episode = false;
       new_episode = true;
     } else if (s.connect_since_ns == 0 && broadcast_gap) {
       /** Treat a broadcast gap as the end of the live episode even if the 1Hz
@@ -248,6 +276,7 @@ void LdsLidar::OnLidarBroadcastEvent(uint8_t handle,
       s.handshake_reset_completed_ns = 0;
       s.handshake_event_valid = false;
       s.handshake_last_network_error_ns = 0;
+      s.power_cycle_required_counted_this_episode = false;
       new_episode = true;
     }
   }
@@ -286,6 +315,7 @@ void LdsLidar::TickHandshakeRecovery(bool enable_recovery) {
         s.handshake_reset_completed = false;
         s.handshake_reset_completed_ns = 0;
         s.handshake_last_network_error_ns = 0;
+        s.power_cycle_required_counted_this_episode = false;
         continue;
       }
       if (s.handshake_state == kHandshakeLinkPowerCycleRequired) {
@@ -340,6 +370,10 @@ void LdsLidar::TickHandshakeRecovery(bool enable_recovery) {
          *  and then be followed by a stale POWER_CYCLE_REQUIRED record. */
         s.handshake_state = kHandshakeLinkPowerCycleRequired;
         s.power_cycle_required_count++;
+        if (!s.power_cycle_required_counted_this_episode) {
+          s.power_cycle_required_episode_count++;
+          s.power_cycle_required_counted_this_episode = true;
+        }
         s.power_cycle_required_wall_s = static_cast<int64_t>(time(nullptr));
         attempt = s.handshake_reset_attempts;
         strncpy(broadcast_code, s.broadcast_code,
@@ -367,21 +401,30 @@ void LdsLidar::TickHandshakeRecovery(bool enable_recovery) {
     {
       lock_guard<mutex> lock(link_stat_lock_[handle]);
       LinkStat &s = link_stat_[handle];
-      /** The call may race a successful connect; totals remain useful history,
-       *  but current episode state is cleared by OnLidarConnectEvent. */
-      s.handshake_last_reset_wall_s = wall_now;
-      if (status == kStatusSuccess) {
-        s.handshake_reset_count++;
-      } else {
-        s.handshake_reset_fail_count++;
-        /** The one-shot budget counts API requests, not accepted cleanups.
-         *  Do not decrement it here: repeatedly calling a rejected cleanup
-         *  would create the retry loop this watchdog is intended to bound. */
+      /** The SDK call can outlive this handle's physical identity.  Attribute
+       *  its result only when the slot still belongs to the broadcast code
+       *  which issued it; otherwise an old reset would pollute the new lidar's
+       *  process history.  A same-device successful connect is still valid
+       *  history even though it has already cleared the live episode. */
+      const bool same_identity =
+          s.broadcast_code[0] != '\0' &&
+          strncmp(s.broadcast_code, broadcast_code,
+                  sizeof(s.broadcast_code)) == 0;
+      if (same_identity) {
+        s.handshake_last_reset_wall_s = wall_now;
+        if (status == kStatusSuccess) {
+          s.handshake_reset_count++;
+        } else {
+          s.handshake_reset_fail_count++;
+          /** The one-shot budget counts API requests, not accepted cleanups.
+           *  Do not decrement it here: repeatedly calling a rejected cleanup
+           *  would create the retry loop this watchdog is intended to bound. */
+        }
       }
       /** Bind the synchronous API result to the episode which issued it. A
        *  connect or broadcast gap may have started/cleared another episode
        *  while the SDK call was in progress. */
-      if (s.connect_since_ns == 0 &&
+      if (same_identity && s.connect_since_ns == 0 &&
           s.broadcast_only_since_ns == episode_since) {
         s.handshake_reset_accepted = (status == kStatusSuccess);
         if (status == kStatusSuccess) {
@@ -853,11 +896,25 @@ void LdsLidar::RememberBroadcastCode(uint8_t handle, const char *broadcast_code)
     return;
   }
 
+  /** Serialize identity replacement with every per-handle SDK command send.
+   *  Otherwise a sender could release mode_mutex_, then enqueue an old
+   *  device's command after this function had already rebound the handle. */
+  lock_guard<mutex> send_lock(mode_send_mutex_[handle]);
   lock_guard<mutex> lock(mode_mutex_);
-  strncpy(mode_requests_[handle].broadcast_code, broadcast_code,
-          sizeof(mode_requests_[handle].broadcast_code) - 1);
-  mode_requests_[handle]
-      .broadcast_code[sizeof(mode_requests_[handle].broadcast_code) - 1] = '\0';
+  ModeChangeRequest &request = mode_requests_[handle];
+  const bool identity_changed =
+      request.broadcast_code[0] != '\0' &&
+      strncmp(request.broadcast_code, broadcast_code,
+              sizeof(request.broadcast_code)) != 0;
+  if (identity_changed) {
+    /** A deferred Normal request belongs to one physical lidar, not to the SDK
+     *  handle number.  Drop it when the handle is reassigned so reconnect of a
+     *  different lidar cannot execute the previous device's pending command. */
+    request = ModeChangeRequest();
+  }
+  strncpy(request.broadcast_code, broadcast_code,
+          sizeof(request.broadcast_code) - 1);
+  request.broadcast_code[sizeof(request.broadcast_code) - 1] = '\0';
 }
 
 bool LdsLidar::ResetModeRequestIfTarget(uint8_t handle, LidarMode target,
@@ -899,6 +956,13 @@ bool LdsLidar::IsModeTransitionActive(uint8_t handle) {
   }
   lock_guard<mutex> lock(mode_mutex_);
   return mode_requests_[handle].active;
+}
+
+uint64_t LdsLidar::GetConnectionGeneration(uint8_t handle) const {
+  if (handle >= kMaxLidarCount) {
+    return 0;
+  }
+  return connection_generation_[handle].load(std::memory_order_acquire);
 }
 
 namespace {
@@ -1377,6 +1441,16 @@ void LdsLidar::OnDeviceHandshake(const DeviceHandshakeStatus *status) {
      *  short lock; formatting and disk logging happen after releasing it. */
     lock_guard<mutex> lock(g_lds_ldiar->link_stat_lock_[handle]);
     LinkStat &s = g_lds_ldiar->link_stat_[handle];
+    const bool status_has_identity = status->broadcast_code[0] != '\0';
+    if (status_has_identity && s.broadcast_code[0] != '\0' &&
+        strncmp(s.broadcast_code, status->broadcast_code,
+                sizeof(s.broadcast_code)) != 0) {
+      /** A callback from the previous occupant of a reused SDK handle must not
+       *  overwrite/cancel the new lidar's episode or counters.  The new
+       *  identity is established by its broadcast callback before normal
+       *  handshake processing continues. */
+      return;
+    }
     bool changed = !s.handshake_event_valid ||
                    s.last_handshake_event != status->event ||
                    s.last_handshake_detail != status->detail;
@@ -1386,9 +1460,10 @@ void LdsLidar::OnDeviceHandshake(const DeviceHandshakeStatus *status) {
     s.last_handshake_event_wall_s = static_cast<int64_t>(time(nullptr));
     strncpy(s.last_handshake_ip, status->ip, sizeof(s.last_handshake_ip) - 1);
     strncpy(ip, status->ip, sizeof(ip) - 1);
-    if (status->broadcast_code[0] != '\0') {
+    if (status_has_identity) {
       strncpy(s.broadcast_code, status->broadcast_code,
               sizeof(s.broadcast_code) - 1);
+      s.broadcast_code[sizeof(s.broadcast_code) - 1] = '\0';
     }
     strncpy(broadcast_code, s.broadcast_code, sizeof(broadcast_code) - 1);
 
@@ -1495,8 +1570,8 @@ void LdsLidar::OnDeviceBroadcast(const BroadcastDeviceInfo *info) {
   result = AddLidarToConnect(info->broadcast_code, &handle);
   if (result == kStatusSuccess && handle < kMaxLidarCount) {
     SetDataCallback(handle, OnLidarDataCb, (void *)g_lds_ldiar);
-    g_lds_ldiar->RememberBroadcastCode(handle, info->broadcast_code);
     g_lds_ldiar->OnLidarBroadcastEvent(handle, info->broadcast_code);
+    g_lds_ldiar->RememberBroadcastCode(handle, info->broadcast_code);
 
     UserRawConfig config;
     if (g_lds_ldiar->GetRawConfig(info->broadcast_code, config)) {
@@ -1538,8 +1613,8 @@ void LdsLidar::OnDeviceChange(const DeviceInfo *info, DeviceEvent type) {
 
   LidarDevice *p_lidar = &(g_lds_ldiar->lidars_[handle]);
   if (type == kEventConnect) {
-    g_lds_ldiar->RememberBroadcastCode(handle, info->broadcast_code);
     g_lds_ldiar->OnLidarConnectEvent(handle, info->broadcast_code);
+    g_lds_ldiar->RememberBroadcastCode(handle, info->broadcast_code);
     QueryDeviceInformation(handle, DeviceInformationCb, g_lds_ldiar);
     {
       lock_guard<mutex> send_lock(g_lds_ldiar->mode_send_mutex_[handle]);
@@ -1761,47 +1836,71 @@ void LdsLidar::LidarErrorStatusCb(livox_status status, uint8_t handle,
   if (message == NULL || handle >= kMaxLidarCount || g_lds_ldiar == nullptr) {
     return;
   }
+  (void)status;
   LidarErrorCode ec = message->lidar_error_code;
-  lock_guard<mutex> link_lock(g_lds_ldiar->link_stat_lock_[handle]);
-  g_lds_ldiar->link_stat_[handle].health_code = message->error_code;
-
-  /** Track temp_status transitions (count + wall-clock time of last change). */
-  static uint8_t prev_temp[kMaxLidarCount] = {0};
-  static bool temp_seen[kMaxLidarCount] = {false};
-  if (temp_seen[handle] && ec.temp_status != prev_temp[handle]) {
-    g_lds_ldiar->link_stat_[handle].temp_change_count++;
-    g_lds_ldiar->link_stat_[handle].temp_change_wall_s = (int64_t)time(nullptr);
+  char broadcast_code[kBroadcastCodeSize] = {0};
+  uint64_t connection_generation = 0;
+  {
+    lock_guard<mutex> data_lock(g_lds_ldiar->data_lock_[handle]);
+    const LidarDevice &lidar = g_lds_ldiar->lidars_[handle];
+    if (lidar.connect_state == kConnectStateOff || lidar.handle != handle ||
+        lidar.info.broadcast_code[0] == '\0') {
+      return;
+    }
+    strncpy(broadcast_code, lidar.info.broadcast_code,
+            sizeof(broadcast_code) - 1);
+    connection_generation =
+        g_lds_ldiar->connection_generation_[handle].load(
+            std::memory_order_acquire);
   }
-  temp_seen[handle] = true;
-  prev_temp[handle] = ec.temp_status;
 
-  /** Track fault onsets (motor/fan/dirty/volt/firmware/system going bad) so the
-   *  dashboard keeps a record even after the lidar recovers -- the live
-   *  columns only ever show the current state. Count the rising edge only.
-   *  dirty_warn (optical window dirty/blocked) matters in dusty environments. */
-  static bool prev_fault[kMaxLidarCount] = {false};
-  bool fault = (ec.motor_status || ec.fan_status || ec.dirty_warn ||
-                ec.volt_status || ec.firmware_err || ec.system_status);
-  if (fault && !prev_fault[handle]) {
-    g_lds_ldiar->link_stat_[handle].fault_count++;
-    g_lds_ldiar->link_stat_[handle].fault_wall_s = (int64_t)time(nullptr);
-    g_lds_ldiar->link_stat_[handle].fault_code = message->error_code;
-  }
-  prev_fault[handle] = fault;
+  {
+    lock_guard<mutex> link_lock(g_lds_ldiar->link_stat_lock_[handle]);
+    LinkStat &link = g_lds_ldiar->link_stat_[handle];
+    if (connection_generation !=
+            g_lds_ldiar->connection_generation_[handle].load(
+                std::memory_order_acquire) ||
+        link.connect_since_ns == 0 || link.broadcast_code[0] == '\0' ||
+        strncmp(link.broadcast_code, broadcast_code,
+                sizeof(link.broadcast_code)) != 0) {
+      /** Drop a callback which crossed a disconnect or handle reassignment.
+       *  Recovery and dashboard history must never attribute an old device's
+       *  health edge to the new physical broadcast code. */
+      return;
+    }
+    link.health_code = message->error_code;
 
-  /** Only print when one of the fields worth alerting on changes (ignore
-   *  pps/ptp/time-sync churn that would otherwise spam every message). */
-  uint32_t watch = (ec.temp_status) | (ec.volt_status << 2) |
-                   (ec.motor_status << 4) | (ec.dirty_warn << 6) |
-                   (ec.firmware_err << 7) | (ec.fan_status << 8) |
-                   (ec.self_heating << 9) | (ec.system_status << 10);
-  static uint32_t last_watch[kMaxLidarCount] = {0};
-  static bool seen[kMaxLidarCount] = {false};
-  if (seen[handle] && watch == last_watch[handle]) {
-    return;
+    /** Track temp_status transitions (count + wall-clock time of last change). */
+    if (link.health_temp_seen && ec.temp_status != link.health_prev_temp) {
+      link.temp_change_count++;
+      link.temp_change_wall_s = (int64_t)time(nullptr);
+    }
+    link.health_temp_seen = true;
+    link.health_prev_temp = ec.temp_status;
+
+    /** Track fault onsets (motor/fan/dirty/volt/firmware/system going bad) so
+     *  the dashboard keeps a record after recovery. Count rising edges only. */
+    bool fault = (ec.motor_status || ec.fan_status || ec.dirty_warn ||
+                  ec.volt_status || ec.firmware_err || ec.system_status);
+    if (fault && !link.health_prev_fault) {
+      link.fault_count++;
+      link.fault_wall_s = (int64_t)time(nullptr);
+      link.fault_code = message->error_code;
+    }
+    link.health_prev_fault = fault;
+
+    /** Ignore pps/ptp/time-sync churn; emit only when an operator-relevant
+     *  health field changes. */
+    uint32_t watch = (ec.temp_status) | (ec.volt_status << 2) |
+                     (ec.motor_status << 4) | (ec.dirty_warn << 6) |
+                     (ec.firmware_err << 7) | (ec.fan_status << 8) |
+                     (ec.self_heating << 9) | (ec.system_status << 10);
+    if (link.health_watch_seen && watch == link.health_last_watch) {
+      return;
+    }
+    link.health_watch_seen = true;
+    link.health_last_watch = watch;
   }
-  seen[handle] = true;
-  last_watch[handle] = watch;
 
   char ts[16];
   NowHms(ts, sizeof(ts));
@@ -1821,13 +1920,6 @@ void LdsLidar::LidarErrorStatusCb(livox_status status, uint8_t handle,
              TempStr(ec.temp_status), FanStr(ec.fan_status),
              Lvl3Str(ec.motor_status), Lvl3Str(ec.volt_status), ec.dirty_warn,
              ec.firmware_err, ec.self_heating, Lvl3Str(ec.system_status));
-    char broadcast_code[kBroadcastCodeSize] = {0};
-    {
-      lock_guard<mutex> data_lock(g_lds_ldiar->data_lock_[handle]);
-      strncpy(broadcast_code,
-              g_lds_ldiar->lidars_[handle].info.broadcast_code,
-              sizeof(broadcast_code) - 1);
-    }
     HealthLogger::Get().LogEvent(handle, broadcast_code, "HEALTH", detail);
   }
 }

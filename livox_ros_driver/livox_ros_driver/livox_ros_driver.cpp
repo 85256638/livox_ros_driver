@@ -25,6 +25,8 @@
 #include "include/livox_ros_driver.h"
 
 #include <chrono>
+#include <cstddef>
+#include <cstdio>
 #include <vector>
 #include <sstream>
 #include <cstring>
@@ -32,6 +34,7 @@
 
 #include <ros/ros.h>
 #include <std_msgs/String.h>
+#include "dashboard_metrics.h"
 #include "health_logger.h"
 #include "recovery_event_json.h"
 #include "lddc.h"
@@ -319,6 +322,99 @@ static std::string FaultTags(uint32_t code) {
   return s.empty() ? "?" : s;
 }
 
+/** Current health fields, kept separate from the historical FaultTags() value.
+ *  Temperature is included here because the main table's HW column describes
+ *  what needs attention now, not only edge-triggered fault history. */
+static std::string CurrentHealthTags(uint32_t code) {
+  ErrorMessage em;
+  em.error_code = code;
+  const LidarErrorCode &e = em.lidar_error_code;
+  std::string tags;
+  auto add = [&](uint32_t bad, const char *tag) {
+    if (!bad) {
+      return;
+    }
+    if (!tags.empty()) {
+      tags += "+";
+    }
+    tags += tag;
+  };
+  add(e.temp_status, "temp");
+  add(e.motor_status, "motor");
+  add(e.fan_status, "fan");
+  add(e.dirty_warn, "dirty");
+  add(e.volt_status, "volt");
+  add(e.firmware_err, "fw");
+  add(e.system_status, "sys");
+  return tags.empty() ? "OK" : tags;
+}
+
+/** One canonical current-state label is reused by the table, summary and
+ *  active-alert section so a single 1 Hz frame cannot describe the same lidar
+ *  with three different terms. */
+static std::string DashboardNowState(
+    bool connected, bool broadcast_recent, const char *connected_state,
+    const LdsLidar::LinkStat &link) {
+  if (!connected) {
+    if (broadcast_recent &&
+        link.handshake_state != LdsLidar::kHandshakeLinkIdle) {
+      return HandshakeStateStr(link.handshake_state);
+    }
+    return "DISCONNECTED";
+  }
+  if (strcmp(connected_state, "NO DATA") == 0) {
+    return "NO_DATA";
+  }
+  if (strcmp(connected_state, "PowerSaving") == 0) {
+    return "POWER_SAVING";
+  }
+  if (strcmp(connected_state, "StandBy") == 0) {
+    return "STANDBY";
+  }
+  if (strcmp(connected_state, "Config") == 0) {
+    return "CONFIG";
+  }
+  if (strcmp(connected_state, "Normal") == 0) {
+    return "NORMAL";
+  }
+  if (strcmp(connected_state, "Error") == 0) {
+    return "ERROR";
+  }
+  if (strcmp(connected_state, "Init") == 0) {
+    return "INIT";
+  }
+  return connected_state;
+}
+
+static const char *DashboardModeName(uint8_t mode) {
+  switch (mode) {
+    case 1:
+      return "Normal";
+    case 2:
+      return "PowerSaving";
+    case 3:
+      return "Standby";
+    default:
+      return "Unknown";
+  }
+}
+
+/** Keep a numeric dashboard cell within its declared width without silently
+ *  truncating the most-significant digits.  Values which cannot fit are shown
+ *  as e.g. ">9999", which preserves the useful lower-bound meaning. */
+static std::string DashboardCountCell(uint64_t value, std::size_t width) {
+  char exact[32];
+  int written = snprintf(exact, sizeof(exact), "%llu",
+                         static_cast<unsigned long long>(value));
+  if (written > 0 && static_cast<std::size_t>(written) <= width) {
+    return std::string(exact);
+  }
+  if (width < 2) {
+    return ">";
+  }
+  return ">" + std::string(width - 1, '9');
+}
+
 /** Format a wall-clock time_t with its date, or "--" when 0 (never). */
 static std::string FmtWall(int64_t t) {
   if (t == 0) {
@@ -388,7 +484,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
   g_read_lidar->TickHandshakeRecovery(g_auto_recover);
   static uint64_t prev_recv[kMaxLidarCount] = {0};
   static uint64_t prev_pub[kMaxLidarCount] = {0};
-  static uint64_t prev_drop[kMaxLidarCount] = {0};
+  static uint64_t prev_connection_generation[kMaxLidarCount] = {0};
   static bool ever_seen[kMaxLidarCount] = {false};
   static char last_bcode[kMaxLidarCount][kBdCodeSize + 1] = {{0}};
   static uint32_t zero_secs[kMaxLidarCount] = {0};      /**< stage timer of the current stall (reset when a recovery cycle recycles) */
@@ -402,13 +498,17 @@ void StatsTimerCb(const ros::TimerEvent &) {
   static uint32_t config_healthy_secs[kMaxLidarCount] = {0}; /**< sustained published recovery before budget reset */
   static bool nodata_logged[kMaxLidarCount] = {false};  /**< a NODATA onset event has been logged for the current silent episode */
   static uint32_t emitted_power_cycle_count[kMaxLidarCount] = {0};
+  /** Display-only rolling windows.  They never drive recovery or relay
+   *  decisions; broadcast-code isolation prevents a reused handle from
+   *  inheriting another physical lidar's trend. */
+  static DashboardMetrics dashboard_metrics[kMaxLidarCount];
 
   int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
 
   /** Snapshot pacing for the persistent health log: one row per lidar every
    *  snapshot_period_s (this timer ticks at 1 Hz). Events are logged elsewhere,
-   *  edge-triggered. Snapshot carries cumulative counters so two rows difference
-   *  into that interval's loss/recv totals with no gap. */
+   *  edge-triggered. Snapshot counters may be differenced only within one
+   *  continuous connection; ResetLidar clears them at a reconnect boundary. */
   HealthLogger &hlog = HealthLogger::Get();
   static int snap_counter = 0;
   bool do_snapshot = false;
@@ -417,12 +517,21 @@ void StatsTimerCb(const ros::TimerEvent &) {
     do_snapshot = true;
   }
 
-  std::ostringstream ss;
-  ss << "===== Livox LiDAR Stats (1Hz) =====\n";
-  ss << "handle  broadcast_code   state                 temp  fan   motor recv/s  "
-        "loss%    drop/s   disc  HS_timeout  HB_lost   heartbeat\n";
-  LdsLidar::LinkStat link_snapshot[kMaxLidarCount];
-  bool any = false;
+  std::ostringstream table;
+  std::ostringstream active_alerts;
+  std::ostringstream process_history;
+  static const char kDashboardRowFormat[] =
+      "%-2.2s  %-15.15s  %-20.20s  %-10.10s  %6.6s  %7.7s  %7.7s  "
+      "%-10.10s  %11.11s  %5.5s\n";
+  char table_header[160];
+  snprintf(table_header, sizeof(table_header), kDashboardRowFormat, "ID",
+           "broadcast_code", "NOW", "TREND", "recv/s", "loss60",
+           "qdrop60", "HW", "link_up", "HS60");
+  table << table_header;
+  bool any_active_alert = false;
+  bool any_process_history = false;
+  uint32_t known_count = 0;
+  uint32_t trend_count[kDashboardTrendStable + 1] = {0};
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
     /** Counters are written by the ingest/publish threads under data_lock_.
      *  Take one coherent snapshot so the watchdog never drives hardware from
@@ -430,28 +539,63 @@ void StatsTimerCb(const ros::TimerEvent &) {
     LidarConnectState connect_state;
     DeviceInfo info;
     LidarPacketStatistic st;
+    uint64_t connection_generation = 0;
     {
       std::lock_guard<std::mutex> lock(g_read_lidar->data_lock_[h]);
       const LidarDevice &live = g_read_lidar->lidars_[h];
       connect_state = live.connect_state;
       info = live.info;
       st = live.statistic_info;
+      /** This generation changes under the same data lock which resets or
+       *  installs the per-connection packet counters.  It therefore detects a
+       *  fast disconnect+reconnect even when the new counter has already
+       *  climbed above the previous 1 Hz sample. */
+      connection_generation = g_read_lidar->GetConnectionGeneration(h);
     }
+    LdsLidar::LinkStat ls;
     {
       std::lock_guard<std::mutex> lock(g_read_lidar->link_stat_lock_[h]);
-      link_snapshot[h] = g_read_lidar->link_stat_[h];
+      ls = g_read_lidar->link_stat_[h];
     }
-    bool connected = (connect_state != kConnectStateOff);
-    LdsLidar::LinkStat &ls = link_snapshot[h];
-    if (connected) {
-      ever_seen[h] = true;
-      strncpy(last_bcode[h], info.broadcast_code, kBdCodeSize);
-      last_bcode[h][kBdCodeSize] = '\0';
-    } else if (ls.last_broadcast_ns != 0 && ls.broadcast_code[0] != '\0') {
+    const bool sdk_connected = (connect_state != kConnectStateOff);
+    const char *observed_bcode = nullptr;
+    if (ls.broadcast_code[0] != '\0' &&
+        (ls.last_broadcast_ns != 0 || ls.connect_since_ns != 0)) {
       /** Do not require a successful first handshake before showing a device.
-       *  The problematic BROADCAST_ONLY case otherwise never gets a row. */
+       *  Prefer LinkStat's physical identity during split connect/disconnect
+       *  transitions; the problematic BROADCAST_ONLY case otherwise never
+       *  gets a row and a reused handle could briefly bounce back to old data. */
+      observed_bcode = ls.broadcast_code;
+    } else if (sdk_connected && info.broadcast_code[0] != '\0') {
+      observed_bcode = info.broadcast_code;
+    }
+    if (observed_bcode != nullptr) {
+      const bool identity_changed =
+          last_bcode[h][0] != '\0' &&
+          strncmp(last_bcode[h], observed_bcode, kBdCodeSize) != 0;
+      if (identity_changed) {
+        /** A reused SDK handle is a new physical lidar.  Clear every local
+         *  watchdog/display budget as well as the rolling windows; otherwise
+         *  the new device could inherit an old recovery stage or suppress its
+         *  first power request behind emitted_power_cycle_count. */
+        prev_recv[h] = 0;
+        prev_pub[h] = 0;
+        prev_connection_generation[h] = connection_generation;
+        zero_secs[h] = 0;
+        nodata_secs[h] = 0;
+        recover_stage[h] = 0;
+        error_secs[h] = 0;
+        error_free_secs[h] = 0;
+        error_reboots[h] = 0;
+        config_secs[h] = 0;
+        config_reboots[h] = 0;
+        config_healthy_secs[h] = 0;
+        nodata_logged[h] = false;
+        emitted_power_cycle_count[h] = 0;
+        dashboard_metrics[h].Reset();
+      }
       ever_seen[h] = true;
-      strncpy(last_bcode[h], ls.broadcast_code, kBdCodeSize);
+      strncpy(last_bcode[h], observed_bcode, kBdCodeSize);
       last_bcode[h][kBdCodeSize] = '\0';
     }
     /** Skip handles that have never connected; but keep showing a lidar once
@@ -460,29 +604,22 @@ void StatsTimerCb(const ros::TimerEvent &) {
     if (!ever_seen[h]) {
       continue;
     }
-    any = true;
+    /** The SDK connect callback updates LinkStat and LidarDevice in separate
+     *  critical sections.  Recovery commands require both snapshots to name
+     *  the same non-empty physical identity; during the split transition we
+     *  intentionally skip one watchdog tick instead of targeting a stale or
+     *  newly reused handle. */
+    const bool watchdog_identity_matches =
+        info.broadcast_code[0] != '\0' && ls.broadcast_code[0] != '\0' &&
+        strncmp(info.broadcast_code, ls.broadcast_code, kBdCodeSize) == 0;
+    const bool watchdog_connected =
+        sdk_connected && ls.connect_since_ns != 0 &&
+        watchdog_identity_matches;
     uint32_t disc = ls.disconnect_count;
     bool broadcast_recent =
         ls.last_broadcast_ns != 0 &&
         now_ns - ls.last_broadcast_ns <=
             LdsLidar::HandshakeBroadcastFreshNs();
-    /** "hb_lost" = heartbeat loss duration: how long the most recent heartbeat
-     *  outage lasted. Still down -> the still-growing down time; reconnected ->
-     *  duration of the last completed outage; never dropped -> "--". */
-    std::string hb_lost;
-    if (ls.last_disconnect_ns == 0) {
-      hb_lost = "--";
-    } else if (connected && ls.connect_since_ns) {
-      hb_lost = FmtDur(ls.connect_since_ns - ls.last_disconnect_ns);
-    } else {
-      hb_lost = FmtDur(now_ns - ls.last_disconnect_ns);
-    }
-    /** "heartbeat" = heartbeat maintained: how long the heartbeat link has been
-     *  up since the last (re)connect. NOT streaming/Normal time — a sleeping
-     *  lidar keeps its heartbeat, so this keeps counting through PowerSaving. */
-    std::string heartbeat = (connected && ls.connect_since_ns)
-                                ? FmtDur(now_ns - ls.connect_since_ns)
-                                : "--";
     ErrorMessage em;
     em.error_code = ls.health_code;
     const char *temp = TempStr(em.lidar_error_code.temp_status);
@@ -490,9 +627,6 @@ void StatsTimerCb(const ros::TimerEvent &) {
     const char *motor = MotorStr(em.lidar_error_code.motor_status);
     /** cumulative loss% since connect: total_loss / (total_recv + total_loss) */
     uint64_t tot = (uint64_t)st.receive_packet_count + st.loss_packet_count;
-    char losspct[12];
-    snprintf(losspct, sizeof(losspct), "%.2f%%",
-             tot ? (100.0 * st.loss_packet_count / tot) : 0.0);
     /** Extra fields the snapshot log wants (MotorStr also maps the 3-level
      *  system_status: 0/1/2 -> OK/WARN/ERR!). */
     unsigned dirty = em.lidar_error_code.dirty_warn;
@@ -500,18 +634,23 @@ void StatsTimerCb(const ros::TimerEvent &) {
     double loss_pct_d = tot ? (100.0 * st.loss_packet_count / tot) : 0.0;
     char line[256];
     bool publishing_now = false;
-    uint32_t row_recv = 0;
-    uint32_t row_drop = 0;
+    uint64_t row_recv = 0;
     const char *row_state = "?";
-    if (connected) {
-      row_recv = (uint32_t)(st.receive_packet_count - prev_recv[h]);
-      uint32_t d_pub = (uint32_t)(st.publish_packet_count - prev_pub[h]);
-      row_drop = (uint32_t)(st.queue_drop_count - prev_drop[h]);
+    if (watchdog_connected) {
+      const bool new_connection =
+          connection_generation != prev_connection_generation[h];
+      row_recv = (new_connection || st.receive_packet_count < prev_recv[h])
+                     ? st.receive_packet_count
+                     : st.receive_packet_count - prev_recv[h];
+      uint64_t d_pub =
+          (new_connection || st.publish_packet_count < prev_pub[h])
+              ? st.publish_packet_count
+              : st.publish_packet_count - prev_pub[h];
       publishing_now =
           (connect_state == kConnectStateSampling && d_pub > 0);
       prev_recv[h] = st.receive_packet_count;
       prev_pub[h] = st.publish_packet_count;
-      prev_drop[h] = st.queue_drop_count;
+      prev_connection_generation[h] = connection_generation;
 
       /** Watch "should be DELIVERING points but is not" -- keyed on published
        *  packets, not received ones. A lidar stuck mid-configure keeps
@@ -652,10 +791,12 @@ void StatsTimerCb(const ros::TimerEvent &) {
               config_secs[h] = 0;
               ROS_WARN("[LivoxRecover] Lidar[%d] stuck in Config %us -> "
                        "reboot (attempt %u/%u)", h, stuck_secs,
-                       config_reboots[h], kConfigRebootMaxAttempts);
+                       static_cast<unsigned>(config_reboots[h]),
+                       kConfigRebootMaxAttempts);
               char rb[48];
               snprintf(rb, sizeof(rb), "Config %us attempt %u/%u",
-                       stuck_secs, config_reboots[h],
+                       stuck_secs,
+                       static_cast<unsigned>(config_reboots[h]),
                        kConfigRebootMaxAttempts);
               hlog.LogEvent(h, last_bcode[h], "REBOOT", rb);
             } else {
@@ -713,11 +854,14 @@ void StatsTimerCb(const ros::TimerEvent &) {
               }
               error_reboots[h]++;
               ROS_WARN("[LivoxRecover] Lidar[%d] in Error %us -> reboot "
-                       "(attempt %u/%u)", h, error_secs[h], error_reboots[h],
+                       "(attempt %u/%u)", h, error_secs[h],
+                       static_cast<unsigned>(error_reboots[h]),
                        kErrorRebootMaxAttempts);
               char rb[40];
-              snprintf(rb, sizeof(rb), "Error %us attempt %u/%u", error_secs[h],
-                       error_reboots[h], kErrorRebootMaxAttempts);
+              snprintf(rb, sizeof(rb), "Error %us attempt %u/%u",
+                       error_secs[h],
+                       static_cast<unsigned>(error_reboots[h]),
+                       kErrorRebootMaxAttempts);
               hlog.LogEvent(h, last_bcode[h], "REBOOT", rb);
             } else {
               ROS_WARN("[LivoxRecover] Lidar[%d] Error reboot was not "
@@ -732,10 +876,14 @@ void StatsTimerCb(const ros::TimerEvent &) {
         }
       }
 
-      /** (A) Flag a connected-but-silent lidar loudly instead of "Normal". */
-      row_state = (connect_state == kConnectStateConfig)
-                      ? "Config"
-                      : LidarStateStr(info.state);
+      /** A real firmware Error outranks the host-side Config phase.  Showing
+       *  Config first would hide the fault and incorrectly classify a lidar
+       *  whose error recovery budget is already running as RECOVERING. */
+      row_state = info.state == kLidarStateError
+                      ? "Error"
+                      : connect_state == kConnectStateConfig
+                            ? "Config"
+                            : LidarStateStr(info.state);
       if (should_stream && nodata_secs[h] >= kNoDataLogSec) {
         row_state = "NO DATA";
       }
@@ -745,7 +893,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
                          st.queue_drop_count, loss_pct_d, disc);
       }
     } else {
-      prev_recv[h] = prev_pub[h] = prev_drop[h] = 0;
+      prev_recv[h] = prev_pub[h] = 0;
+      prev_connection_generation[h] = connection_generation;
       zero_secs[h] = 0;
       nodata_secs[h] = 0;
       recover_stage[h] = 0;
@@ -793,191 +942,296 @@ void StatsTimerCb(const ros::TimerEvent &) {
     }
     const char *publish_bcode =
         ls.broadcast_code[0] ? ls.broadcast_code : last_bcode[h];
-    PublishRecoveryState(h, publish_bcode, connected, connect_state,
-                         info.state, ls, broadcast_recent, publishing_now,
+    const std::string dashboard_bcode(publish_bcode);
+    const bool identity_matches =
+        info.broadcast_code[0] != '\0' && !dashboard_bcode.empty() &&
+        strncmp(info.broadcast_code, dashboard_bcode.c_str(), kBdCodeSize) == 0;
+    /** Connect/disconnect callbacks update LinkStat before LidarDevice.  Require
+     *  both snapshots (and their identities) to agree, so the dashboard and
+     *  recovery-state topic never emit an impossible NORMAL + link_up=-- frame. */
+    const bool dashboard_connected =
+        sdk_connected && ls.connect_since_ns != 0 && identity_matches;
+    PublishRecoveryState(h, publish_bcode, dashboard_connected, connect_state,
+                         info.state, ls, broadcast_recent,
+                         dashboard_connected && publishing_now,
                          st.publish_packet_count);
     if (publish_power_edge) {
       PublishPowerCycleRequest(h, publish_bcode, ls, broadcast_recent);
       emitted_power_cycle_count[h] = ls.power_cycle_required_count;
     }
-    /** Format both row variants only after the final live LinkStat snapshot, so
-     *  HS_timeout and the Handshake footer cannot disagree by one callback in
-     *  the same 1 Hz dashboard frame. */
-    disc = ls.disconnect_count;
-    if (connected) {
-      snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-20s  %-4s  %-4s  %-4s  %6u  %7s  %6u   %4u  %10u  %8s  %9s\n",
-               h, last_bcode[h], row_state, temp, fan, motor, row_recv, losspct,
-               row_drop, disc, ls.handshake_timeout_count, hb_lost.c_str(),
-               heartbeat.c_str());
+    /** Build every user-visible status from the same final LinkStat snapshot.
+     *  The rolling metrics and labels below are display-only and never feed
+     *  watchdog or relay decisions. */
+    /** Link-derived durations must be computed after the final LinkStat copy,
+     *  otherwise NOW/HS60 and link_up can disagree within one dashboard frame. */
+    std::string outage_duration;
+    if (ls.last_disconnect_ns == 0) {
+      outage_duration = "--";
+    } else if (dashboard_connected) {
+      outage_duration =
+          FmtDur(ls.connect_since_ns - ls.last_disconnect_ns);
     } else {
-      const char *offline_state = "DISCONNECTED";
-      if (broadcast_recent &&
-          ls.handshake_state != LdsLidar::kHandshakeLinkIdle) {
-        offline_state = HandshakeStateStr(ls.handshake_state);
+      outage_duration = FmtDur(now_ns - ls.last_disconnect_ns);
+    }
+    /** Link uptime is heartbeat uptime, not point-streaming uptime; it remains
+     *  valid while a connected lidar is intentionally sleeping. */
+    const std::string link_up = dashboard_connected
+                                     ? FmtDur(now_ns - ls.connect_since_ns)
+                                     : "--";
+    const std::string health_tags =
+        dashboard_connected ? CurrentHealthTags(ls.health_code) : "-";
+    const std::string health_cell =
+        health_tags.size() <= 10 ? health_tags : "MULTI";
+    const std::string display_state =
+        DashboardNowState(dashboard_connected, broadcast_recent, row_state, ls);
+
+    DashboardCounters dashboard_counters;
+    dashboard_counters.received_packets = st.receive_packet_count;
+    dashboard_counters.lost_packets = st.loss_packet_count;
+    dashboard_counters.queue_drops = st.queue_drop_count;
+    dashboard_counters.handshake_ack_attempts = ls.handshake_success_count;
+    dashboard_counters.handshake_timeout_attempts =
+        ls.handshake_timeout_count;
+    dashboard_counters.handshake_rejected_attempts =
+        ls.handshake_rejected_count;
+    dashboard_counters.handshake_network_attempts =
+        ls.handshake_network_error_count;
+    dashboard_counters.handshake_protocol_attempts =
+        ls.handshake_protocol_error_count;
+    dashboard_counters.disconnect_episodes = ls.disconnect_count;
+    dashboard_counters.handshake_stuck_episodes = ls.handshake_stuck_count;
+    dashboard_counters.power_reached_episodes =
+        ls.power_cycle_required_episode_count;
+    dashboard_counters.power_request_edges =
+        ls.power_cycle_required_count;
+    dashboard_counters.fault_episodes = ls.fault_count;
+    dashboard_counters.reboot_actions = ls.recover_reboot_count;
+    dashboard_counters.mode_fail_episodes = ls.mode_fail_count;
+    const DashboardWindow window = dashboard_metrics[h].Update(
+        dashboard_bcode, connection_generation, now_ns, dashboard_counters);
+
+    DashboardLiveSignals live_signals;
+    const bool handshake_incident =
+        display_state == "HANDSHAKE_STUCK" ||
+        display_state == "POWER_CYCLE_REQUIRED";
+    const bool config_exhausted =
+        display_state == "CONFIG" && g_auto_recover &&
+        config_reboots[h] >= kConfigRebootMaxAttempts;
+    const bool current_incident =
+        display_state == "DISCONNECTED" || display_state == "NO_DATA" ||
+        display_state == "ERROR" || display_state == "?" ||
+        handshake_incident || config_exhausted ||
+        (dashboard_connected && health_tags != "OK");
+    live_signals.incident_active = current_incident;
+    live_signals.recovery_active =
+        display_state == "BROADCAST_ONLY" ||
+        (display_state == "CONFIG" && !config_exhausted) ||
+        display_state == "INIT" ||
+        (display_state == "NORMAL" && !publishing_now);
+    live_signals.intentionally_idle =
+        display_state == "POWER_SAVING" || display_state == "STANDBY";
+    const DashboardTrend trend = EvaluateTrend(window, live_signals);
+    trend_count[static_cast<unsigned>(trend)]++;
+    known_count++;
+
+    char loss60_text[16];
+    const std::string recv_cell =
+        dashboard_connected ? DashboardCountCell(row_recv, 6) : "-";
+    const std::string id_cell = DashboardCountCell(h, 2);
+    const std::string qdrop_cell =
+        DashboardCountCell(window.queue_drops_60s, 7);
+    const std::string hs60_cell =
+        DashboardCountCell(window.handshake_timeout_60s, 5);
+    if (window.loss_60s_has_data) {
+      snprintf(loss60_text, sizeof(loss60_text), "%.2f%%",
+               window.loss_60s_percent);
+    } else {
+      snprintf(loss60_text, sizeof(loss60_text), "--");
+    }
+    snprintf(line, sizeof(line), kDashboardRowFormat, id_cell.c_str(),
+             dashboard_bcode.c_str(), display_state.c_str(),
+             DashboardTrendName(trend), recv_cell.c_str(), loss60_text,
+             qdrop_cell.c_str(), health_cell.c_str(), link_up.c_str(),
+             hs60_cell.c_str());
+    table << line;
+
+    if (current_incident) {
+      any_active_alert = true;
+      const bool critical =
+          display_state == "POWER_CYCLE_REQUIRED";
+      active_alerts << "  " << (critical ? "[CRIT]" : "[ALERT]") << " L"
+                    << static_cast<unsigned>(h) << " " << dashboard_bcode
+                    << " " << display_state;
+      if (handshake_incident && ls.broadcast_only_since_ns != 0) {
+        active_alerts << " age="
+                      << FmtDur(now_ns - ls.broadcast_only_since_ns) << "\n";
+        active_alerts << "    handshake: broadcast=alive; reset="
+                      << HandshakeResetPhaseStr(ls.handshake_reset_phase);
+        if (!g_auto_recover) {
+          active_alerts << "; detection only; session reset disabled";
+        } else if (ls.handshake_reset_phase ==
+                       LdsLidar::kHandshakeResetRequested ||
+                   ls.handshake_reset_phase ==
+                       LdsLidar::kHandshakeResetQueued) {
+          active_alerts << "; waiting SDK RESET completion";
+        } else if (ls.handshake_reset_phase ==
+                   LdsLidar::kHandshakeResetRejected) {
+          active_alerts << "; hard-power escalation blocked";
+        } else if (display_state == "POWER_CYCLE_REQUIRED") {
+          active_alerts << "; power-cycle request published; see POWER "
+                           "RECOVERY manager";
+        } else if (ls.handshake_reset_phase ==
+                   LdsLidar::kHandshakeResetCompleted) {
+          active_alerts << "; post-reset observation";
+        }
+        active_alerts << "\n";
+      } else if (display_state == "DISCONNECTED") {
+        active_alerts << "\n    link: broadcast=absent; outage="
+                      << outage_duration << "\n";
+      } else if (display_state == "NO_DATA") {
+        const char *stage = recover_stage[h] == 0
+                                ? "monitoring"
+                                : recover_stage[h] == 1
+                                      ? "restart-sampling sent"
+                                      : "reboot sent";
+        active_alerts << "\n    stream: silent=" << nodata_secs[h]
+                      << "s; recovery=" << stage << "\n";
+      } else if (display_state == "ERROR") {
+        active_alerts << "\n    error: age=" << error_secs[h]
+                      << "s; reboot actions this episode="
+                      << static_cast<unsigned>(error_reboots[h]) << "/"
+                      << kErrorRebootMaxAttempts
+                       << "; auto-recover=" << (g_auto_recover ? "on" : "off")
+                       << "\n";
+      } else if (config_exhausted) {
+        active_alerts << "\n    config: reboot budget exhausted "
+                      << static_cast<unsigned>(config_reboots[h]) << "/"
+                      << kConfigRebootMaxAttempts
+                      << "; manual check required\n";
+      } else {
+        active_alerts << "\n";
       }
-      snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-20s  %-4s  %-4s  %-4s  %6s  %7s  %6s   %4u  %10u  %8s  %9s\n",
-               h, last_bcode[h], offline_state, "-", "-", "-", "-", losspct,
-               "-", disc, ls.handshake_timeout_count, hb_lost.c_str(),
-               heartbeat.c_str());
+      if (dashboard_connected && health_tags != "OK") {
+        active_alerts << "    hardware: " << health_tags << "\n";
+      }
+      if (ls.handshake_event_valid && handshake_incident) {
+        active_alerts << "    last SDK event: "
+                      << HandshakeEventStr(ls.last_handshake_event)
+                      << "; detail=" << ls.last_handshake_detail << "\n";
+      }
     }
-    ss << line;
-  }
-  if (!any) {
-    ss << "(no lidar seen yet)\n";
-  }
 
-  /** Temp-change footer: only list lidars that actually changed temp state,
-   *  otherwise a single plain "all normal" note. */
-  std::string temp_note;
-  for (uint8_t h = 0; h < kMaxLidarCount; h++) {
-    if (!ever_seen[h]) {
-      continue;
-    }
-    LdsLidar::LinkStat &ls = link_snapshot[h];
-    if (ls.temp_change_count > 0) {
-      char buf[80];
-      snprintf(buf, sizeof(buf), "  lidar %d: %u time(s), last at %s", h,
-               ls.temp_change_count, FmtWall(ls.temp_change_wall_s).c_str());
-      temp_note += buf;
-    }
-  }
-  if (temp_note.empty()) {
-    ss << "Temp changes: none (all lidars normal since start)\n";
-  } else {
-    ss << "Temp changes:" << temp_note << "\n";
-  }
-
-  /** Fault-event footer: motor/fan/volt/fw/system faults since start, kept
-   *  even after the lidar recovers (live columns only show current state). */
-  std::string fault_note;
-  for (uint8_t h = 0; h < kMaxLidarCount; h++) {
-    if (!ever_seen[h]) {
-      continue;
-    }
-    LdsLidar::LinkStat &ls = link_snapshot[h];
-    if (ls.fault_count > 0) {
-      char buf[96];
-      snprintf(buf, sizeof(buf), "  lidar %d: %u time(s) (%s), last at %s", h,
-               ls.fault_count, FaultTags(ls.fault_code).c_str(),
-               FmtWall(ls.fault_wall_s).c_str());
-      fault_note += buf;
-    }
-  }
-  if (fault_note.empty()) {
-    ss << "Fault events: none (no motor/fan/dirty/volt/fw/system fault since "
-          "start)\n";
-  } else {
-    ss << "Fault events:" << fault_note << "\n";
-  }
-
-  /** Auto-recover footer: watchdog reboots issued (only shown when non-zero,
-   *  so it stays hidden unless auto_recover actually acted). */
-  std::string rec_note;
-  for (uint8_t h = 0; h < kMaxLidarCount; h++) {
-    if (!ever_seen[h]) {
-      continue;
-    }
-    LdsLidar::LinkStat &ls = link_snapshot[h];
-    if (ls.recover_reboot_count > 0) {
-      char buf[80];
-      snprintf(buf, sizeof(buf), "  lidar %d: %u reboot(s), last at %s", h,
-               ls.recover_reboot_count, FmtWall(ls.recover_last_wall_s).c_str());
-      rec_note += buf;
-    }
-  }
-  if (!rec_note.empty()) {
-    ss << "Auto-recover:" << rec_note << "\n";
-  }
-
-  /** Broadcast/handshake footer. It contains both the active episode duration
-   *  and persistent counters, so a successful reconnect does not erase the
-   *  evidence that local session recovery was needed. */
-  bool handshake_heading = false;
-  for (uint8_t h = 0; h < kMaxLidarCount; h++) {
-    if (!ever_seen[h]) {
-      continue;
-    }
-    LdsLidar::LinkStat &ls = link_snapshot[h];
-    bool active = ls.handshake_state != LdsLidar::kHandshakeLinkIdle;
-    bool history = ls.handshake_reset_count != 0 ||
-                   ls.handshake_reset_fail_count != 0 ||
-                   ls.handshake_stuck_count != 0 ||
-                   ls.power_cycle_required_count != 0 ||
-                   ls.handshake_timeout_count != 0 ||
-                   ls.handshake_rejected_count != 0 ||
-                   ls.handshake_network_error_count != 0 ||
-                   ls.handshake_protocol_error_count != 0;
-    if (!active && !history) {
-      continue;
-    }
-    if (!handshake_heading) {
-      ss << "Handshake recovery:\n";
-      handshake_heading = true;
-    }
-    std::string duration =
-        (active && ls.broadcast_only_since_ns != 0)
-            ? FmtDur(now_ns - ls.broadcast_only_since_ns)
-            : "--";
-    ss << "  lidar " << static_cast<unsigned>(h) << ": "
-       << HandshakeStateStr(ls.handshake_state) << " " << duration
-       << ", reset-phase="
-       << HandshakeResetPhaseStr(ls.handshake_reset_phase)
-       << ", reset-request "
-       << static_cast<unsigned>(ls.handshake_reset_attempts)
-       << "/" << static_cast<unsigned>(LdsLidar::HandshakeResetMaxAttempts())
-       << " (queued total=" << ls.handshake_reset_count
-       << ", rejected=" << ls.handshake_reset_fail_count << ")"
-       << ", stuck=" << ls.handshake_stuck_count
-       << ", power-alert=" << ls.power_cycle_required_count;
-    if (active && !g_auto_recover) {
-      ss << ", auto-reset=disabled";
-    }
-    ss << "\n";
-    if (ls.handshake_event_valid) {
-      ss << "    last=" << HandshakeEventStr(ls.last_handshake_event)
-         << " detail=" << ls.last_handshake_detail
-         << " ip=" << (ls.last_handshake_ip[0] ? ls.last_handshake_ip : "?")
-         << "\n";
-    }
-    if (ls.handshake_timeout_count != 0 ||
+    const bool handshake_history =
+        ls.handshake_reset_count != 0 ||
+        ls.handshake_reset_fail_count != 0 ||
+        ls.handshake_stuck_count != 0 ||
+        ls.power_cycle_required_episode_count != 0 ||
+        ls.power_cycle_required_count != 0 ||
+        ls.handshake_timeout_count != 0 ||
         ls.handshake_rejected_count != 0 ||
         ls.handshake_network_error_count != 0 ||
-        ls.handshake_protocol_error_count != 0) {
-      /** ACK only means the handshake reply was accepted; DeviceInfo/public
-       *  Connect may still be pending, so deliberately do not label it
-       *  "success".  All values reset only when this Driver process restarts. */
-      ss << "    sdk-events(proc): ack=" << ls.handshake_success_count
-         << ", timeout=" << ls.handshake_timeout_count
-         << ", rejected=" << ls.handshake_rejected_count
-         << ", network=" << ls.handshake_network_error_count
-         << ", protocol=" << ls.handshake_protocol_error_count << "\n";
+        ls.handshake_protocol_error_count != 0;
+    const bool has_history =
+        ls.disconnect_count != 0 || ls.temp_change_count != 0 ||
+        ls.fault_count != 0 || ls.recover_reboot_count != 0 ||
+        ls.mode_fail_count != 0 || handshake_history;
+    if (has_history) {
+      any_process_history = true;
+      process_history << "  L" << static_cast<unsigned>(h) << " "
+                      << dashboard_bcode << ":\n";
+      if (ls.disconnect_count != 0) {
+        process_history << "    link: disconnect episodes="
+                        << ls.disconnect_count << "; outage duration="
+                        << outage_duration << "; current link up=" << link_up
+                        << "\n";
+      }
+      if (handshake_history) {
+        process_history << "    handshake attempts (SDK): ACK="
+                        << ls.handshake_success_count
+                        << " timeout=" << ls.handshake_timeout_count
+                        << " rejected=" << ls.handshake_rejected_count
+                        << "\n";
+        process_history << "      network="
+                        << ls.handshake_network_error_count
+                        << " protocol=" << ls.handshake_protocol_error_count
+                        << "\n";
+        process_history << "    handshake failure episodes: stuck="
+                        << ls.handshake_stuck_count
+                        << "; escalated-to-power="
+                        << ls.power_cycle_required_episode_count
+                        << " (subset of stuck)\n";
+        process_history << "    POWER_CYCLE_REQUIRED entries="
+                        << ls.power_cycle_required_count
+                        << " (may repeat within one episode)\n";
+        process_history << "    session reset actions: accepted="
+                        << ls.handshake_reset_count
+                        << "; rejected=" << ls.handshake_reset_fail_count
+                        << "\n";
+        if (ls.last_handshake_event_wall_s != 0) {
+          process_history << "    last SDK event: "
+                          << HandshakeEventStr(ls.last_handshake_event)
+                          << " detail=" << ls.last_handshake_detail
+                          << " ip="
+                          << (ls.last_handshake_ip[0]
+                                  ? ls.last_handshake_ip
+                                  : "?")
+                          << " at=" << FmtWall(ls.last_handshake_event_wall_s)
+                          << "\n";
+        }
+      }
+      if (ls.fault_count != 0) {
+        process_history << "    hardware fault episodes=" << ls.fault_count
+                        << "; tags=" << FaultTags(ls.fault_code)
+                        << "; last=" << FmtWall(ls.fault_wall_s) << "\n";
+      }
+      if (ls.temp_change_count != 0) {
+        process_history << "    temperature state changes="
+                        << ls.temp_change_count
+                        << "; last=" << FmtWall(ls.temp_change_wall_s)
+                        << "\n";
+      }
+      if (ls.recover_reboot_count != 0) {
+        process_history << "    automatic reboot actions="
+                        << ls.recover_reboot_count
+                        << ", last=" << FmtWall(ls.recover_last_wall_s)
+                        << "\n";
+      }
+      if (ls.mode_fail_count != 0) {
+        process_history << "    mode failures: total=" << ls.mode_fail_count
+                        << "; last-mode="
+                        << DashboardModeName(ls.mode_fail_mode)
+                        << ", last=" << FmtWall(ls.mode_fail_wall_s) << "\n";
+      }
     }
   }
 
-  /** Mode-switch footer: requests that failed after all bounded retries
-   *  (only shown when non-zero). Surfaces the "manual check needed"
-   *  alert on the dashboard so it is not missed in the scrolling log. */
-  std::string mode_note;
-  for (uint8_t h = 0; h < kMaxLidarCount; h++) {
-    if (!ever_seen[h]) {
-      continue;
-    }
-    LdsLidar::LinkStat &ls = link_snapshot[h];
-    if (ls.mode_fail_count > 0) {
-      const char *m = (ls.mode_fail_mode == 1)
-                          ? "Normal"
-                          : (ls.mode_fail_mode == 3) ? "Standby"
-                                                    : "PowerSaving";
-      char buf[96];
-      snprintf(buf, sizeof(buf), "  lidar %d: %s FAILED %u time(s), last at %s",
-               h, m, ls.mode_fail_count, FmtWall(ls.mode_fail_wall_s).c_str());
-      mode_note += buf;
-    }
+  std::ostringstream ss;
+  ss << "===== Livox LiDAR Status (1 Hz) =====\n";
+  ss << "SUMMARY: known=" << known_count
+     << " | ATTENTION: ACTIVE=" << trend_count[kDashboardTrendActive]
+     << " UNSTABLE=" << trend_count[kDashboardTrendUnstable]
+     << " WATCH=" << trend_count[kDashboardTrendWatch]
+     << " | TRANSITION: RECOVERING="
+     << trend_count[kDashboardTrendRecovering]
+     << " OBSERVE=" << trend_count[kDashboardTrendObserve]
+     << " | OK: STABLE=" << trend_count[kDashboardTrendStable]
+     << " IDLE=" << trend_count[kDashboardTrendIdle] << "\n";
+  if (any_active_alert) {
+    ss << "ACTIVE ALERTS:\n" << active_alerts.str();
+  } else {
+    ss << "ACTIVE ALERTS: none\n";
   }
-  if (!mode_note.empty()) {
-    ss << "Mode switch:" << mode_note << "\n";
+  ss << "LEGEND: loss60=point-packet loss; qdrop60=local queue drops; "
+        "HS60=SDK timeout attempts, not incidents (last 60s)\n";
+  ss << "TREND: repeated episodes/actions use last 10m; PROCESS HISTORY is "
+        "Driver-process cumulative only\n";
+  ss << table.str();
+  if (known_count == 0) {
+    ss << "(no lidar seen yet)\n";
+  }
+  if (any_process_history) {
+    ss << "PROCESS HISTORY (Driver process; resets on restart; not current alarms):\n"
+       << process_history.str();
   }
 
   std_msgs::String msg;

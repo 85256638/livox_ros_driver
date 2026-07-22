@@ -78,6 +78,9 @@ class LdsLidar : public Lds {
    *  request. Thread-safe; used by recovery code to avoid fighting a planned
    *  mode transition. */
   bool IsModeTransitionActive(uint8_t handle);
+  /** Read-only session identity for dashboard snapshots.  Callers which also
+   *  copy LidarDevice should load this while holding data_lock_[handle]. */
+  uint64_t GetConnectionGeneration(uint8_t handle) const;
   /** Reclaim callback contexts after the paired SDK has completed/cancelled
    *  them and a grace period has elapsed. */
   void ReapCommandContexts();
@@ -109,6 +112,14 @@ class LdsLidar : public Lds {
     int64_t last_disconnect_ns = 0;  /**< steady_clock ns, 0 = never */
     int64_t connect_since_ns = 0;    /**< steady_clock ns, 0 = not connected */
     uint32_t health_code = 0;        /**< latest LidarErrorCode bits (temp/fan/...) */
+    /** Edge-detection baselines belong to this physical broadcast code.  Keep
+     *  them in LinkStat so handle reassignment resets them together with the
+     *  public health history instead of leaking static per-handle state. */
+    bool health_temp_seen = false;
+    uint8_t health_prev_temp = 0;
+    bool health_prev_fault = false;
+    bool health_watch_seen = false;
+    uint32_t health_last_watch = 0;
     uint32_t temp_change_count = 0;  /**< times temp_status changed since start */
     int64_t temp_change_wall_s = 0;  /**< wall-clock (time_t) of last temp change, 0=never */
     uint32_t fault_count = 0;        /**< times entered a motor/fan/volt/fw/system fault */
@@ -139,7 +150,17 @@ class LdsLidar : public Lds {
     int64_t handshake_last_reset_wall_s = 0;
     uint32_t handshake_stuck_count = 0;   /**< episodes reaching STUCK */
     int64_t handshake_stuck_wall_s = 0;
+    /** Committed entries into POWER_CYCLE_REQUIRED.  A NETWORK_ERROR can
+     *  cancel an entry before its request is published and allow a later
+     *  re-entry in the same episode, so this is a transition sequence rather
+     *  than an incident count. */
     uint32_t power_cycle_required_count = 0;
+    /** Number of distinct broadcast-only episodes which reached
+     *  POWER_CYCLE_REQUIRED at least once. */
+    uint32_t power_cycle_required_episode_count = 0;
+    /** Per-episode latch preventing a cancelled/re-offered edge from being
+     *  counted as another distinct failure episode. */
+    bool power_cycle_required_counted_this_episode = false;
     int64_t power_cycle_required_wall_s = 0;
     /** Exact reason from the paired SDK's handshake diagnostics. A handshake
      *  ACK is not a public kEventConnect: DeviceInfo may still be pending, so

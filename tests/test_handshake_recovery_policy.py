@@ -69,10 +69,9 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
     def test_dashboard_has_episode_reset_phase_and_locked_publish_recheck(self):
         self.assertIn("enum HandshakeResetPhase", HEADER)
         self.assertIn("handshake_reset_phase", HEADER)
-        self.assertIn('<< ", reset-phase="', DRIVER)
         publish = DRIVER[
             DRIVER.index("const int64_t expected_power_episode") :
-            DRIVER.index("ss << line;")
+            DRIVER.index("/** Build every user-visible status")
         ]
         self.assertIn("link_stat_lock_[h]", publish)
         self.assertIn(
@@ -81,33 +80,249 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         self.assertIn(
             "live.power_cycle_required_count == expected_power_count", publish
         )
+        self.assertIn("ls = live", publish)
 
-    def test_dashboard_surfaces_per_lidar_handshake_timeout_history(self):
+        alerts = DRIVER[
+            DRIVER.index("if (current_incident)") :
+            DRIVER.index("const bool handshake_history")
+        ]
+        self.assertIn("HandshakeResetPhaseStr(ls.handshake_reset_phase)", alerts)
+        self.assertIn("waiting SDK RESET completion", alerts)
+        self.assertIn("post-reset observation", alerts)
+
+    def test_dashboard_timeout_is_attempt_history_not_a_current_alarm(self):
         stats = DRIVER[
             DRIVER.index("void StatsTimerCb(") :
-            DRIVER.index("/** Temp-change footer:")
+            DRIVER.index("int main(")
         ]
-        self.assertIn("HS_timeout", stats)
-        final_rows = stats[
-            stats.index("/** Format both row variants only after") :
-            stats.index("ss << line;")
+        self.assertIn("HS60", stats)
+        self.assertIn(
+            "dashboard_counters.handshake_timeout_attempts =", stats
+        )
+        self.assertIn("ls.handshake_timeout_count", stats)
+        self.assertIn("handshake attempts (SDK): ACK=", stats)
+        self.assertIn(
+            "PROCESS HISTORY (Driver process; resets on restart; not current alarms)",
+            stats,
+        )
+
+        current_classification = stats[
+            stats.index("const bool handshake_incident") :
+            stats.index("const DashboardTrend trend")
         ]
-        self.assertIn("if (connected)", final_rows)
-        self.assertIn("} else {", final_rows)
-        # The final connected and disconnected render paths must both use the
-        # same live per-process timeout snapshot as the footer.
-        self.assertEqual(final_rows.count("ls.handshake_timeout_count"), 2)
+        self.assertNotIn("handshake_timeout_count", current_classification)
+
+    def test_dashboard_active_alerts_use_current_handshake_state(self):
+        stats = DRIVER[
+            DRIVER.index("void StatsTimerCb(") :
+            DRIVER.index("int main(")
+        ]
+        self.assertIn('" | ATTENTION: ACTIVE="', stats)
+        self.assertIn('" | TRANSITION: RECOVERING="', stats)
+        self.assertIn('" | OK: STABLE="', stats)
+        current_classification = stats[
+            stats.index("const bool handshake_incident") :
+            stats.index("const DashboardTrend trend")
+        ]
+        self.assertIn('display_state == "HANDSHAKE_STUCK"', current_classification)
+        self.assertIn(
+            'display_state == "POWER_CYCLE_REQUIRED"', current_classification
+        )
+        self.assertIn(
+            '(dashboard_connected && health_tags != "OK")',
+            current_classification,
+        )
+
+        alerts = stats[
+            stats.index("if (current_incident)") :
+            stats.index("const bool handshake_history")
+        ]
+        self.assertIn('display_state == "POWER_CYCLE_REQUIRED"', alerts)
+        self.assertIn("[CRIT]", alerts)
+        self.assertIn("[ALERT]", alerts)
+        self.assertRegex(
+            alerts,
+            re.compile(
+                r'"; power-cycle request published; see POWER "\s*'
+                r'"RECOVERY manager"'
+            ),
+        )
+
+    def test_dashboard_power_saving_is_intentionally_idle(self):
+        stats = DRIVER[
+            DRIVER.index("void StatsTimerCb(") :
+            DRIVER.index("int main(")
+        ]
+        current_classification = stats[
+            stats.index("const bool handshake_incident") :
+            stats.index("const DashboardTrend trend")
+        ]
+        current_incident = current_classification[
+            current_classification.index("const bool current_incident") :
+            current_classification.index("live_signals.recovery_active")
+        ]
+        self.assertNotIn("POWER_SAVING", current_incident)
+        self.assertNotIn("STANDBY", current_incident)
+        self.assertIn(
+            'display_state == "POWER_SAVING" || display_state == "STANDBY"',
+            current_classification,
+        )
+
+    def test_dashboard_separates_unique_power_episodes_from_request_edges(self):
+        stats = DRIVER[
+            DRIVER.index("void StatsTimerCb(") :
+            DRIVER.index("int main(")
+        ]
+        self.assertIn(
+            "dashboard_counters.handshake_stuck_episodes = ls.handshake_stuck_count",
+            stats,
+        )
+        self.assertIn(
+            "dashboard_counters.power_reached_episodes =", stats
+        )
+        self.assertIn("ls.power_cycle_required_episode_count", stats)
+        self.assertIn("dashboard_counters.power_request_edges =", stats)
+        self.assertIn("ls.power_cycle_required_count", stats)
+        self.assertIn('<< "    handshake failure episodes: stuck="', stats)
+        self.assertIn('<< "; escalated-to-power="', stats)
+        self.assertIn('<< " (subset of stuck)\\n"', stats)
+        self.assertIn('<< "    POWER_CYCLE_REQUIRED entries="', stats)
+        self.assertIn("may repeat within one episode", stats)
+        self.assertIn('<< "    session reset actions: accepted="', stats)
+
+    def test_unique_power_episode_latch_survives_network_cancellation(self):
+        self.assertIn("power_cycle_required_episode_count", HEADER)
+        self.assertIn("power_cycle_required_counted_this_episode", HEADER)
+        commit = CPP[
+            CPP.index("if (power_cycle_candidate)") :
+            CPP.index("if (!request_reset)")
+        ]
+        self.assertIn("s.power_cycle_required_count++", commit)
+        self.assertIn(
+            "if (!s.power_cycle_required_counted_this_episode)", commit
+        )
+        self.assertIn("s.power_cycle_required_episode_count++", commit)
+        cancellation = CPP[
+            CPP.index("if (status->event == kDeviceHandshakeNetworkError") :
+            CPP.index("if (status->event == kDeviceHandshakeReset")
+        ]
+        self.assertNotIn(
+            "power_cycle_required_counted_this_episode = false", cancellation
+        )
+
+    def test_handle_reuse_resets_link_history_and_dashboard_local_state(self):
+        broadcast = CPP[
+            CPP.index("void LdsLidar::OnLidarBroadcastEvent") :
+            CPP.index("void LdsLidar::TickHandshakeRecovery")
+        ]
+        self.assertIn("const bool identity_changed", broadcast)
+        self.assertIn("s = LinkStat();", broadcast)
+        stats = DRIVER[DRIVER.index("void StatsTimerCb(") : DRIVER.index("int main(")]
+        self.assertIn("const bool identity_changed", stats)
+        self.assertIn("dashboard_metrics[h].Reset()", stats)
+        self.assertIn("emitted_power_cycle_count[h] = 0", stats)
+
+    def test_dashboard_uses_generation_and_cross_snapshot_connection_gate(self):
+        stats = DRIVER[DRIVER.index("void StatsTimerCb(") : DRIVER.index("int main(")]
+        self.assertIn("GetConnectionGeneration(h)", stats)
+        self.assertIn("connection_generation != prev_connection_generation[h]", stats)
+        self.assertIn("const bool watchdog_identity_matches", stats)
+        self.assertIn("const bool watchdog_connected", stats)
+        self.assertIn("if (watchdog_connected)", stats)
+        self.assertIn("const bool dashboard_connected", stats)
+        self.assertIn("sdk_connected && ls.connect_since_ns != 0 && identity_matches", stats)
+        self.assertIn(
+            "dashboard_bcode, connection_generation, now_ns, dashboard_counters",
+            stats,
+        )
+
+    def test_handle_reuse_rejects_stale_callbacks_and_pending_commands(self):
+        handshake = CPP[
+            CPP.index("void LdsLidar::OnDeviceHandshake") :
+            CPP.index("void LdsLidar::OnDeviceBroadcast")
+        ]
+        self.assertIn("const bool status_has_identity", handshake)
+        self.assertIn("strncmp(s.broadcast_code, status->broadcast_code", handshake)
+
+        reset_result = CPP[
+            CPP.index("livox_status status = ResetLidarHandshakeSession") :
+            CPP.index("char detail[80]", CPP.index("livox_status status = ResetLidarHandshakeSession"))
+        ]
+        self.assertIn("const bool same_identity", reset_result)
+        self.assertIn("if (same_identity)", reset_result)
+
+        remember = CPP[
+            CPP.index("void LdsLidar::RememberBroadcastCode") :
+            CPP.index("bool LdsLidar::ResetModeRequestIfTarget")
+        ]
+        self.assertLess(
+            remember.index("lock_guard<mutex> send_lock(mode_send_mutex_[handle])"),
+            remember.index("lock_guard<mutex> lock(mode_mutex_)"),
+        )
+        self.assertIn("request = ModeChangeRequest();", remember)
+
+        health = CPP[
+            CPP.index("void LdsLidar::LidarErrorStatusCb") :
+            CPP.index("void LdsLidar::ControlFanCb")
+        ]
+        self.assertIn("connection_generation", health)
+        self.assertIn("link.health_temp_seen", health)
+        self.assertNotIn("static uint8_t prev_temp", health)
+        self.assertNotIn("static bool prev_fault", health)
+
+    def test_mode_failure_history_labels_total_and_last_mode(self):
+        stats = DRIVER[DRIVER.index("void StatsTimerCb(") : DRIVER.index("int main(")]
+        self.assertIn('"    mode failures: total="', stats)
+        self.assertIn('<< "; last-mode="', stats)
+
+    def test_error_outranks_config_and_exhausted_config_is_active(self):
+        stats = DRIVER[DRIVER.index("void StatsTimerCb(") : DRIVER.index("int main(")]
+        self.assertIn("row_state = info.state == kLidarStateError", stats)
+        self.assertIn("const bool config_exhausted", stats)
+        current = stats[
+            stats.index("const bool current_incident") :
+            stats.index("const DashboardTrend trend")
+        ]
+        self.assertIn("handshake_incident || config_exhausted", current)
+        self.assertIn('display_state == "CONFIG" && !config_exhausted', current)
+
+    def test_process_history_keeps_last_sdk_event_after_reconnect(self):
+        stats = DRIVER[DRIVER.index("void StatsTimerCb(") : DRIVER.index("int main(")]
+        history = stats[
+            stats.index("const bool handshake_history") :
+            stats.index("if (ls.fault_count != 0)")
+        ]
+        self.assertIn("if (ls.last_handshake_event_wall_s != 0)", history)
+        self.assertIn("FmtWall(ls.last_handshake_event_wall_s)", history)
 
     def test_dashboard_contextualizes_timeout_with_sdk_event_breakdown(self):
-        self.assertIn('"    sdk-events(proc): ack="', DRIVER)
-        self.assertIn('<< ", timeout=" << ls.handshake_timeout_count', DRIVER)
-        self.assertIn('<< ", rejected=" << ls.handshake_rejected_count', DRIVER)
-        self.assertIn('<< ", network=" << ls.handshake_network_error_count', DRIVER)
-        self.assertIn('<< ", protocol=" << ls.handshake_protocol_error_count', DRIVER)
+        self.assertIn('"    handshake attempts (SDK): ACK="', DRIVER)
+        self.assertIn('<< " timeout=" << ls.handshake_timeout_count', DRIVER)
+        self.assertIn('<< " rejected=" << ls.handshake_rejected_count', DRIVER)
+        self.assertIn('<< "      network="', DRIVER)
+        self.assertIn("<< ls.handshake_network_error_count", DRIVER)
+        self.assertIn('<< " protocol=" << ls.handshake_protocol_error_count', DRIVER)
         self.assertIn('return "ACK(DeviceInfo pending)";', DRIVER)
         self.assertNotIn('return "SUCCESS(DeviceInfo pending)";', DRIVER)
         self.assertIn('return "ACK_DEVICEINFO_PENDING";', CPP)
         self.assertNotIn('return "SUCCESS_DEVICEINFO_PENDING";', CPP)
+
+    def test_dashboard_network_error_is_diagnostic_not_power_instruction(self):
+        self.assertIn('return "NETWORK_ERROR";', DRIVER)
+        stats = DRIVER[
+            DRIVER.index("void StatsTimerCb(") :
+            DRIVER.index("int main(")
+        ]
+        alerts = stats[
+            stats.index("if (current_incident)") :
+            stats.index("const bool handshake_history")
+        ]
+        self.assertIn(
+            'const bool critical =\n          display_state == "POWER_CYCLE_REQUIRED";',
+            alerts,
+        )
+        self.assertNotIn("kDeviceHandshakeNetworkError", alerts)
+        self.assertIn("last SDK event:", alerts)
 
 
 if __name__ == "__main__":
