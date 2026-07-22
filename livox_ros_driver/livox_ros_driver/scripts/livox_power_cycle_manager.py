@@ -77,6 +77,8 @@ _BROADCAST_CODE_RE = re.compile(r"^[A-Za-z0-9]{15}$")
 _POWER_GROUP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _LEGACY_COMMAND_HEADER = b"\xCC\xDD"
 _LEGACY_STATUS_HEADER = b"\xAA\xBB\xB0"
+_DEFAULT_OFF_SECONDS = 10.0
+_MINIMUM_OFF_SECONDS = 5.0
 
 
 class ConfigurationError(ValueError):
@@ -89,7 +91,9 @@ class RelayProtocolError(RuntimeError):
 
 @dataclass(frozen=True)
 class Policy:
-    off_seconds: float = 10.0
+    # Preserve the pre-fast-recovery value for callers and site configs that
+    # omit off_seconds.  New deployments opt in to five seconds explicitly.
+    off_seconds: float = _DEFAULT_OFF_SECONDS
     boot_timeout_seconds: float = 180.0
     healthy_seconds: float = 10.0
     minimum_cycle_interval_seconds: float = 1800.0
@@ -331,7 +335,11 @@ def _policy_from_json(data: Mapping[str, Any]) -> Policy:
     )
     policy = Policy(
         off_seconds=_number(
-            data, "off_seconds", default=10, minimum=2, maximum=120
+            data,
+            "off_seconds",
+            default=_DEFAULT_OFF_SECONDS,
+            minimum=_MINIMUM_OFF_SECONDS,
+            maximum=120,
         ),
         boot_timeout_seconds=_number(
             data, "boot_timeout_seconds", default=180, minimum=30, maximum=900
@@ -2933,12 +2941,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         print(
             "Configuration valid: mode=%s groups=%d enabled_groups=%d "
-            "members=%d state_db=%s"
+            "members=%d off_seconds=%g state_db=%s"
             % (
                 config.mode,
                 len(config.power_groups),
                 enabled_groups,
                 total_members,
+                config.policy.off_seconds,
                 config.state_db,
             )
         )

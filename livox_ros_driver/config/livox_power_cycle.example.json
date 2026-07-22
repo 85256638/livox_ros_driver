@@ -9,7 +9,7 @@
     "heartbeat": "/livox/power_cycle_heartbeat"
   },
   "policy": {
-    "off_seconds": 10,
+    "off_seconds": 5,
     "boot_timeout_seconds": 180,
     "healthy_seconds": 10,
     "minimum_cycle_interval_seconds": 1800,

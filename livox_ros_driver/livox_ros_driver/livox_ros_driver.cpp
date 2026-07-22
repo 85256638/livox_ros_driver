@@ -201,10 +201,26 @@ static const char *HandshakeStateStr(LdsLidar::HandshakeLinkState state) {
   }
 }
 
+static const char *HandshakeResetPhaseStr(
+    LdsLidar::HandshakeResetPhase phase) {
+  switch (phase) {
+    case LdsLidar::kHandshakeResetRequested:
+      return "requested";
+    case LdsLidar::kHandshakeResetQueued:
+      return "queued";
+    case LdsLidar::kHandshakeResetCompleted:
+      return "completed";
+    case LdsLidar::kHandshakeResetRejected:
+      return "rejected";
+    default:
+      return "none";
+  }
+}
+
 static const char *HandshakeEventStr(DeviceHandshakeEvent event) {
   switch (event) {
     case kDeviceHandshakeSuccess:
-      return "SUCCESS(DeviceInfo pending)";
+      return "ACK(DeviceInfo pending)";
     case kDeviceHandshakeTimeout:
       return "TIMEOUT";
     case kDeviceHandshakeRejected:
@@ -404,7 +420,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
   std::ostringstream ss;
   ss << "===== Livox LiDAR Stats (1Hz) =====\n";
   ss << "handle  broadcast_code   state                 temp  fan   motor recv/s  "
-        "loss%    drop/s   disc  HB_lost   heartbeat\n";
+        "loss%    drop/s   disc  HS_timeout  HB_lost   heartbeat\n";
   LdsLidar::LinkStat link_snapshot[kMaxLidarCount];
   bool any = false;
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
@@ -484,10 +500,13 @@ void StatsTimerCb(const ros::TimerEvent &) {
     double loss_pct_d = tot ? (100.0 * st.loss_packet_count / tot) : 0.0;
     char line[256];
     bool publishing_now = false;
+    uint32_t row_recv = 0;
+    uint32_t row_drop = 0;
+    const char *row_state = "?";
     if (connected) {
-      uint32_t d_recv = (uint32_t)(st.receive_packet_count - prev_recv[h]);
+      row_recv = (uint32_t)(st.receive_packet_count - prev_recv[h]);
       uint32_t d_pub = (uint32_t)(st.publish_packet_count - prev_pub[h]);
-      uint32_t d_drop = (uint32_t)(st.queue_drop_count - prev_drop[h]);
+      row_drop = (uint32_t)(st.queue_drop_count - prev_drop[h]);
       publishing_now =
           (connect_state == kConnectStateSampling && d_pub > 0);
       prev_recv[h] = st.receive_packet_count;
@@ -714,18 +733,14 @@ void StatsTimerCb(const ros::TimerEvent &) {
       }
 
       /** (A) Flag a connected-but-silent lidar loudly instead of "Normal". */
-      const char *st_str = (connect_state == kConnectStateConfig)
-                               ? "Config"
-                               : LidarStateStr(info.state);
+      row_state = (connect_state == kConnectStateConfig)
+                      ? "Config"
+                      : LidarStateStr(info.state);
       if (should_stream && nodata_secs[h] >= kNoDataLogSec) {
-        st_str = "NO DATA";
+        row_state = "NO DATA";
       }
-      snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-20s  %-4s  %-4s  %-4s  %6u  %7s  %6u   %4u  %8s  %9s\n",
-               h, last_bcode[h], st_str, temp, fan, motor, d_recv, losspct,
-               d_drop, disc, hb_lost.c_str(), heartbeat.c_str());
       if (do_snapshot) {
-        hlog.LogSnapshot(h, last_bcode[h], st_str, temp, fan, motor, dirty, sys,
+        hlog.LogSnapshot(h, last_bcode[h], row_state, temp, fan, motor, dirty, sys,
                          st.receive_packet_count, st.loss_packet_count,
                          st.queue_drop_count, loss_pct_d, disc);
       }
@@ -744,27 +759,68 @@ void StatsTimerCb(const ros::TimerEvent &) {
           ls.handshake_state != LdsLidar::kHandshakeLinkIdle) {
         offline_state = HandshakeStateStr(ls.handshake_state);
       }
-      snprintf(line, sizeof(line),
-               "%-6d  %-15s  %-20s  %-4s  %-4s  %-4s  %6s  %7s  %6s   %4u  %8s  %9s\n",
-               h, last_bcode[h], offline_state, "-", "-", "-", "-", losspct,
-               "-", disc, hb_lost.c_str(), heartbeat.c_str());
       if (do_snapshot) {
         hlog.LogSnapshot(h, last_bcode[h], offline_state, "-", "-", "-", 0, "-",
                          st.receive_packet_count, st.loss_packet_count,
                          st.queue_drop_count, loss_pct_d, disc);
       }
     }
-    /** Publish a compact, machine-readable state independently of the human
-     *  dashboard.  The relay manager uses current state as a second guard
-     *  against acting on a delayed or replayed request. */
-    PublishRecoveryState(h, last_bcode[h], connected, connect_state,
+    /** Revalidate a pending request from a freshly locked handle+episode
+     *  snapshot.  ROS publication happens after releasing the SDK callback
+     *  lock; the relay manager performs its own final live-state precheck for
+     *  any cancellation which races this immutable committed-edge snapshot. */
+    const int64_t expected_power_episode = ls.broadcast_only_since_ns;
+    const uint32_t expected_power_count = ls.power_cycle_required_count;
+    const bool expected_power_edge =
+        ls.handshake_state == LdsLidar::kHandshakeLinkPowerCycleRequired &&
+        expected_power_count > emitted_power_cycle_count[h];
+    bool publish_power_edge = false;
+    {
+      std::lock_guard<std::mutex> lock(g_read_lidar->link_stat_lock_[h]);
+      const LdsLidar::LinkStat &live = g_read_lidar->link_stat_[h];
+      broadcast_recent =
+          live.last_broadcast_ns != 0 &&
+          now_ns - live.last_broadcast_ns <=
+              LdsLidar::HandshakeBroadcastFreshNs();
+      publish_power_edge =
+          expected_power_edge &&
+          live.handshake_state ==
+              LdsLidar::kHandshakeLinkPowerCycleRequired &&
+          live.broadcast_only_since_ns == expected_power_episode &&
+          live.power_cycle_required_count == expected_power_count;
+      /** Keep the later footer coherent with the state just published. */
+      ls = live;
+    }
+    const char *publish_bcode =
+        ls.broadcast_code[0] ? ls.broadcast_code : last_bcode[h];
+    PublishRecoveryState(h, publish_bcode, connected, connect_state,
                          info.state, ls, broadcast_recent, publishing_now,
                          st.publish_packet_count);
-    if (ls.handshake_state ==
-            LdsLidar::kHandshakeLinkPowerCycleRequired &&
-        ls.power_cycle_required_count > emitted_power_cycle_count[h]) {
-      PublishPowerCycleRequest(h, last_bcode[h], ls, broadcast_recent);
+    if (publish_power_edge) {
+      PublishPowerCycleRequest(h, publish_bcode, ls, broadcast_recent);
       emitted_power_cycle_count[h] = ls.power_cycle_required_count;
+    }
+    /** Format both row variants only after the final live LinkStat snapshot, so
+     *  HS_timeout and the Handshake footer cannot disagree by one callback in
+     *  the same 1 Hz dashboard frame. */
+    disc = ls.disconnect_count;
+    if (connected) {
+      snprintf(line, sizeof(line),
+               "%-6d  %-15s  %-20s  %-4s  %-4s  %-4s  %6u  %7s  %6u   %4u  %10u  %8s  %9s\n",
+               h, last_bcode[h], row_state, temp, fan, motor, row_recv, losspct,
+               row_drop, disc, ls.handshake_timeout_count, hb_lost.c_str(),
+               heartbeat.c_str());
+    } else {
+      const char *offline_state = "DISCONNECTED";
+      if (broadcast_recent &&
+          ls.handshake_state != LdsLidar::kHandshakeLinkIdle) {
+        offline_state = HandshakeStateStr(ls.handshake_state);
+      }
+      snprintf(line, sizeof(line),
+               "%-6d  %-15s  %-20s  %-4s  %-4s  %-4s  %6s  %7s  %6s   %4u  %10u  %8s  %9s\n",
+               h, last_bcode[h], offline_state, "-", "-", "-", "-", losspct,
+               "-", disc, ls.handshake_timeout_count, hb_lost.c_str(),
+               heartbeat.c_str());
     }
     ss << line;
   }
@@ -848,7 +904,11 @@ void StatsTimerCb(const ros::TimerEvent &) {
     bool history = ls.handshake_reset_count != 0 ||
                    ls.handshake_reset_fail_count != 0 ||
                    ls.handshake_stuck_count != 0 ||
-                   ls.power_cycle_required_count != 0;
+                   ls.power_cycle_required_count != 0 ||
+                   ls.handshake_timeout_count != 0 ||
+                   ls.handshake_rejected_count != 0 ||
+                   ls.handshake_network_error_count != 0 ||
+                   ls.handshake_protocol_error_count != 0;
     if (!active && !history) {
       continue;
     }
@@ -862,21 +922,38 @@ void StatsTimerCb(const ros::TimerEvent &) {
             : "--";
     ss << "  lidar " << static_cast<unsigned>(h) << ": "
        << HandshakeStateStr(ls.handshake_state) << " " << duration
-       << ", reset " << static_cast<unsigned>(ls.handshake_reset_attempts)
+       << ", reset-phase="
+       << HandshakeResetPhaseStr(ls.handshake_reset_phase)
+       << ", reset-request "
+       << static_cast<unsigned>(ls.handshake_reset_attempts)
        << "/" << static_cast<unsigned>(LdsLidar::HandshakeResetMaxAttempts())
-       << " (accepted total=" << ls.handshake_reset_count
-       << ", failed=" << ls.handshake_reset_fail_count << ")"
+       << " (queued total=" << ls.handshake_reset_count
+       << ", rejected=" << ls.handshake_reset_fail_count << ")"
        << ", stuck=" << ls.handshake_stuck_count
        << ", power-alert=" << ls.power_cycle_required_count;
     if (active && !g_auto_recover) {
       ss << ", auto-reset=disabled";
     }
-    if (ls.handshake_event_valid) {
-      ss << ", last=" << HandshakeEventStr(ls.last_handshake_event)
-         << " detail=" << ls.last_handshake_detail
-         << " ip=" << (ls.last_handshake_ip[0] ? ls.last_handshake_ip : "?");
-    }
     ss << "\n";
+    if (ls.handshake_event_valid) {
+      ss << "    last=" << HandshakeEventStr(ls.last_handshake_event)
+         << " detail=" << ls.last_handshake_detail
+         << " ip=" << (ls.last_handshake_ip[0] ? ls.last_handshake_ip : "?")
+         << "\n";
+    }
+    if (ls.handshake_timeout_count != 0 ||
+        ls.handshake_rejected_count != 0 ||
+        ls.handshake_network_error_count != 0 ||
+        ls.handshake_protocol_error_count != 0) {
+      /** ACK only means the handshake reply was accepted; DeviceInfo/public
+       *  Connect may still be pending, so deliberately do not label it
+       *  "success".  All values reset only when this Driver process restarts. */
+      ss << "    sdk-events(proc): ack=" << ls.handshake_success_count
+         << ", timeout=" << ls.handshake_timeout_count
+         << ", rejected=" << ls.handshake_rejected_count
+         << ", network=" << ls.handshake_network_error_count
+         << ", protocol=" << ls.handshake_protocol_error_count << "\n";
+    }
   }
 
   /** Mode-switch footer: requests that failed after all bounded retries

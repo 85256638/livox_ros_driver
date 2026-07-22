@@ -31,13 +31,13 @@ int main() {
   }
 
   const std::string request = BuildPowerCycleRequestJson(
-      "event:1", 100, 99, 200, 3, "TESTLIDAR000001", true, 3, 2);
+      "event:1", 100, 99, 200, 3, "TESTLIDAR000001", true, 1, 2);
   const std::string expected_request =
       "{\"schema_version\":1,\"type\":\"POWER_CYCLE_REQUIRED\","
       "\"event_id\":\"event:1\",\"timestamp\":100,\"detected_at\":99,"
       "\"driver_instance\":200,\"handle\":3,"
       "\"broadcast_code\":\"TESTLIDAR000001\","
-      "\"broadcast_fresh\":true,\"session_reset_attempts\":3,"
+      "\"broadcast_fresh\":true,\"session_reset_attempts\":1,"
       "\"episode_count\":2}";
   if (request != expected_request) {
     std::cerr << "request JSON mismatch:\n" << request << "\n";

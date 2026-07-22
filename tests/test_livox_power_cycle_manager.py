@@ -220,6 +220,35 @@ def _publish_health(core, members=MEMBERS, repeats=5, interval=0.02):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_omitted_off_seconds_preserves_legacy_ten_second_default(self):
+        self.assertEqual(manager.Policy().off_seconds, 10.0)
+        self.assertEqual(manager._policy_from_json({}).off_seconds, 10.0)
+
+    def test_explicit_fast_off_seconds_is_preserved(self):
+        self.assertEqual(
+            manager._policy_from_json({"off_seconds": 5}).off_seconds,
+            5.0,
+        )
+        self.assertEqual(
+            manager._policy_from_json({"off_seconds": 10}).off_seconds,
+            10.0,
+        )
+
+    def test_off_seconds_rejects_values_below_five(self):
+        for value in (4, 4.9):
+            with self.subTest(value=value), self.assertRaises(
+                manager.ConfigurationError
+            ):
+                manager._policy_from_json({"off_seconds": value})
+        for value in (5, 10):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    manager._policy_from_json(
+                        {"off_seconds": value}
+                    ).off_seconds,
+                    float(value),
+                )
+
     def test_shipped_example_is_safe_and_valid(self):
         config = manager.load_config(
             str(
@@ -230,6 +259,7 @@ class ConfigTests(unittest.TestCase):
             )
         )
         self.assertEqual(config.mode, "observe")
+        self.assertEqual(config.policy.off_seconds, 5.0)
         self.assertGreaterEqual(len(config.power_groups), 1)
         self.assertFalse(
             any(item.enabled for item in config.power_groups.values())
@@ -461,6 +491,24 @@ class ManagerCliTests(unittest.TestCase):
                     self.assertEqual(result, 0)
                     self.assertEqual(len(received), 1)
                     self.assertEqual(received[0].mode, cli_mode)
+
+    def test_validate_config_reports_effective_off_seconds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            state_db = Path(tmp) / "state.sqlite3"
+            self._write_config(path, state_db, "observe")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["policy"] = {"off_seconds": 10}
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with mock.patch("builtins.print") as output:
+                result = manager.main(
+                    ["--config", str(path), "--validate-config"]
+                )
+
+            self.assertEqual(result, 0)
+            output.assert_called_once()
+            self.assertIn("off_seconds=10", output.call_args.args[0])
 
     def test_repair_before_start_runs_before_damaged_json_is_read(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1436,6 +1484,95 @@ class _FailingObligationStore(manager.StateStore):
 
 
 class CoreTests(unittest.TestCase):
+    def _verify_group_health_rows(self, rows):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(
+                Path(tmp) / "state.sqlite3",
+                _group(),
+                policy=_policy(status_stale_seconds=1),
+            )
+            core = manager.PowerCycleManagerCore(
+                config,
+                manager.StateStore(config.state_db),
+                lambda _row: None,
+                relay_factory=_FakeRelay,
+            )
+            result = []
+            worker = threading.Thread(
+                target=lambda: result.append(
+                    core._wait_group_healthy(_group(), 123, 0.12, 0.02)
+                )
+            )
+            worker.start()
+            time.sleep(0.01)
+            while worker.is_alive():
+                for row in rows:
+                    current = dict(row)
+                    current["timestamp"] = int(time.time())
+                    core.accept_state_payload(current)
+                time.sleep(0.005)
+            worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(result), 1)
+            return result[0]
+
+    def test_recovery_rejects_low_power_without_expected_mode_evidence(self):
+        for lidar_state in ("PowerSaving", "StandBy"):
+            with self.subTest(lidar_state=lidar_state):
+                rows = [_healthy_state(code) for code in MEMBERS]
+                rows[0].update(
+                    {"lidar_state": lidar_state, "publishing": False}
+                )
+
+                recovered, unhealthy = self._verify_group_health_rows(rows)
+
+                self.assertFalse(recovered)
+                self.assertIn(MEMBERS[0], unhealthy)
+
+    def test_recovery_keeps_strict_state_and_publishing_requirements(self):
+        cases = (
+            ("normal_without_data", {"lidar_state": "Normal", "publishing": False}),
+            (
+                "power_saving_with_data",
+                {"lidar_state": "PowerSaving", "publishing": True},
+            ),
+            ("init", {"lidar_state": "Init", "publishing": False}),
+            ("config", {"lidar_state": "Config", "publishing": False}),
+            ("error", {"lidar_state": "Error", "publishing": False}),
+            ("off_lidar_state", {"lidar_state": "Off", "publishing": False}),
+            (
+                "off_connect_state",
+                {
+                    "lidar_state": "PowerSaving",
+                    "publishing": False,
+                    "connect_state": "Off",
+                },
+            ),
+            (
+                "handshake_not_idle",
+                {
+                    "lidar_state": "PowerSaving",
+                    "publishing": False,
+                    "handshake_state": "HANDSHAKE_STUCK",
+                },
+            ),
+            (
+                "not_connected",
+                {
+                    "lidar_state": "PowerSaving",
+                    "publishing": False,
+                    "connected": False,
+                },
+            ),
+        )
+        for name, changes in cases:
+            with self.subTest(case=name):
+                rows = [_healthy_state(code) for code in MEMBERS]
+                rows[0].update(changes)
+                recovered, unhealthy = self._verify_group_health_rows(rows)
+                self.assertFalse(recovered)
+                self.assertIn(MEMBERS[0], unhealthy)
+
     def test_stale_or_inconsistent_recovery_state_is_rejected_before_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = _config(Path(tmp) / "state.sqlite3", _group())

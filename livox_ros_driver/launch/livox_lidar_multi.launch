@@ -75,13 +75,13 @@
          Needs a desktop / gnome-terminal (X11 DISPLAY). Enable with monitor:=true.
          Kept in a separate window so its in-place redraw never mixes with the
          driver's scrolling logs.
-         The window geometry is fixed at 140 cols x 18 rows: wide enough for
-         POWER_CYCLE_REQUIRED and tall enough for the table plus the
-         Temp/Fault/Auto-recover/Handshake footer lines (see the
-         geometry option in launch-prefix below). -->
+         The window geometry is fixed at 140 cols x 30 rows: the main table is
+         128 cols wide, while the extra height reduces scrolling when several
+         LiDARs have Handshake SDK-event history. Exception-heavy histories may
+         still need manual scrolling (see the geometry option below). -->
     <node if="$(arg monitor)" name="livox_stats_monitor" pkg="livox_ros_driver"
           type="livox_stats_monitor.py" output="screen"
-          launch-prefix="gnome-terminal --geometry=140x18 --wait --"/>
+          launch-prefix="gnome-terminal --geometry=140x30 --wait --"/>
 
     <!-- Optional: Enable RViz -->
     <group if="$(arg rviz_enable)">

@@ -63,11 +63,11 @@ class LdsLidar : public Lds {
    *  and re-send within its bounded retry budget. */
   void TickSleepModeVerification();
   /** Called at 1 Hz: classify a disconnected device which is still
-   *  broadcasting, and (when enabled) clear/retry its local SDK handshake
-   *  session on a bounded schedule. */
+   *  broadcasting, and (when enabled) clear its local SDK handshake session
+   *  once before escalating on a bounded schedule. */
   void TickHandshakeRecovery(bool enable_recovery);
   static int64_t HandshakeBroadcastFreshNs() { return 3000000000LL; }
-  static uint8_t HandshakeResetMaxAttempts() { return 3; }
+  static uint8_t HandshakeResetMaxAttempts() { return 1; }
   livox_status RequestLidarReboot(uint8_t handle, uint16_t timeout_ms = 100);
   /** Watchdog variant: reject if a planned mode request won the per-handle
    *  send race. Manual reboot remains an explicit override. */
@@ -90,6 +90,18 @@ class LdsLidar : public Lds {
     kHandshakeLinkBroadcastOnly,
     kHandshakeLinkStuck,
     kHandshakeLinkPowerCycleRequired
+  };
+
+  /** Progress of the driver's one local-session cleanup in the current
+   *  broadcast-only episode.  This is deliberately independent of
+   *  last_handshake_event: later SDK TIMEOUT/NETWORK_ERROR diagnostics must
+   *  not make the dashboard forget whether cleanup was accepted/completed. */
+  enum HandshakeResetPhase {
+    kHandshakeResetNone = 0,
+    kHandshakeResetRequested,
+    kHandshakeResetQueued,
+    kHandshakeResetCompleted,
+    kHandshakeResetRejected
   };
 
   struct LinkStat {
@@ -115,8 +127,13 @@ class LdsLidar : public Lds {
     int64_t last_broadcast_ns = 0;
     int64_t broadcast_only_since_ns = 0;
     HandshakeLinkState handshake_state = kHandshakeLinkIdle;
-    uint8_t handshake_reset_attempts = 0; /**< current episode, max 3 */
+    uint8_t handshake_reset_attempts = 0; /**< reset requests this episode,
+                                           *   max 1 */
     int64_t handshake_last_reset_try_ns = 0;
+    HandshakeResetPhase handshake_reset_phase = kHandshakeResetNone;
+    bool handshake_reset_accepted = false;  /**< API accepted this episode */
+    bool handshake_reset_completed = false; /**< SDK RESET event confirmed */
+    int64_t handshake_reset_completed_ns = 0; /**< steady_clock completion */
     uint32_t handshake_reset_count = 0;   /**< accepted SDK session resets */
     uint32_t handshake_reset_fail_count = 0;
     int64_t handshake_last_reset_wall_s = 0;
@@ -132,6 +149,10 @@ class LdsLidar : public Lds {
     int32_t last_handshake_detail = 0;
     int64_t last_handshake_event_wall_s = 0;
     char last_handshake_ip[16] = {0};
+    /** steady_clock timestamp for the most recent NETWORK_ERROR in the live
+     *  broadcast-only episode. Kept separately because later RESET/TIMEOUT
+     *  diagnostics must not erase the local-network power-cycle gate. */
+    int64_t handshake_last_network_error_ns = 0;
     uint32_t handshake_success_count = 0;
     uint32_t handshake_timeout_count = 0;
     uint32_t handshake_rejected_count = 0;
