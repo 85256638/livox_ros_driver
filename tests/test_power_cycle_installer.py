@@ -29,7 +29,7 @@ class IntegratedInstallerSafetyTests(unittest.TestCase):
 
     def test_dropin_has_config_independent_start_and_stop_repairs(self):
         expected_command = (
-            "/usr/bin/python3 @MANAGER_SOURCE@ --state-db @STATE_DB@ "
+            "/usr/bin/python3 @MANAGER_RUNTIME@ --state-db @STATE_DB@ "
             "--repair-obligations"
         )
         self.assertEqual(
@@ -52,7 +52,7 @@ class IntegratedInstallerSafetyTests(unittest.TestCase):
         self.assertIn("TimeoutStopSec=300", self.dropin)
         self.assertIn("SendSIGKILL=yes", self.dropin)
         self.assertEqual(
-            self.dropin.count("LIVOX_POWER_CYCLE_SAFETY_DROPIN_V1"), 1
+            self.dropin.count("LIVOX_POWER_CYCLE_SAFETY_DROPIN_V2"), 1
         )
         self.assertNotIn("--config", self.dropin)
         self.assertNotIn("rosrun", self.dropin)

@@ -1,12 +1,13 @@
 {
   "schema_version": 2,
-  "mode": "observe",
   "state_db": "~/.local/state/livox-power-cycle-manager/state.sqlite3",
   "topics": {
     "request": "/livox/power_cycle_request",
     "state": "/livox/lidar_recovery_state",
     "status": "/livox/power_cycle_status",
-    "heartbeat": "/livox/power_cycle_heartbeat"
+    "heartbeat": "/livox/power_cycle_heartbeat",
+    "intent": "/livox/group_power_cycle_intent",
+    "intent_ack": "/livox/group_power_cycle_ack"
   },
   "policy": {
     "off_seconds": 5,
@@ -23,7 +24,11 @@
     "restore_deadline_seconds": 90,
     "ensure_on_retry_seconds": 30,
     "precheck_retry_seconds": 60,
-    "precheck_max_attempts": 5
+    "precheck_max_attempts": 5,
+    "intent_ack_timeout_seconds": 3,
+    "intent_ack_attempts": 3,
+    "intent_retry_seconds": 0.5,
+    "intent_valid_for_seconds": 15
   },
   "power_groups": {
     "pit-x-four-lidars": {

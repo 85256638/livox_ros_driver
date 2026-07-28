@@ -11,6 +11,7 @@ import threading
 import time
 import unittest
 import xml.etree.ElementTree as ET
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -28,6 +29,20 @@ assert SPEC is not None and SPEC.loader is not None
 manager = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = manager
 SPEC.loader.exec_module(manager)
+
+SITE_VALIDATOR = (
+    ROOT
+    / "livox_ros_driver"
+    / "livox_ros_driver"
+    / "scripts"
+    / "validate_livox_power_cycle_site.py"
+)
+VALIDATOR_SPEC = importlib.util.spec_from_file_location(
+    "validate_livox_power_cycle_site", SITE_VALIDATOR
+)
+assert VALIDATOR_SPEC is not None and VALIDATOR_SPEC.loader is not None
+site_validator = importlib.util.module_from_spec(VALIDATOR_SPEC)
+VALIDATOR_SPEC.loader.exec_module(site_validator)
 
 
 MEMBERS = (
@@ -136,6 +151,8 @@ def _config(db_path, group, mode="armed", policy=None):
         state_topic="/livox/lidar_recovery_state",
         status_topic="/livox/power_cycle_status",
         heartbeat_topic="/livox/power_cycle_heartbeat",
+        intent_topic="",
+        intent_ack_topic="",
         policy=policy or manager.Policy(),
         power_groups={group.group_id: group},
         member_to_group={code: group.group_id for code in group.members},
@@ -869,6 +886,53 @@ class ManagerCliTests(unittest.TestCase):
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_armed_site_identity_requires_exact_driver_and_relay_members(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            driver = root / "driver.json"
+            relay = root / "relay.json"
+            launch = root / "site.launch"
+            driver.write_text(
+                json.dumps(
+                    {
+                        "lidar_config": [
+                            {"broadcast_code": code, "enable_connect": True}
+                            for code in MEMBERS
+                        ]
+                        + [{"broadcast_code": "DISABLEDLIDAR01"}]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            relay.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "power_groups": {
+                            GROUP_ID: {"enabled": True, "members": list(MEMBERS)}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            launch.write_text(
+                "<launch><arg name=\"relay_power_cycle_enable\" default=\"true\"/>"
+                + "".join(
+                    '<remap from=\"/livox/lidar_%s\" to=\"/test/%s\"/>'
+                    % (code, index)
+                    for index, code in enumerate(MEMBERS)
+                )
+                + "</launch>",
+                encoding="utf-8",
+            )
+            self.assertEqual(site_validator.validate(relay, driver, launch), 0)
+
+            data = json.loads(relay.read_text(encoding="utf-8"))
+            data["power_groups"][GROUP_ID]["members"][3] = "OTHERLIDAR00001"
+            relay.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaises(site_validator.ValidationError):
+                site_validator.validate(relay, driver, launch)
+
     def test_updater_targets_paired_network_relay_branches(self):
         updater = (ROOT / "update_livox_geph.sh").read_text(
             encoding="utf-8"
@@ -929,7 +993,7 @@ class DeploymentTests(unittest.TestCase):
         )
         tokens = {
             "@HOME@",
-            "@MANAGER_SOURCE@",
+            "@MANAGER_RUNTIME@",
             "@STATE_DB@",
         }
         self.assertEqual(
@@ -942,6 +1006,9 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("TimeoutStartSec=600", template)
         self.assertIn("TimeoutStopSec=300", template)
         self.assertEqual(template.count("--repair-obligations"), 2)
+        self.assertIn("LIVOX_POWER_CYCLE_SAFETY_DROPIN_V2", template)
+        self.assertIn(".local/libexec/livox-power-cycle-manager", installer)
+        self.assertIn('mv -f -- "${RUNTIME_TEMP}" "${MANAGER_RUNTIME}"', installer)
         self.assertNotIn("--config", template)
         self.assertNotIn("rosrun", template)
         self.assertFalse(
@@ -1037,8 +1104,9 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(len(nodes), 1)
         node = nodes[0]
         self.assertEqual(node.attrib.get("name"), "livox_power_cycle_manager")
-        self.assertEqual(node.attrib.get("required"), "true")
-        self.assertNotIn("respawn", node.attrib)
+        self.assertEqual(node.attrib.get("required"), "false")
+        self.assertEqual(node.attrib.get("respawn"), "true")
+        self.assertEqual(node.attrib.get("respawn_delay"), "5")
         self.assertIn("--mode armed", node.attrib.get("args", ""))
         self.assertIn("--repair-before-start", node.attrib.get("args", ""))
         self.assertIn(
@@ -2089,6 +2157,304 @@ class _FailingObligationStore(manager.StateStore):
 
 
 class CoreTests(unittest.TestCase):
+    def test_driver_intent_barrier_accepts_exact_current_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = _group()
+            config = replace(
+                _config(Path(tmp) / "state.sqlite3", target),
+                intent_topic="/livox/group_power_cycle_intent",
+                intent_ack_topic="/livox/group_power_cycle_ack",
+            )
+            sent = []
+            core = None
+
+            def emit_intent(payload):
+                sent.append(dict(payload))
+                if payload["type"] == manager.INTENT_TYPE:
+                    core.accept_intent_ack_payload(
+                        {
+                            "schema_version": 1,
+                            "type": manager.INTENT_ACK_TYPE,
+                            "token": payload["token"],
+                            "group_id": payload["group_id"],
+                            "driver_instance": payload["driver_instance"],
+                            "accepted": True,
+                            "members": list(payload["members"]),
+                            "detail": "all members armed",
+                        }
+                    )
+
+            core = manager.PowerCycleManagerCore(
+                config,
+                manager.StateStore(config.state_db),
+                lambda _row: None,
+                intent_emit=emit_intent,
+                relay_factory=_FakeRelay,
+            )
+            request = manager.PowerCycleRequest.from_state(_required_state())
+            state, detail, token = core._prepare_driver_intent(request, target)
+            self.assertEqual(state, "ACKED")
+            self.assertEqual(detail, "all members armed")
+            self.assertTrue(token)
+            self.assertEqual(sent[0]["valid_for_ms"], 15000)
+
+    def test_driver_intent_barrier_fails_closed_on_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = _group()
+            config = replace(
+                _config(
+                    Path(tmp) / "state.sqlite3",
+                    target,
+                    policy=_policy(intent_ack_timeout_seconds=0.02),
+                ),
+                intent_topic="/livox/group_power_cycle_intent",
+                intent_ack_topic="/livox/group_power_cycle_ack",
+            )
+            sent = []
+            core = manager.PowerCycleManagerCore(
+                config,
+                manager.StateStore(config.state_db),
+                lambda _row: None,
+                intent_emit=lambda row: sent.append(dict(row)),
+                relay_factory=_FakeRelay,
+            )
+            request = manager.PowerCycleRequest.from_state(_required_state())
+            state, detail, token = core._prepare_driver_intent(request, target)
+            self.assertEqual(state, "DRIVER_INTENT_ACK_TIMEOUT")
+            self.assertIn("did not ACK", detail)
+            self.assertTrue(token)
+            self.assertTrue(sent)
+
+    def test_driver_intent_timeout_retries_before_cycle_reservation(self):
+        class TrackingStore(manager.StateStore):
+            reserve_calls = 0
+
+            def reserve_cycle(self, request, target, policy):
+                self.reserve_calls += 1
+                return super().reserve_cycle(request, target, policy)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            statuses = []
+            verified = threading.Event()
+            target = _group()
+            policy = _policy(
+                off_seconds=0.01,
+                boot_timeout_seconds=2,
+                healthy_seconds=0.05,
+                status_stale_seconds=1,
+                intent_ack_timeout_seconds=0.02,
+                intent_ack_attempts=3,
+                intent_retry_seconds=0.01,
+            )
+            config = replace(
+                _config(Path(tmp) / "state.sqlite3", target, policy=policy),
+                intent_topic="/livox/group_power_cycle_intent",
+                intent_ack_topic="/livox/group_power_cycle_ack",
+            )
+            store = TrackingStore(config.state_db)
+            sent = []
+            intent_tokens = []
+            core = None
+
+            def emit(row):
+                statuses.append(dict(row))
+                if row["state"] == "RECOVERY_VERIFIED":
+                    verified.set()
+
+            def emit_intent(payload):
+                sent.append(dict(payload))
+                if (
+                    payload["type"] == manager.INTENT_TYPE
+                    and payload["token"] not in intent_tokens
+                ):
+                    intent_tokens.append(payload["token"])
+                    self.assertEqual(store.reserve_calls, 0)
+                    if len(intent_tokens) == 3:
+                        core.accept_intent_ack_payload(
+                            {
+                                "schema_version": 1,
+                                "type": manager.INTENT_ACK_TYPE,
+                                "token": payload["token"],
+                                "group_id": payload["group_id"],
+                                "driver_instance": payload["driver_instance"],
+                                "accepted": True,
+                                "members": list(payload["members"]),
+                                "detail": "all members armed",
+                            }
+                        )
+
+            _FakeRelay.reset(on=True)
+            core = manager.PowerCycleManagerCore(
+                config,
+                store,
+                emit,
+                intent_emit=emit_intent,
+                relay_factory=_FakeRelay,
+            )
+            core.start()
+            feeder = _trigger_group(core, _required_state())
+
+            def publish_recovery():
+                self.assertTrue(
+                    _wait_until(
+                        lambda: any(
+                            row["state"] == "POWER_ON_CONFIRMED"
+                            for row in statuses
+                        ),
+                        timeout=2,
+                    ),
+                    statuses,
+                )
+                time.sleep(0.02)
+                _publish_health(core, repeats=6)
+
+            recovery = threading.Thread(target=publish_recovery)
+            recovery.start()
+            self.assertTrue(verified.wait(3), statuses)
+            feeder.join(timeout=1)
+            recovery.join(timeout=2)
+            core.stop()
+            self.assertEqual(len(intent_tokens), 3)
+            cancelled = {
+                row["token"]
+                for row in sent
+                if row["type"] == manager.INTENT_CANCEL_TYPE
+            }
+            self.assertEqual(cancelled, set(intent_tokens[:2]))
+            self.assertEqual(store.reserve_calls, 1)
+            self.assertEqual(_FakeRelay.transitions, [False, True])
+
+    def test_exhausted_intent_ack_retries_cancel_without_reserving(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            statuses = []
+            terminal = threading.Event()
+            target = _group()
+            policy = _policy(
+                status_stale_seconds=1,
+                intent_ack_timeout_seconds=0.02,
+                intent_ack_attempts=3,
+                intent_retry_seconds=0.01,
+            )
+            config = replace(
+                _config(Path(tmp) / "state.sqlite3", target, policy=policy),
+                intent_topic="/livox/group_power_cycle_intent",
+                intent_ack_topic="/livox/group_power_cycle_ack",
+            )
+            sent = []
+
+            def emit(row):
+                statuses.append(dict(row))
+                if row["state"] == "DRIVER_INTENT_ACK_TIMEOUT":
+                    terminal.set()
+
+            _FakeRelay.reset(on=True)
+            store = manager.StateStore(config.state_db)
+            core = manager.PowerCycleManagerCore(
+                config,
+                store,
+                emit,
+                intent_emit=lambda row: sent.append(dict(row)),
+                relay_factory=_FakeRelay,
+            )
+            core.start()
+            feeder = _trigger_group(core, _required_state())
+            self.assertTrue(terminal.wait(2), statuses)
+            feeder.join(timeout=1)
+            core.stop()
+            intent_tokens = {
+                row["token"]
+                for row in sent
+                if row["type"] == manager.INTENT_TYPE
+            }
+            cancelled = {
+                row["token"]
+                for row in sent
+                if row["type"] == manager.INTENT_CANCEL_TYPE
+            }
+            self.assertEqual(len(intent_tokens), 3)
+            self.assertEqual(cancelled, intent_tokens)
+            self.assertNotIn(False, _FakeRelay.transitions)
+            self.assertFalse(store.obligations())
+            db = sqlite3.connect(store.path)
+            try:
+                cycle_count = db.execute(
+                    "SELECT COUNT(*) FROM power_cycles"
+                ).fetchone()[0]
+            finally:
+                db.close()
+            self.assertEqual(cycle_count, 0)
+
+    def test_cycle_reservation_exception_stops_and_cancels_acked_intent(self):
+        class FailingReserveStore(manager.StateStore):
+            def reserve_cycle(self, request, target, policy):
+                raise manager.StateStoreError("injected reservation failure")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            statuses = []
+            failed = threading.Event()
+            target = _group()
+            config = replace(
+                _config(
+                    Path(tmp) / "state.sqlite3",
+                    target,
+                    policy=_policy(status_stale_seconds=1),
+                ),
+                intent_topic="/livox/group_power_cycle_intent",
+                intent_ack_topic="/livox/group_power_cycle_ack",
+            )
+            sent = []
+            core = None
+
+            def emit(row):
+                statuses.append(dict(row))
+                if row["state"] == "MANAGER_INTERNAL_ERROR":
+                    failed.set()
+
+            def emit_intent(payload):
+                sent.append(dict(payload))
+                if payload["type"] == manager.INTENT_TYPE:
+                    core.accept_intent_ack_payload(
+                        {
+                            "schema_version": 1,
+                            "type": manager.INTENT_ACK_TYPE,
+                            "token": payload["token"],
+                            "group_id": payload["group_id"],
+                            "driver_instance": payload["driver_instance"],
+                            "accepted": True,
+                            "members": list(payload["members"]),
+                            "detail": "all members armed",
+                        }
+                    )
+
+            _FakeRelay.reset(on=True)
+            store = FailingReserveStore(config.state_db)
+            core = manager.PowerCycleManagerCore(
+                config,
+                store,
+                emit,
+                intent_emit=emit_intent,
+                relay_factory=_FakeRelay,
+            )
+            core.start()
+            feeder = _trigger_group(core, _required_state())
+            self.assertTrue(failed.wait(2), statuses)
+            feeder.join(timeout=1)
+            core.stop()
+            acked_tokens = {
+                row["token"]
+                for row in sent
+                if row["type"] == manager.INTENT_TYPE
+            }
+            cancelled = {
+                row["token"]
+                for row in sent
+                if row["type"] == manager.INTENT_CANCEL_TYPE
+            }
+            self.assertTrue(acked_tokens)
+            self.assertEqual(cancelled, acked_tokens)
+            self.assertNotIn(False, _FakeRelay.transitions)
+            self.assertFalse(store.obligations())
+
     def _verify_group_health_rows(self, rows):
         with tempfile.TemporaryDirectory() as tmp:
             config = _config(

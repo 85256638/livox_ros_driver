@@ -40,6 +40,9 @@ SITE_LAUNCH_PATH="livox_ros_driver/launch/livox_lidar_multi.launch"
 RELAY_CHILD_PATH="livox_ros_driver/launch/livox_power_cycle.launch"
 SITE_LAUNCH_MARKER="LIVOX_RELAY_LAUNCH_INTEGRATION"
 DRIVER_SAFETY_DROPIN="/etc/systemd/system/livox-ros-driver.service.d/20-livox-power-cycle-safety.conf"
+MANAGER_RUNTIME_DIR="${HOME}/.local/libexec/livox-power-cycle-manager"
+MANAGER_RUNTIME="${MANAGER_RUNTIME_DIR}/livox_power_cycle_manager.py"
+RUNTIME_HELPER_TEMP=""
 SITE_CONFIG_PATHS=(
   "${SITE_JSON_PATH}"
   "${SITE_LAUNCH_PATH}"
@@ -114,6 +117,9 @@ cleanup() {
   fi
   if [[ -n "${ACTIVE_CLONE_TEMP}" && -d "${ACTIVE_CLONE_TEMP}" ]]; then
     rm -rf -- "${ACTIVE_CLONE_TEMP}"
+  fi
+  if [[ -n "${RUNTIME_HELPER_TEMP}" ]]; then
+    rm -f -- "${RUNTIME_HELPER_TEMP}"
   fi
   trap - EXIT
   exit "${exit_status}"
@@ -197,6 +203,24 @@ inspect_legacy_power_manager_unit() {
   fi
 }
 
+sync_runtime_manager_helper() {
+  local source="${DRIVER_DIR}/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py"
+  [[ -f "${source}" && ! -L "${source}" ]] ||
+    die "新版仓库缺少普通 manager 源文件：${source}"
+  if [[ -e "${MANAGER_RUNTIME_DIR}" || -L "${MANAGER_RUNTIME_DIR}" ]]; then
+    [[ -d "${MANAGER_RUNTIME_DIR}" && ! -L "${MANAGER_RUNTIME_DIR}" ]] ||
+      die "稳定 helper 目录不是普通目录或是符号链接：${MANAGER_RUNTIME_DIR}"
+  fi
+  install -d -m 700 "${MANAGER_RUNTIME_DIR}"
+  RUNTIME_HELPER_TEMP="$(mktemp "${MANAGER_RUNTIME}.new.XXXXXX")"
+  install -m 700 "${source}" "${RUNTIME_HELPER_TEMP}"
+  cmp -s -- "${source}" "${RUNTIME_HELPER_TEMP}" ||
+    die "稳定 helper 临时副本校验失败：${RUNTIME_HELPER_TEMP}"
+  mv -f -- "${RUNTIME_HELPER_TEMP}" "${MANAGER_RUNTIME}"
+  RUNTIME_HELPER_TEMP=""
+  log "已原子同步稳定补 ON helper：${MANAGER_RUNTIME}"
+}
+
 validate_driver_safety_dropin() {
   local current_user
   local driver_kill_mode
@@ -216,6 +240,10 @@ validate_driver_safety_dropin() {
   local timeout_stop
   local environment_token
   local home_entries=0
+  local helper_metadata
+  local helper_mode
+  local helper_owner
+  local manager_source
 
   DRIVER_DROPIN_PATHS="$(systemctl show livox-ros-driver.service \
     --property=DropInPaths --value 2>/dev/null || true)"
@@ -232,9 +260,23 @@ validate_driver_safety_dropin() {
   (( (8#${mode} & 8#022) == 0 )) ||
     die "安全 drop-in 可被 group/other 写入，拒绝信任：mode=${mode}"
 
-  expected_repair_command="/usr/bin/python3 ${DRIVER_DIR}/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py --state-db ${HOME}/.local/state/livox-power-cycle-manager/state.sqlite3 --repair-obligations"
-  [[ "$(grep -Fxc -- '# LIVOX_POWER_CYCLE_SAFETY_DROPIN_V1' "${DRIVER_SAFETY_DROPIN}")" == "1" ]] ||
-    die "安全 drop-in 缺少唯一版本标记。"
+  manager_source="${DRIVER_DIR}/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py"
+  [[ -f "${MANAGER_RUNTIME}" && ! -L "${MANAGER_RUNTIME}" ]] ||
+    die "稳定补 ON helper 不存在、不是普通文件或是符号链接：${MANAGER_RUNTIME}"
+  cmp -s -- "${manager_source}" "${MANAGER_RUNTIME}" ||
+    die "稳定补 ON helper 与当前 Driver 版本不一致，拒绝重启。"
+  helper_metadata="$(stat -Lc '%u %a' "${MANAGER_RUNTIME}")" ||
+    die "无法读取稳定 helper 权限：${MANAGER_RUNTIME}"
+  helper_owner="${helper_metadata%% *}"
+  helper_mode="${helper_metadata##* }"
+  [[ "${helper_owner}" == "$(id -u)" && "${helper_mode}" =~ ^[0-7]{3,4}$ ]] ||
+    die "稳定 helper 所有者或权限异常：uid=${helper_owner}, mode=${helper_mode}"
+  (( (8#${helper_mode} & 8#077) == 0 )) ||
+    die "稳定 helper 可被其他用户读取/写入/执行，拒绝信任：mode=${helper_mode}"
+
+  expected_repair_command="/usr/bin/python3 ${MANAGER_RUNTIME} --state-db ${HOME}/.local/state/livox-power-cycle-manager/state.sqlite3 --repair-obligations"
+  [[ "$(grep -Fxc -- '# LIVOX_POWER_CYCLE_SAFETY_DROPIN_V2' "${DRIVER_SAFETY_DROPIN}")" == "1" ]] ||
+    die "安全 drop-in 不是稳定 helper V2；请先运行新版 ${DRIVER_DIR}/install_livox_power_cycle_service.sh。"
   [[ "$(grep -Fxc -- "ExecStartPre=${expected_repair_command}" "${DRIVER_SAFETY_DROPIN}")" == "1" ]] ||
     die "安全 drop-in 的 ExecStartPre 与当前仓库/固定状态库不一致。"
   [[ "$(grep -Fxc -- "ExecStopPost=${expected_repair_command}" "${DRIVER_SAFETY_DROPIN}")" == "1" ]] ||
@@ -541,7 +583,9 @@ expected_node_attrs = (
     ("pkg", "livox_ros_driver"),
     ("type", "livox_power_cycle_manager.py"),
     ("output", "screen"),
-    ("required", "true"),
+    ("required", "false"),
+    ("respawn", "true"),
+    ("respawn_delay", "5"),
 )
 for name, value in expected_node_attrs:
     if node.get(name) != value:
@@ -560,7 +604,9 @@ PY
 
 validate_driver_restart_safety() {
   local launch_path="${DRIVER_DIR}/${SITE_LAUNCH_PATH}"
+  local site_validator="${DRIVER_DIR}/livox_ros_driver/livox_ros_driver/scripts/validate_livox_power_cycle_site.py"
 
+  sync_runtime_manager_helper
   inspect_legacy_power_manager_unit
   if [[ "${LEGACY_POWER_MANAGER_LOAD_STATE}" != "not-found" ||
         "${LEGACY_POWER_MANAGER_ACTIVE_STATE}" != "inactive" ||
@@ -572,6 +618,13 @@ validate_driver_restart_safety() {
     die "当前 multi launch 的继电器集成结构无效，拒绝重启 Driver。"
   validate_relay_child_launch "${DRIVER_DIR}/${RELAY_CHILD_PATH}" ||
     die "当前继电器 child launch 的安全结构无效，拒绝重启 Driver。"
+  [[ -f "${site_validator}" && ! -L "${site_validator}" ]] ||
+    die "缺少普通现场身份校验器：${site_validator}"
+  "${PYTHON_EXECUTABLE}" "${site_validator}" \
+    --relay-config "${HOME}/.config/livox/power_cycle.json" \
+    --driver-config "${DRIVER_DIR}/${SITE_JSON_PATH}" \
+    --launch "${launch_path}" ||
+    die "Driver 白名单、继电器 members 或 launch 授权不一致，拒绝重启。"
   validate_driver_safety_dropin
 }
 
@@ -1017,7 +1070,7 @@ build_driver_if_needed() {
 [[ "${SDK_INSTALL_PREFIX}" == /* ]] || die "LIVOX_SDK_INSTALL_PREFIX 必须是绝对路径。"
 [[ -x "${PYTHON_EXECUTABLE}" ]] ||
   die "找不到用于安全校验现场 launch XML 的 Python：${PYTHON_EXECUTABLE}"
-for command_name in git flock cmp grep id stat tr; do
+for command_name in git flock cmp grep id stat tr install mv mktemp; do
   command -v "${command_name}" >/dev/null 2>&1 || die "缺少命令：${command_name}"
 done
 mkdir -p "${STATE_DIR}" "${CATKIN_WS}/src"

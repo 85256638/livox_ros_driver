@@ -77,6 +77,7 @@ catkin_package(CATKIN_DEPENDS
 catkin_install_python(PROGRAMS
 	livox_ros_driver/scripts/livox_stats_monitor.py
 	livox_ros_driver/scripts/livox_power_cycle_manager.py
+	livox_ros_driver/scripts/validate_livox_power_cycle_site.py
 	DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
@@ -166,6 +167,48 @@ target_link_libraries(${PROJECT_NAME}_node
 	${PCL_LIBRARIES}
 	${APR_LIBRARIES}
 	)
+
+#---------------------------------------------------------------------------------------
+# Recovery safety quality gates
+#---------------------------------------------------------------------------------------
+if(CATKIN_ENABLE_TESTING)
+  set(LIVOX_RECOVERY_QC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tests")
+  set(LIVOX_RECOVERY_QC_TARGETS
+    dashboard_metrics_qc
+    normal_dropout_policy_qc
+    wake_dropout_policy_qc
+    recovery_event_json_qc
+    group_power_cycle_protocol_qc
+  )
+  foreach(qc_target IN LISTS LIVOX_RECOVERY_QC_TARGETS)
+    add_executable(${qc_target} "${LIVOX_RECOVERY_QC_DIR}/${qc_target}.cpp")
+    target_include_directories(${qc_target} PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/livox_ros_driver"
+      "${CMAKE_CURRENT_SOURCE_DIR}/common"
+    )
+    add_test(NAME ${qc_target} COMMAND $<TARGET_FILE:${qc_target}>)
+    set_tests_properties(${qc_target} PROPERTIES LABELS "livox_recovery_qc")
+  endforeach()
+
+  if(NOT PYTHON_EXECUTABLE)
+    find_package(PythonInterp REQUIRED)
+  endif()
+  set(LIVOX_RECOVERY_PY_TESTS
+    test_handshake_recovery_policy
+    test_livox_power_cycle_manager
+    test_livox_stats_monitor
+    test_power_cycle_installer
+    test_update_livox_geph
+  )
+  foreach(py_test IN LISTS LIVOX_RECOVERY_PY_TESTS)
+    add_test(
+      NAME ${py_test}
+      COMMAND "${PYTHON_EXECUTABLE}"
+              "${LIVOX_RECOVERY_QC_DIR}/${py_test}.py"
+    )
+    set_tests_properties(${py_test} PROPERTIES LABELS "livox_recovery_qc")
+  endforeach()
+endif()
 
 
 #---------------------------------------------------------------------------------------

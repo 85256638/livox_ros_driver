@@ -563,11 +563,13 @@ class UpdaterChildLaunchValidationTests(unittest.TestCase):
                 b"/tmp/other.sqlite3",
                 1,
             ),
-            "not-required": self.valid.replace(
-                b'required="true"', b'required="false"', 1
+            "required-manager": self.valid.replace(
+                b'required="false"', b'required="true"', 1
             ),
             "extra-node-attribute": self.valid.replace(
-                b'required="true"', b'required="true" respawn="true"', 1
+                b'respawn_delay="5"',
+                b'respawn_delay="5" launch-prefix="env"',
+                1,
             ),
         }
         for name, payload in cases.items():
@@ -587,6 +589,7 @@ class UpdaterRestartSafetyTests(unittest.TestCase):
                 "log",
                 "die",
                 "inspect_legacy_power_manager_unit",
+                "sync_runtime_manager_helper",
                 "validate_driver_safety_dropin",
                 "validate_relay_launch_integration",
                 "validate_relay_child_launch",
@@ -615,18 +618,35 @@ class UpdaterRestartSafetyTests(unittest.TestCase):
         child.write_bytes(
             (ROOT / RELAY_CHILD).read_bytes()
         )
+        manager_source = (
+            driver
+            / "livox_ros_driver/livox_ros_driver/scripts/"
+            "livox_power_cycle_manager.py"
+        )
+        manager_source.parent.mkdir(parents=True, exist_ok=True)
+        manager_source.write_bytes(
+            (
+                ROOT
+                / "livox_ros_driver/livox_ros_driver/scripts/"
+                "livox_power_cycle_manager.py"
+            ).read_bytes()
+        )
+        manager_source.with_name("validate_livox_power_cycle_site.py").write_text(
+            "# test fixture\n", encoding="utf-8"
+        )
+        manager_runtime_dir = home / ".local/libexec/livox-power-cycle-manager"
+        manager_runtime = manager_runtime_dir / "livox_power_cycle_manager.py"
         dropin_path = root / "20-livox-power-cycle-safety.conf"
         expected_repair = (
-            "/usr/bin/python3 %s/livox_ros_driver/livox_ros_driver/scripts/"
-            "livox_power_cycle_manager.py --state-db %s/.local/state/"
+            "/usr/bin/python3 %s --state-db %s/.local/state/"
             "livox-power-cycle-manager/state.sqlite3 --repair-obligations"
-            % (_bash_path(driver), _bash_path(home))
+            % (_bash_path(manager_runtime), _bash_path(home))
         )
         loaded_dropins = ""
         if dropins:
             dropin_path.write_text(
                 "[Service]\n"
-                "# LIVOX_POWER_CYCLE_SAFETY_DROPIN_V1\n"
+                "# LIVOX_POWER_CYCLE_SAFETY_DROPIN_V2\n"
                 "ExecStartPre=%s\n" % expected_repair
                 + "ExecStopPost=%s\n" % expected_repair
                 + "TimeoutStartSec=600\n"
@@ -640,6 +660,12 @@ class UpdaterRestartSafetyTests(unittest.TestCase):
         harness = root / "safety-test.sh"
         q = lambda value: shlex.quote(_bash_path(value))
         fake_python = UpdaterSiteTransactionTests._fake_python_function()
+        fake_python = fake_python.replace(
+            "python_validator() {\n",
+            "python_validator() {\n"
+            "  if [[ \"${1:-}\" == *validate_livox_power_cycle_site.py ]]; then return 0; fi\n",
+            1,
+        )
         harness.write_text(
             "#!/usr/bin/env bash\n"
             "set -Eeuo pipefail\n"
@@ -676,9 +702,14 @@ class UpdaterRestartSafetyTests(unittest.TestCase):
             + "    *) return 1 ;;\n"
             + "  esac\n"
             + "}\n"
-            + "stat() { printf '0 644\\n'; }\n"
+            + "install() { if [[ \"$1\" == \"-d\" ]]; then mkdir -p -- \"${@: -1}\"; else cp -- \"${@: -2:1}\" \"${@: -1}\"; fi; }\n"
+            + "stat() { if [[ \"$*\" == *\"${MANAGER_RUNTIME}\"* ]]; then printf '%s 700\\n' \"$(id -u)\"; else printf '0 644\\n'; fi; }\n"
             + "PYTHON_EXECUTABLE=python_validator\n"
             + "DRIVER_DIR=%s\n" % q(driver)
+            + "MANAGER_RUNTIME_DIR=%s\n" % q(manager_runtime_dir)
+            + "MANAGER_RUNTIME=%s\n" % q(manager_runtime)
+            + "RUNTIME_HELPER_TEMP=\"\"\n"
+            + "SITE_JSON_PATH=%s\n" % shlex.quote(SITE_JSON)
             + "SITE_LAUNCH_PATH=%s\n" % shlex.quote(SITE_LAUNCH)
             + "RELAY_CHILD_PATH=%s\n" % shlex.quote(RELAY_CHILD)
             + "SITE_LAUNCH_MARKER=%s\n" % shlex.quote(MARKER)

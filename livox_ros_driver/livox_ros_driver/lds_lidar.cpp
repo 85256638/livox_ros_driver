@@ -30,6 +30,8 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <sstream>
 #include <thread>
 
 #include "health_logger.h"
@@ -259,6 +261,9 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
   WakeRecoveryState previous_wake_state = s.wake_state;
   NormalDropoutRecoveryState previous_normal_dropout_state =
       s.normal_dropout_state;
+  const bool planned_group_recovery =
+      s.planned_group_power_cycle_active &&
+      s.planned_group_power_cycle_deadline_ns >= now;
   uint8_t reset_attempts = s.handshake_reset_attempts;
   int64_t handshake_since_ns = s.broadcast_only_since_ns;
   s.connect_since_ns = now;
@@ -280,19 +285,30 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
   ClearWakeRecoveryState(&s);
   ClearNormalDropoutState(&s);
   s.planned_reboot_generation = 0;
+  s.planned_group_power_cycle_active = false;
+  s.planned_group_power_cycle_deadline_ns = 0;
+  memset(s.planned_group_power_cycle_token, 0,
+         sizeof(s.planned_group_power_cycle_token));
   if (s.last_disconnect_ns != 0) {
     long long down_s = (now - s.last_disconnect_ns) / 1000000000LL;
     char buf[48];
-    snprintf(buf, sizeof(buf), "RECONNECTED (down %llds)", down_s);
+    snprintf(buf, sizeof(buf), "%s (down %llds)",
+             planned_group_recovery ? "PLANNED_GROUP_POWER_RECOVERED"
+                                    : "RECONNECTED",
+             down_s);
     PrintLidarEvent(handle, broadcast_code, buf);
     char detail[32];
     snprintf(detail, sizeof(detail), "down %llds", down_s);
-    HealthLogger::Get().LogEvent(handle, broadcast_code, "RECONNECT", detail);
+    HealthLogger::Get().LogEvent(
+        handle, broadcast_code,
+        planned_group_recovery ? "PLANNED_GROUP_POWER_RECOVERED" : "RECONNECT",
+        detail);
   } else {
     PrintLidarEvent(handle, broadcast_code, "CONNECTED");
     HealthLogger::Get().LogEvent(handle, broadcast_code, "CONNECT", "");
   }
-  if (previous_handshake_state >= kHandshakeLinkStuck || reset_attempts != 0) {
+  if (!planned_group_recovery &&
+      (previous_handshake_state >= kHandshakeLinkStuck || reset_attempts != 0)) {
     long long elapsed_s = handshake_since_ns == 0
                               ? 0
                               : (now - handshake_since_ns) / 1000000000LL;
@@ -303,12 +319,14 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
     HealthLogger::Get().LogEvent(handle, broadcast_code,
                                  "HANDSHAKE_RECOVERED", detail);
   }
-  if (previous_wake_state >= kWakeRecoveryNoBroadcast) {
+  if (!planned_group_recovery &&
+      previous_wake_state >= kWakeRecoveryNoBroadcast) {
     PrintLidarEvent(handle, broadcast_code, "WAKE_LINK_RECOVERED");
     HealthLogger::Get().LogEvent(handle, broadcast_code,
                                  "WAKE_LINK_RECOVERED", "Connect returned");
   }
-  if (previous_normal_dropout_state >= kNormalDropoutNoBroadcast) {
+  if (!planned_group_recovery &&
+      previous_normal_dropout_state >= kNormalDropoutNoBroadcast) {
     PrintLidarEvent(handle, broadcast_code, "NORMAL_LINK_RECOVERED");
     HealthLogger::Get().LogEvent(handle, broadcast_code,
                                  "NORMAL_LINK_RECOVERED", "Connect returned");
@@ -330,8 +348,6 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
   }
   const int64_t now =
       std::chrono::steady_clock::now().time_since_epoch().count();
-  s.disconnect_count++;
-  s.last_disconnect_ns = now;
   bool wake_no_broadcast = false;
   bool normal_no_broadcast = false;
   const uint64_t current_generation =
@@ -341,10 +357,44 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
       broadcast_code[0] != '\0' &&
       strncmp(s.broadcast_code, broadcast_code,
               sizeof(s.broadcast_code)) == 0;
+  std::string planned_group_token = s.planned_group_power_cycle_token;
+  const bool consumed_planned_marker =
+      callback_identity_matches &&
+      ConsumePlannedGroupPowerCycle(broadcast_code, &planned_group_token);
+  const bool planned_group_disconnect =
+      callback_identity_matches &&
+      (s.planned_group_power_cycle_active || consumed_planned_marker);
+  if (planned_group_disconnect) {
+    if (!s.planned_group_power_cycle_active) {
+      ++s.planned_group_power_cycle_count;
+    }
+    s.planned_group_power_cycle_active = true;
+    // Match the manager's default 180 s post-ON health-verification window.
+    // After that deadline the current dashboard must show a real disconnect,
+    // while the maintenance event remains visible in process history.
+    s.planned_group_power_cycle_deadline_ns =
+        now + INT64_C(180000000000);
+    strncpy(s.planned_group_power_cycle_token, planned_group_token.c_str(),
+            sizeof(s.planned_group_power_cycle_token) - 1);
+    s.planned_group_power_cycle_token[
+        sizeof(s.planned_group_power_cycle_token) - 1] = '\0';
+  } else {
+    ++s.disconnect_count;
+  }
+  s.last_disconnect_ns = now;
   const bool planned_reboot_disconnect =
       callback_identity_matches && s.planned_reboot_generation != 0 &&
       s.planned_reboot_generation == current_generation;
-  if (planned_reboot_disconnect) {
+  if (planned_group_disconnect) {
+    /** The relay manager obtained a Driver ACK before issuing OFF. This edge
+     *  belongs to that shared maintenance action and must not make a healthy
+     *  companion lidar look unstable or request another power cycle. */
+    ClearWakeRecoveryState(&s);
+    ClearNormalDropoutState(&s);
+    s.handshake_state = kHandshakeLinkIdle;
+    s.power_cycle_reason = kPowerCycleReasonNone;
+    s.power_cycle_required_counted_this_episode = false;
+  } else if (planned_reboot_disconnect) {
     /** This disconnect belongs to an explicit software reboot, not to the
      *  earlier wake command. It must never grant shared-relay permission. */
     ClearWakeRecoveryState(&s);
@@ -416,8 +466,15 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
   if (s.power_cycle_reason == kPowerCycleReasonHandshakeStuck) {
     s.power_cycle_reason = kPowerCycleReasonNone;
   }
-  PrintLidarEvent(handle, broadcast_code, "DISCONNECTED");
-  HealthLogger::Get().LogEvent(handle, broadcast_code, "DISCONNECT", "");
+  if (planned_group_disconnect) {
+    PrintLidarEvent(handle, broadcast_code, "PLANNED_GROUP_POWER_CYCLE");
+    HealthLogger::Get().LogEvent(handle, broadcast_code,
+                                 "PLANNED_GROUP_POWER_CYCLE",
+                                 planned_group_token.c_str());
+  } else {
+    PrintLidarEvent(handle, broadcast_code, "DISCONNECTED");
+    HealthLogger::Get().LogEvent(handle, broadcast_code, "DISCONNECT", "");
+  }
   if (wake_no_broadcast) {
     PrintLidarEvent(handle, broadcast_code, "WAKE_NO_BROADCAST");
     HealthLogger::Get().LogEvent(
@@ -703,6 +760,84 @@ std::vector<std::string> LdsLidar::GetWhitelistBroadcastCodes() const {
     }
   }
   return result;
+}
+
+bool LdsLidar::ArmPlannedGroupPowerCycle(
+    const std::vector<std::string> &members, const std::string &token,
+    uint32_t valid_for_ms, std::string *detail) {
+  const std::vector<std::string> whitelist = GetWhitelistBroadcastCodes();
+  const std::set<std::string> configured(whitelist.begin(), whitelist.end());
+  const std::set<std::string> intended(members.begin(), members.end());
+  if (members.size() != 4 || intended.size() != 4 || configured != intended) {
+    if (detail != nullptr) {
+      std::ostringstream message;
+      message << "relay members do not exactly match Driver whitelist"
+              << " (members=" << intended.size()
+              << ", whitelist=" << configured.size() << ")";
+      *detail = message.str();
+    }
+    return false;
+  }
+  const int64_t now =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  const int64_t expires =
+      now + static_cast<int64_t>(valid_for_ms) * 1000000LL;
+  {
+    lock_guard<mutex> lock(planned_group_power_cycle_lock_);
+    for (auto row = planned_group_power_cycles_.begin();
+         row != planned_group_power_cycles_.end();) {
+      if (row->second.expires_ns <= now) {
+        row = planned_group_power_cycles_.erase(row);
+      } else {
+        ++row;
+      }
+    }
+    for (const std::string &member : members) {
+      PlannedGroupPowerCycle marker;
+      marker.token = token;
+      marker.expires_ns = expires;
+      planned_group_power_cycles_[member] = marker;
+    }
+  }
+  if (detail != nullptr) {
+    *detail = "all 4 whitelist members armed before relay OFF";
+  }
+  return true;
+}
+
+void LdsLidar::CancelPlannedGroupPowerCycle(
+    const std::vector<std::string> &members, const std::string &token) {
+  lock_guard<mutex> lock(planned_group_power_cycle_lock_);
+  for (const std::string &member : members) {
+    const auto row = planned_group_power_cycles_.find(member);
+    if (row != planned_group_power_cycles_.end() &&
+        row->second.token == token) {
+      planned_group_power_cycles_.erase(row);
+    }
+  }
+}
+
+bool LdsLidar::ConsumePlannedGroupPowerCycle(const char *broadcast_code,
+                                             std::string *token) {
+  if (broadcast_code == nullptr || broadcast_code[0] == '\0') {
+    return false;
+  }
+  const int64_t now =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  lock_guard<mutex> lock(planned_group_power_cycle_lock_);
+  const auto row = planned_group_power_cycles_.find(broadcast_code);
+  if (row == planned_group_power_cycles_.end()) {
+    return false;
+  }
+  if (row->second.expires_ns <= now) {
+    planned_group_power_cycles_.erase(row);
+    return false;
+  }
+  if (token != nullptr) {
+    *token = row->second.token;
+  }
+  planned_group_power_cycles_.erase(row);
+  return true;
 }
 
 void LdsLidar::TickNormalDropoutRecovery(bool enable_recovery) {

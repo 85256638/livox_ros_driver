@@ -152,6 +152,12 @@ source devel/setup.bash
 > - 新版 CMake（≥3.27）若报 policy 版本错，再补 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`。
 > - ⚠️ **编译用的 `catkin_ws` 必须和下面 systemd 服务里 `source` 的是同一个目录**，否则你编译了、服务却跑的是另一份旧的，改动不生效还极难排查。
 
+危险恢复判据的5个C++ QC和Python manager测试已接入CMake/CTest；需要验收时执行这一行：
+
+```bash
+cd "$HOME/catkin_ws" && catkin_make run_tests && catkin_test_results
+```
+
 ### 启动
 
 ```bash
@@ -511,7 +517,7 @@ POWER RECOVERY (shared relay; separate manager process):
 
 | 列 | 含义 |
 |----|------|
-| `NOW` | 这一秒的真实状态：`NORMAL` / `NO_DATA` / `DISCONNECTED` / `NORMAL_NO_BROADCAST` / `BROADCAST_RETURNING` / `NORMAL_DROPOUT` / `STARTUP_MISSING` / `WAKE_NO_BROADCAST` / `WAKE_DROPOUT` / `BROADCAST_ONLY` / `HANDSHAKE_STUCK` / `POWER_CYCLE_REQUIRED` / `POWER_SAVING` / `STANDBY` / `CONFIG` / `INIT` / `ERROR`；`POWER_CYCLE_REQUIRED` 的告警详情明确标注四种原因之一，未知 SDK 状态显示 `?` 并进入 `ACTIVE` |
+| `NOW` | 这一秒的真实状态：`NORMAL` / `NO_DATA` / `DISCONNECTED` / `PLANNED_POWER_CYCLE` / `NORMAL_NO_BROADCAST` / `BROADCAST_RETURNING` / `NORMAL_DROPOUT` / `STARTUP_MISSING` / `WAKE_NO_BROADCAST` / `WAKE_DROPOUT` / `BROADCAST_ONLY` / `HANDSHAKE_STUCK` / `POWER_CYCLE_REQUIRED` / `POWER_SAVING` / `STANDBY` / `CONFIG` / `INIT` / `ERROR`；计划内共享断电不计单机故障趋势，`POWER_CYCLE_REQUIRED` 的告警详情明确标注四种原因之一，未知 SDK 状态显示 `?` 并进入 `ACTIVE` |
 | `TREND` | 当前状态优先，再结合最近 60 秒数据面/握手尝试和最近 10 分钟故障 episode 得出的可操作分级；具体规则见下表 |
 | `recv/s` | 1 Hz 看板相邻两次刷新间收到的点云包数（近似每秒速率）；Horizon 正常采样时通常约 2500，未连接显示 `-` |
 | `loss60` | **最近 60 秒**点云网络丢包率，按 `lost / (received + lost)` 计算；窗口内没有点云样本显示 `--`。它不是 Driver 启动以来累计；连接 generation 会显式标记断线清零，即使一秒内重连后的新计数已经超过旧值也不会错误差分 |
@@ -530,7 +536,7 @@ POWER RECOVERY (shared relay; separate manager process):
 | `OBSERVE` | 当前与窗口内均无异常，但针对这个 broadcast code 的连续观察尚不足 10 分钟 |
 | `STABLE` | 当前正常，且已连续观察至少 10 分钟，滚动窗口内没有上述异常 |
 
-> **共享继电器伴生断线不会再触发第二轮：**只有断电前已经连续健康发布 30 秒的同一 broadcast code + generation，才可能武装 `NORMAL_DROPOUT`；组断电后新连接会清除旧 generation 证据，端点冷却/次数上限还会抑制并发重复请求。单纯的 `disconnect_count` 仍不会触发 `UNSTABLE`；趋势只使用原因明确的 dropout episode。
+> **共享继电器伴生断线不再污染单机历史：**manager 在 OFF 前先发布带 token、Driver instance 和 4 个 members 的计划断电意图；Driver 只有在 members 与实际白名单完全一致时才为 4 台建立短时标记并 ACK。manager 收到 ACK 后还会再复核一次触发故障，随后才允许 OFF。健康伴随雷达的断线记录为 `PLANNED_GROUP_POWER_CYCLE`，单独计入 maintenance 历史，不增加 `disconnect / NORMAL_DROPOUT / POWER_CYCLE_REQUIRED`，也不影响稳定性趋势。ACK 超时、拒绝、实例变化或复核恢复都确认通道仍为 ON并取消循环。
 
 > `TREND=WATCH` 但 `HS60=0` 并不矛盾：`HS60` 只展示超时尝试；`WATCH` 还会考虑最近 60 秒的 `REJECTED/NETWORK_ERROR/PROTOCOL_ERROR`、队列丢包，以及最近 10 分钟的 episode/恢复动作。
 
@@ -761,12 +767,21 @@ flowchart TD
     WPCR --> M0
     NPCR --> M0
     SPCR --> M0
-    M0 --> M1{"原因特定安全复核通过？<br/>HANDSHAKE：required + 广播新鲜 + reset 完成<br/>WAKE：两个 generation 相等；窗内归因；静默 ≥10 秒<br/>NORMAL：两个 generation 相等；此前健康 ≥30 秒；静默 ≥5 秒<br/>STARTUP：handle=255；启动缺失 ≥30 秒；无连接/广播/发布<br/>其余原因证据必须为 0<br/>armed + 恰好 4 members + 通道 ON<br/>B0 预检后再收到同 episode/reason 新状态<br/>未触发 30 分钟冷却或 24h 3 次上限"}
-    M1 -->|否| SUP["不发送 OFF并保留明确告警<br/>瞬态预检：间隔 60 秒，总计最多 5 次<br/>已恢复 / 禁用 / 冷却 / 上限：取消或抑制"]
-    M1 -->|是| OBL["先持久化 must-be-ON obligation<br/>确保进程中断后仍会补上电"]
-    OBL --> M2{"OFF 前最新 1 Hz 触发状态<br/>仍精确匹配本次 episode + reason + 证据？"}
-    M2 -->|否| CANCEL["不发送 OFF<br/>确认通道仍为 ON并取消本次循环<br/>释放首条 OFF 前未使用的安全预算"]
-    M2 -->|是| POFF["共享继电器通道 OFF<br/>同组 4 台雷达一起断电"]
+    M0 --> M1{"原因特定安全复核通过？<br/>HANDSHAKE：required + 广播新鲜 + reset 完成<br/>WAKE：两个 generation 相等；窗内归因；静默 ≥10 秒<br/>NORMAL：两个 generation 相等；此前健康 ≥30 秒；静默 ≥5 秒<br/>STARTUP：handle=255；启动缺失 ≥30 秒；无连接/广播/发布<br/>其余原因证据必须为 0<br/>armed + 恰好 4 members + 通道 ON<br/>B0 预检后再收到同 episode/reason 新状态"}
+    M1 -->|否| SUP["不发送 OFF并保留明确告警<br/>瞬态预检：间隔 60 秒，总计最多 5 次<br/>已恢复 / 禁用：取消"]
+    M1 -->|是| INTENT["发布计划断电 token<br/>携带 Driver instance + 精确 4 members<br/>此时尚未占用断电预算"]
+    INTENT --> ACK{"当前 Driver 已先标记 4 台<br/>且白名单与 members 完全一致并 ACK？<br/>每次等待 3 秒，最多 3 次，间隔 0.5 秒"}
+    ACK -->|超时且未满 3 次| INTENT
+    ACK -->|拒绝 / 实例或映射不一致<br/>或 3 次均超时| CANCEL0["发布 CANCEL；不发送 OFF<br/>没有 cycle / obligation，也不占预算"]
+    ACK -->|是| M2{"ACK 后复核<br/>同一 episode + reason 仍成立？"}
+    M2 -->|否| CANCEL0
+    M2 -->|是| BUDGET{"预留持久化安全预算<br/>未触发 30 分钟冷却或 24h 3 次上限？"}
+    BUDGET -->|否| CANCEL0
+    BUDGET -->|是| OBL["持久化 must-be-ON obligation<br/>确保进程中断后仍会补上电<br/>同时每秒刷新计划断电 intent"]
+    OBL -->|写入失败| CANCEL["发布 CANCEL；不发送 OFF<br/>确认通道仍为 ON并取消本次循环<br/>释放首条 OFF 前未使用的安全预算"]
+    OBL -->|成功| M3{"OFF 前最新 1 Hz 触发状态<br/>仍精确匹配本次 episode + reason + 证据？"}
+    M3 -->|否| CANCEL
+    M3 -->|是| POFF["共享继电器通道 OFF<br/>同组 4 台雷达一起断电<br/>伴生断线记为计划维护，不污染单机趋势"]
     POFF --> OFFQ{"B0 已确认目标通道 OFF<br/>且另外 3 个继电器输出未变化？"}
     OFFQ -->|是| HOLD["按有效 off_seconds 保持 OFF<br/>新模板 5 秒；未迁移旧配置可能 10 秒<br/>然后必须恢复 ON"]
     OFFQ -->|否：立即补 ON，不等待| PON
@@ -793,10 +808,10 @@ flowchart TD
   classDef success fill:#dcfce7,stroke:#15803d,color:#14532d;
   classDef guard fill:#f3f4f6,stroke:#6b7280,color:#374151;
   class A,B,C,G,WS,WG,WC,WN,N0,ND,NN,SG,HOLD,PON normal;
-  class E,OBS,FAIL,WAIT,NET,WD,WOBS,NCONF,NOBS,SM,SOBS,SUP,CANCEL,TIMEOUT,REPAIR,RESTORED,ABORT warning;
+  class E,OBS,FAIL,WAIT,NET,WD,WOBS,NCONF,NOBS,SM,SOBS,SUP,CANCEL0,CANCEL,TIMEOUT,REPAIR,RESTORED,ABORT warning;
   class PCR,WPCR,NPCR,SPCR,POFF danger;
   class OK,WOK,NOK,SOK,DONE success;
-  class D,H,AR,RESET,ACCEPT,COMPLETE,I,NOTE,WQ,WR,WAR,WARM,WBR,NARM,NDISC,NR,NBR,NAR,S0,SP,SAR,M0,M1,OBL,M2,OFFQ,ONQ,RETRY,PHASE,VERIFY,LIMIT guard;
+  class D,H,AR,RESET,ACCEPT,COMPLETE,I,NOTE,WQ,WR,WAR,WARM,WBR,NARM,NDISC,NR,NBR,NAR,S0,SP,SAR,M0,M1,INTENT,ACK,M2,BUDGET,OBL,M3,OFFQ,ONQ,RETRY,PHASE,VERIFY,LIMIT guard;
 ```
 
 | 握手时间（从首次连续广播起） | 状态/动作 |
@@ -849,21 +864,22 @@ flowchart TD
 1. Driver 在状态首次进入 `POWER_CYCLE_REQUIRED` 时发布带唯一 `event_id`、`recovery_reason` 和原因证据的 `/livox/power_cycle_request`，并以 1 Hz 发布 `/livox/lidar_recovery_state`。normal 请求携带两代相等的 generation、健康起点、归因断线和当前静默起点；startup 请求携带合成 handle 和缺失起点。
 2. `livox_power_cycle_manager.py` 只接受配置中 `power_groups.<组名>.members` 明确列出的 broadcast code，并按四种 reason 严格复核：handshake 要求广播新鲜与 reset 终态；wake 要求同 generation、60 秒归因窗和 10 秒静默；normal 要求同 generation、此前健康至少 30 秒和当前静默至少 5 秒；startup 要求 `handle=255`、启动缺失至少 30 秒且无连接/广播/发布。非本原因证据必须为 0。继电器 B0 预检查后还必须收到触发成员的一帧更新状态；触发者恢复或身份变化时 fail closed，不发 OFF。
 3. 现场上位机/PLC 已在任一雷达异常时中断测量流程，而且该继电器通道只给这 4 台雷达供电，因此硬恢复不再等待额外的 `SAFE_TO_CYCLE` 许可。守护进程通过状态复核、组级去重/冷却/次数上限及继电器状态检查后，直接控制该电源组映射的**单个继电器通道**；不提供“全部关闭”命令，也不改动另外 3 个继电器输出。
-4. 发送 OFF 前先按物理供电端点把“该通道必须恢复 ON”及 4 个成员快照提交到 SQLite；OFF、ON 都通过独立 B0 查询确认。Driver 的 systemd 安全钩子会在每次启动前和停止后执行与现场 JSON/ROS 无关的紧急补上电，并为协议重试保留 600 秒启动超时；仍有任何补上电义务时，全局禁止新的 OFF。
-5. 上电后必须等待该组 **4 个 members 全部**重新连接、完成配置、握手为 `IDLE`，并在 `Normal + Sampling + publishing` 状态连续健康 10 秒，才记为 `RECOVERY_VERIFIED`。`PowerSaving/StandBy/Init/Config/Error/Off` 均不算本次硬恢复完成；只恢复触发故障的那台或只收到继电器 `OK!` 也不算整组恢复成功。
+4. manager 在占用断电预算和写 obligation **之前**，先通过 `/livox/group_power_cycle_intent` 发送 token、当前 Driver instance 和 4 个 members。Driver 要求 members 与实际连接白名单完全相等，建立默认 15 秒计划停电标记后才通过 `/livox/group_power_cycle_ack` ACK。每次默认等待 3 秒，超时后发布 CANCEL 并间隔 0.5 秒换新 token 快速重试，最多 3 次（总计约 10 秒）；明确拒绝不重试。3 次均超时、Driver拒绝、身份/成员不一致或ACK后故障已恢复，均不发送 OFF，也不会创建 cycle/obligation 或占用断电预算。ACK 成功后每秒刷新 intent，直到继电器操作结束。
+5. 发送 OFF 前已按物理供电端点把“该通道必须恢复 ON”及 4 个成员快照提交到 SQLite；OFF、ON 都通过独立 B0 查询确认。Driver 的 systemd 安全钩子使用 `~/.local/libexec/livox-power-cycle-manager/` 中的稳定原子更新副本，在每次启动前和停止后执行与源码checkout、现场 JSON、ROS无关的紧急补上电；仍有任何补上电义务时，全局禁止新的 OFF。计划维护标签最多保持 180 秒；仍未重连时当前状态回到 `DISCONNECTED`，不会永久用维护标签掩盖恢复失败。
+6. 上电后必须等待该组 **4 个 members 全部**重新连接、完成配置、握手为 `IDLE`，并在 `Normal + Sampling + publishing` 状态连续健康 10 秒，才记为 `RECOVERY_VERIFIED`。`PowerSaving/StandBy/Init/Config/Error/Off` 均不算本次硬恢复完成；只恢复触发故障的那台或只收到继电器 `OK!` 也不算整组恢复成功。
 
 自动控制需要这些条件同时成立：Driver 安全钩子已安装、launch 的 `relay_power_cycle_enable=true`、JSON 中目标电源组 `enabled=true`、本次事件的 reason-specific 状态复核通过，并且没有触发同一物理通道 **30 分钟冷却**、**24 小时 3 次上限**或继电器安全检查。它不订阅 PLC/上位机许可 topic；通过全部门禁后按有效 `off_seconds` 执行共享组 OFF/恢复 ON，再验收 4 台点云。
 
 launch 开关是日常唯一总开关：
 
 - `false`（默认）：完全不启动 manager，不读取继电器 JSON，不连接继电器，更不会发送 OFF。
-- `true`：launch 强制把 Driver 的 `/auto_recover` 设为 `true`，并以 `required=true`、`armed` 模式启动 manager；JSON 顶层旧 `mode` 字段仅为命令行兼容项，不决定 launch 是否武装。
+- `true`：launch 强制把 Driver 的 `/auto_recover` 设为 `true`，并以 `required=false + respawn=true + armed` 启动 manager。manager配置、SQLite或继电器网络故障只会让硬恢复看板进入 `MANAGER_STALE/CRITICAL`，不会关闭Driver和点云话题；JSON顶层旧`mode`字段仅为兼容项，命令行覆盖时会明确打印NOTICE，仍不决定launch是否武装。
 
 无论 launch 开关是什么，只要 SQLite 留有历史“必须恢复 ON”义务，已安装的 systemd 启动前/停止后钩子都会优先尝试并确认 ON。这是中断恢复，不是一次新的断电循环。
 
 ##### 首次部署与配置
 
-先完成新版 Driver 编译，再运行一次安装脚本。它会创建缺失的外部 JSON、给现有 `livox-ros-driver.service` 安装补 ON 安全钩子，并安全迁移/删除旧的独立 manager unit；不会覆盖已有 JSON/SQLite，不会启用 launch 开关，也不会自动重启 Driver。生产 Driver unit 必须使用同一普通用户、`Type=simple`、`Restart=always`、`KillMode=control-group`、`RemainAfterExit=no` 和 `SendSIGKILL=yes`，否则安装器 fail closed：
+先完成新版 Driver 编译，再运行一次安装脚本。它会创建缺失的外部 JSON、把补 ON helper 原子安装到 `~/.local/libexec/livox-power-cycle-manager/`、给现有 `livox-ros-driver.service` 安装不依赖源码树的补 ON 安全钩子，并安全迁移/删除旧的独立 manager unit；不会覆盖已有 JSON/SQLite，不会启用 launch 开关，也不会自动重启 Driver。旧V1 drop-in必须通过这一步升级到稳定helper V2，否则更新器拒绝重启。生产 Driver unit 必须使用同一普通用户、`Type=simple`、`Restart=always`、`KillMode=control-group`、`RemainAfterExit=no` 和 `SendSIGKILL=yes`，否则安装器 fail closed：
 
 ```bash
 bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh"
@@ -881,6 +897,12 @@ python3 -c 'import json,os,pathlib; p=pathlib.Path.home()/".config/livox/power_c
 
 ```bash
 python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py" --config "$HOME/.config/livox/power_cycle.json" --validate-config
+```
+
+再校验实际Driver白名单、enabled继电器members与launch授权；launch已武装时两组广播码必须完全一致，lidar remap不一致会单独WARNING：
+
+```bash
+python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/validate_livox_power_cycle_site.py" --relay-config "$HOME/.config/livox/power_cycle.json" --driver-config "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_lidar_config_multi.json" --launch "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_lidar_multi.launch"
 ```
 
 只读查询所有已启用映射的四路状态（不会改变任何输出）：
@@ -913,8 +935,9 @@ sudo systemctl restart livox-ros-driver && systemctl is-active livox-ros-driver
 
 | 保护 | 默认行为 |
 |------|----------|
-| 白名单 | 未加入 `members`、电源组禁用、广播码不合法或一个成员跨组重复，一律 fail closed |
-| 当前状态复核 | Driver 先完成原因归因；manager 再复核时间戳、离线/未发布真值和互斥证据。handshake 要广播新鲜，wake 要同 generation + 60 秒窗 + 10 秒静默，normal 要同 generation + 30 秒健康 + 5 秒静默，startup 要合成 handle 255 + 30 秒缺失。流程有三个 OFF 决策点：初始缓存、B0 预检后强制收到的新状态、obligation 持久化后的最终缓存复核；任一点恢复/身份变化都取消 OFF。不以其余 3 台健康作为 OFF 前置条件，多台同时异常也只执行一次共享恢复 |
+| 白名单 | 未加入 `members`、电源组禁用、广播码不合法或一个成员跨组重复，一律 fail closed；launch武装时部署校验器和运行时Driver ACK都要求enabled members与实际Driver白名单完全相等 |
+| 计划断电ACK | OFF前manager先等待Driver精确ACK，再占用预算；Driver先标记4台再ACK。每次等待3秒、间隔0.5秒换新token，最多3次；超时token逐一CANCEL，明确拒绝不重试。3次均超时、拒绝、实例/成员不一致或ACK后原因恢复均不创建断电循环。伴生断线单记maintenance，不进入单机故障趋势 |
+| 当前状态复核 | Driver 先完成原因归因；manager 再复核时间戳、离线/未发布真值和互斥证据。handshake 要广播新鲜，wake 要同 generation + 60 秒窗 + 10 秒静默，normal 要同 generation + 30 秒健康 + 5 秒静默，startup 要合成 handle 255 + 30 秒缺失。流程有四个 OFF 决策点：初始缓存、B0 预检后强制收到的新状态、Driver ACK 后、obligation 持久化后；任一点恢复/身份变化都取消 OFF。不以其余 3 台健康作为 OFF 前置条件，多台同时异常也只执行一次共享恢复 |
 | 测量联锁边界 | 上位机/PLC 在任一雷达异常时已负责中断测量；继电器通道只给这 4 台雷达供电，因此 manager 不再要求或等待额外的 `SAFE_TO_CYCLE` 许可 |
 | 协议确认 | 私有 TCP `B0` 状态查询接受完整 `CH/CL`；同时兼容 CX-5104E-L 实机确认的“正确 `CH` + 固定 `AA` 尾字节”（例如全开状态 `... 0D CD AA`），并保留 WARN。该兼容仍严格校验首校验字节、地址、`0D` 结束位和四路状态范围；错误 `CH`、未知非 `AA` 尾字节及越界状态一律拒绝。只有固件精确返回 `00 00` 时，才需对单个电源组显式设置 `allow_omitted_status_checksum=true` |
 | 旁路通道保护 | OFF 前记录另外 3 路继电器状态，目标路 OFF 和恢复 ON 后都再次查询；任一非目标路发生变化立即中止并报 `NON_TARGET_STATE_CHANGED`，软件绝不尝试改动它们 |

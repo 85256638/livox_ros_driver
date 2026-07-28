@@ -18,6 +18,11 @@ STATE_DIR="${HOME}/.local/state/livox-power-cycle-manager"
 STATE_DB="${STATE_DIR}/state.sqlite3"
 EXAMPLE_FILE="${SCRIPT_DIR}/livox_ros_driver/config/livox_power_cycle.example.json"
 MANAGER_SOURCE="${SCRIPT_DIR}/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py"
+MANAGER_RUNTIME_DIR="${HOME}/.local/libexec/livox-power-cycle-manager"
+MANAGER_RUNTIME="${MANAGER_RUNTIME_DIR}/livox_power_cycle_manager.py"
+SITE_VALIDATOR="${SCRIPT_DIR}/livox_ros_driver/livox_ros_driver/scripts/validate_livox_power_cycle_site.py"
+DRIVER_CONFIG="${SCRIPT_DIR}/livox_ros_driver/config/livox_lidar_config_multi.json"
+DRIVER_LAUNCH="${SCRIPT_DIR}/livox_ros_driver/launch/livox_lidar_multi.launch"
 TEMPLATE_FILE="${SCRIPT_DIR}/systemd/livox-ros-driver-power-cycle.conf.in"
 DRIVER_UNIT_NAME="livox-ros-driver.service"
 LEGACY_UNIT_NAME="livox-power-cycle-manager.service"
@@ -30,6 +35,7 @@ LEGACY_STOPPED_BY_INSTALLER=0
 LEGACY_MIGRATION_COMPLETE=0
 RENDERED_FILE=""
 DROPIN_ROLLBACK_PATH=""
+RUNTIME_TEMP=""
 
 log() { printf '[livox-power-cycle-install] %s\n' "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
@@ -39,6 +45,9 @@ cleanup() {
   set +e
   if [[ -n "${RENDERED_FILE}" ]]; then
     rm -f -- "${RENDERED_FILE}"
+  fi
+  if [[ -n "${RUNTIME_TEMP}" ]]; then
+    rm -f -- "${RUNTIME_TEMP}"
   fi
   if [[ -n "${DROPIN_ROLLBACK_PATH}" &&
         ( -e "${DROPIN_ROLLBACK_PATH}" || -L "${DROPIN_ROLLBACK_PATH}" ) &&
@@ -124,20 +133,24 @@ unit_enable_state() {
 }
 
 repair_obligations() {
-  /usr/bin/python3 "${MANAGER_SOURCE}" \
+  local helper="${MANAGER_RUNTIME}"
+  [[ -f "${helper}" && ! -L "${helper}" ]] || helper="${MANAGER_SOURCE}"
+  /usr/bin/python3 "${helper}" \
     --state-db "${STATE_DB}" --repair-obligations
 }
 
-for command_name in sudo systemctl sed install mktemp id mv tr; do
+for command_name in sudo systemctl sed install mktemp id mv tr cmp; do
   command -v "${command_name}" >/dev/null 2>&1 ||
     die "缺少命令：${command_name}"
 done
 [[ -x /usr/bin/python3 ]] || die "找不到可执行文件：/usr/bin/python3"
 [[ ${EUID} -ne 0 ]] || die "请使用普通用户运行；脚本仅通过 sudo 安装 systemd drop-in。"
 [[ -f "${MANAGER_SOURCE}" ]] || die "找不到 relay manager 源文件：${MANAGER_SOURCE}"
+[[ -f "${SITE_VALIDATOR}" ]] || die "找不到现场身份校验器：${SITE_VALIDATOR}"
 
 for path in "${HOME}" "${CONFIG_FILE}" "${STATE_DIR}" "${STATE_DB}" \
-  "${SCRIPT_DIR}" "${MANAGER_SOURCE}" "${DROPIN_PATH}"; do
+  "${SCRIPT_DIR}" "${MANAGER_SOURCE}" "${MANAGER_RUNTIME_DIR}" \
+  "${MANAGER_RUNTIME}" "${DROPIN_PATH}"; do
   [[ "${path}" != *[$'\n\r\t ']* ]] ||
     die "工业服务路径不能包含空白字符：${path}"
   [[ "${path}" =~ ^/[A-Za-z0-9._/-]+$ ]] ||
@@ -181,9 +194,22 @@ fi
 
 mkdir -p -- "${CONFIG_DIR}" "${STATE_DIR}"
 chmod 700 "${CONFIG_DIR}" "${STATE_DIR}"
+if [[ -e "${MANAGER_RUNTIME_DIR}" || -L "${MANAGER_RUNTIME_DIR}" ]]; then
+  [[ -d "${MANAGER_RUNTIME_DIR}" && ! -L "${MANAGER_RUNTIME_DIR}" ]] ||
+    die "稳定 helper 目录不是普通目录或是符号链接：${MANAGER_RUNTIME_DIR}"
+fi
+install -d -m 700 "${MANAGER_RUNTIME_DIR}"
+RUNTIME_TEMP="$(mktemp "${MANAGER_RUNTIME}.new.XXXXXX")"
+install -m 700 "${MANAGER_SOURCE}" "${RUNTIME_TEMP}"
+cmp -s -- "${MANAGER_SOURCE}" "${RUNTIME_TEMP}" ||
+  die "稳定 helper 临时副本校验失败：${RUNTIME_TEMP}"
+mv -f -- "${RUNTIME_TEMP}" "${MANAGER_RUNTIME}"
+RUNTIME_TEMP=""
+[[ -f "${MANAGER_RUNTIME}" && ! -L "${MANAGER_RUNTIME}" ]] ||
+  die "稳定 helper 安装结果无效：${MANAGER_RUNTIME}"
 if [[ ! -e "${CONFIG_FILE}" ]]; then
   install -m 600 "${EXAMPLE_FILE}" "${CONFIG_FILE}"
-  log "已创建安全配置（mode=observe，不会发起新 OFF）：${CONFIG_FILE}"
+  log "已创建安全配置（所有 power group 默认 disabled）：${CONFIG_FILE}"
 else
   [[ -f "${CONFIG_FILE}" && ! -L "${CONFIG_FILE}" ]] ||
     die "现有配置不是普通文件或是符号链接，拒绝使用：${CONFIG_FILE}"
@@ -193,12 +219,16 @@ chmod 600 "${CONFIG_FILE}"
 
 /usr/bin/python3 "${MANAGER_SOURCE}" \
   --config "${CONFIG_FILE}" --validate-config
+/usr/bin/python3 "${SITE_VALIDATOR}" \
+  --relay-config "${CONFIG_FILE}" \
+  --driver-config "${DRIVER_CONFIG}" \
+  --launch "${DRIVER_LAUNCH}"
 CONFIG_STATE_DB="$(/usr/bin/python3 -c 'import json,os,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); p=d.get("state_db", "~/.local/state/livox-power-cycle-manager/state.sqlite3"); print(os.path.abspath(os.path.expandvars(os.path.expanduser(p.strip()))))' "${CONFIG_FILE}")"
 [[ "${CONFIG_STATE_DB}" == "${STATE_DB}" ]] ||
   die "生产安装只允许 state_db=${STATE_DB}；当前配置解析为 ${CONFIG_STATE_DB}。请先迁移并核对旧库中的补上电义务。"
-CONFIG_MODE="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("mode", "observe"))' "${CONFIG_FILE}")"
+CONFIG_MODE="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("mode", "unset"))' "${CONFIG_FILE}")"
 CONFIG_ENABLED_GROUPS="$(/usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); print(sum(1 for row in d.get("power_groups", {}).values() if row.get("enabled") is True))' "${CONFIG_FILE}")"
-log "现场配置保持原状：mode=${CONFIG_MODE}，enabled_groups=${CONFIG_ENABLED_GROUPS}。本脚本不会启动 manager 或重启 Driver。"
+log "现场配置保持原状：legacy_mode=${CONFIG_MODE}（launch 才是唯一硬件授权），enabled_groups=${CONFIG_ENABLED_GROUPS}。本脚本不会启动 manager 或重启 Driver。"
 
 sudo systemctl daemon-reload
 DRIVER_LOAD_STATE="$(unit_load_state "${DRIVER_UNIT_NAME}")"
@@ -212,7 +242,7 @@ DRIVER_USER="$(systemctl show --property=User --value "${DRIVER_UNIT_NAME}")" ||
 DRIVER_RESTART_POLICY="$(systemctl show --property=Restart --value "${DRIVER_UNIT_NAME}")" ||
   die "无法读取 ${DRIVER_UNIT_NAME} 的 Restart 策略。"
 [[ "${DRIVER_RESTART_POLICY}" == "always" ]] ||
-  die "${DRIVER_UNIT_NAME} 的 Restart=${DRIVER_RESTART_POLICY:-unset}；集成 manager 使用 required=true，生产 unit 必须是 Restart=always 才能整套自恢复。"
+  die "${DRIVER_UNIT_NAME} 的 Restart=${DRIVER_RESTART_POLICY:-unset}；Driver 节点仍使用 required=true，生产 unit 必须是 Restart=always 才能在 Driver 退出时整套自恢复。"
 DRIVER_KILL_MODE="$(systemctl show --property=KillMode --value "${DRIVER_UNIT_NAME}")" ||
   die "无法读取 ${DRIVER_UNIT_NAME} 的 KillMode。"
 [[ "${DRIVER_KILL_MODE}" == "control-group" ]] ||
@@ -231,7 +261,7 @@ rendered="$(mktemp "${TMPDIR:-/tmp}/livox-driver-power-cycle-dropin.XXXXXX")"
 RENDERED_FILE="${rendered}"
 sed \
   -e "s|@HOME@|$(escape_sed "${HOME}")|g" \
-  -e "s|@MANAGER_SOURCE@|$(escape_sed "${MANAGER_SOURCE}")|g" \
+  -e "s|@MANAGER_RUNTIME@|$(escape_sed "${MANAGER_RUNTIME}")|g" \
   -e "s|@STATE_DIR@|$(escape_sed "${STATE_DIR}")|g" \
   -e "s|@STATE_DB@|$(escape_sed "${STATE_DB}")|g" \
   "${TEMPLATE_FILE}" >"${rendered}"
@@ -246,7 +276,7 @@ DRIVER_DROPIN_PATHS="$(systemctl show --property=DropInPaths --value "${DRIVER_U
   die "无法读取 ${DRIVER_UNIT_NAME} 的 DropInPaths；安全 drop-in 文件已保留但安装未确认。"
 [[ " ${DRIVER_DROPIN_PATHS} " == *" ${DROPIN_PATH} "* ]] ||
   die "systemd 未确认加载 ${DROPIN_PATH}；拒绝迁移旧 unit。"
-EXPECTED_REPAIR_COMMAND="/usr/bin/python3 ${MANAGER_SOURCE} --state-db ${STATE_DB} --repair-obligations"
+EXPECTED_REPAIR_COMMAND="/usr/bin/python3 ${MANAGER_RUNTIME} --state-db ${STATE_DB} --repair-obligations"
 DRIVER_EXEC_START_PRE="$(systemctl show --property=ExecStartPre --value "${DRIVER_UNIT_NAME}")" ||
   die "无法读取 ${DRIVER_UNIT_NAME} 的有效 ExecStartPre。"
 DRIVER_EXEC_STOP_POST="$(systemctl show --property=ExecStopPost --value "${DRIVER_UNIT_NAME}")" ||
@@ -349,6 +379,7 @@ if [[ "${LEGACY_LOAD_STATE}" != "not-found" ||
 fi
 
 log "已安装 Driver 安全 drop-in：${DROPIN_PATH}"
-log "ExecStartPre/ExecStopPost 将使用固定 SQLite 独立补 ON；TimeoutStartSec=600，TimeoutStopSec=300。"
+log "稳定补 ON helper 已原子同步：${MANAGER_RUNTIME}"
+log "ExecStartPre/ExecStopPost 将使用稳定 helper 和固定 SQLite 独立补 ON；TimeoutStartSec=600，TimeoutStopSec=300。"
 log "未修改 launch 开关、未自动 armed、未停止或重启 ${DRIVER_UNIT_NAME}。"
 log "请在完成 relay JSON、共享通道和电气验收后，再由维护人员决定何时重启 Driver 并启用 launch 开关。"

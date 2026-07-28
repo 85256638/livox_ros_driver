@@ -32,8 +32,10 @@
 #include <array>
 #include <chrono>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "lds.h"
@@ -94,6 +96,17 @@ class LdsLidar : public Lds {
    *  fail-closed STARTUP_MISSING row for configured devices which never
    *  produce any connection/broadcast state. */
   std::vector<std::string> GetWhitelistBroadcastCodes() const;
+  /** Arm a short, token-bound window immediately before the relay manager
+   *  removes power from a shared group. The exact member set must equal this
+   *  Driver's whitelist; an ACK is sent only after these markers are live. */
+  bool ArmPlannedGroupPowerCycle(const std::vector<std::string> &members,
+                                 const std::string &token,
+                                 uint32_t valid_for_ms,
+                                 std::string *detail);
+  /** Remove an uncommitted intent when the manager cancels before its first
+   *  OFF command. Already-consumed disconnect markers remain historical. */
+  void CancelPlannedGroupPowerCycle(const std::vector<std::string> &members,
+                                    const std::string &token);
   livox_status RequestLidarReboot(uint8_t handle, uint16_t timeout_ms = 100);
   /** Watchdog variant: reject if a planned mode request won the per-handle
    *  send race. Manual reboot remains an explicit override. */
@@ -222,6 +235,13 @@ class LdsLidar : public Lds {
     uint32_t handshake_power_cycle_episode_count = 0;
     uint32_t wake_power_cycle_episode_count = 0;
     uint32_t normal_power_cycle_episode_count = 0;
+    /** Shared relay outages acknowledged before OFF are maintenance actions,
+     *  not single-lidar instability. Keep them visible without incrementing
+     *  disconnect/normal-dropout/power-escalation history. */
+    uint32_t planned_group_power_cycle_count = 0;
+    bool planned_group_power_cycle_active = false;
+    int64_t planned_group_power_cycle_deadline_ns = 0;
+    char planned_group_power_cycle_token[129] = {0};
     /** An explicit wake guard survives completion of ModeChangeRequest because
      *  field units can enter Normal/Config and then disappear tens of seconds
      *  later. Identity and generation are captured before the command send. */
@@ -298,6 +318,8 @@ class LdsLidar : public Lds {
   void OnLidarConnectEvent(uint8_t handle, const char *broadcast_code);
   void OnLidarDisconnectEvent(uint8_t handle, const char *broadcast_code);
   void OnLidarBroadcastEvent(uint8_t handle, const char *broadcast_code);
+  bool ConsumePlannedGroupPowerCycle(const char *broadcast_code,
+                                     std::string *token);
   void ArmWakeObservation(uint8_t handle, const char *broadcast_code,
                           uint64_t request_id,
                           uint64_t connection_generation);
@@ -479,6 +501,13 @@ class LdsLidar : public Lds {
   volatile bool is_initialized_;
   char broadcast_code_whitelist_[kMaxLidarCount][kBroadcastCodeSize];
   std::vector<UserRawConfig> raw_config_;
+
+  struct PlannedGroupPowerCycle {
+    std::string token;
+    int64_t expires_ns;
+  };
+  std::mutex planned_group_power_cycle_lock_;
+  std::map<std::string, PlannedGroupPowerCycle> planned_group_power_cycles_;
 
   bool enable_timesync_;
   TimeSync *timesync_;

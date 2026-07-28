@@ -3,14 +3,16 @@
     <!-- LIVOX_POWER_CYCLE_CHILD_V1: keep relay process policy out of site-edited launch files. -->
     <arg name="enable" default="false"/>
 
-    <!-- Armed is fail-closed: a manager exit shuts down the launch so the
-         production service can restart the whole recovery chain. Enabling
-         relay recovery also forces the Driver's prerequisite recovery state
-         machine on before livox_ros_driver_node starts. -->
+    <!-- The manager is isolated from the data plane: configuration, relay, or
+         SQLite failures cannot tear down the Driver. roslaunch respawns it
+         after a bounded delay. Enabling relay recovery also forces the
+         Driver's prerequisite recovery state machine on before the Driver
+         node starts. -->
     <group if="$(arg enable)">
         <param name="/auto_recover" type="bool" value="true"/>
         <node name="livox_power_cycle_manager" pkg="livox_ros_driver"
-              type="livox_power_cycle_manager.py" output="screen" required="true"
+              type="livox_power_cycle_manager.py" output="screen"
+              required="false" respawn="true" respawn_delay="5"
               args="--config $(env HOME)/.config/livox/power_cycle.json --state-db $(env HOME)/.local/state/livox-power-cycle-manager/state.sqlite3 --mode armed --repair-before-start"/>
     </group>
 

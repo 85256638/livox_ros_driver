@@ -35,6 +35,7 @@
 #include <ros/ros.h>
 #include <std_msgs/String.h>
 #include "dashboard_metrics.h"
+#include "group_power_cycle_protocol.h"
 #include "health_logger.h"
 #include "recovery_event_json.h"
 #include "lddc.h"
@@ -188,12 +189,66 @@ static ros::Publisher g_stats_pub;
  *  restart cannot miss a still-active POWER_CYCLE_REQUIRED episode. */
 static ros::Publisher g_power_cycle_request_pub;
 static ros::Publisher g_recovery_state_pub;
+static ros::Publisher g_group_power_cycle_ack_pub;
 static uint64_t g_driver_instance_id = 0;
 static int64_t g_driver_started_ns = 0;
 static int64_t g_driver_started_wall_s = 0;
 /** When true, the stats timer auto-recovers a lidar that is connected/Normal
  *  but has produced no point cloud for a while (restart sampling, then reboot). */
 static bool g_auto_recover = false;
+
+/** Complete the manager -> Driver intent/ACK barrier before a shared relay
+ *  OFF.  The ACK is published only after all four whitelist identities have
+ *  live, token-bound suppression markers. */
+static void GroupPowerCycleIntentCb(
+    const std_msgs::String::ConstPtr &message) {
+  if (!message) {
+    return;
+  }
+  GroupPowerCycleIntent intent;
+  std::string detail;
+  if (!ParseGroupPowerCycleIntentJson(message->data, &intent, &detail)) {
+    ROS_WARN_THROTTLE(30, "Invalid group power-cycle intent ignored: %s",
+                      detail.c_str());
+    return;
+  }
+  if (intent.cancel) {
+    if (g_read_lidar != nullptr &&
+        intent.driver_instance == g_driver_instance_id) {
+      g_read_lidar->CancelPlannedGroupPowerCycle(intent.members, intent.token);
+      ROS_INFO("Cancelled uncommitted group power-cycle intent token=%s group=%s",
+               intent.token.c_str(), intent.group_id.c_str());
+    }
+    return;
+  }
+
+  bool accepted = false;
+  if (g_read_lidar == nullptr) {
+    detail = "raw lidar data source is unavailable";
+  } else if (intent.driver_instance != g_driver_instance_id) {
+    std::ostringstream mismatch;
+    mismatch << "driver_instance mismatch: intent=" << intent.driver_instance
+             << " running=" << g_driver_instance_id;
+    detail = mismatch.str();
+  } else {
+    accepted = g_read_lidar->ArmPlannedGroupPowerCycle(
+        intent.members, intent.token, intent.valid_for_ms, &detail);
+  }
+
+  if (g_group_power_cycle_ack_pub) {
+    std_msgs::String ack;
+    ack.data = BuildGroupPowerCycleIntentAckJson(intent, accepted, detail);
+    g_group_power_cycle_ack_pub.publish(ack);
+  }
+  if (accepted) {
+    ROS_WARN("Armed planned shared power-cycle token=%s group=%s for %u ms",
+             intent.token.c_str(), intent.group_id.c_str(),
+             intent.valid_for_ms);
+  } else {
+    ROS_ERROR("Rejected shared power-cycle intent token=%s group=%s: %s",
+              intent.token.c_str(), intent.group_id.c_str(), detail.c_str());
+  }
+}
 
 static const char *LidarStateStr(uint8_t state) {
   switch (state) {
@@ -527,6 +582,12 @@ static std::string DashboardNowState(
     bool connected, bool broadcast_recent, const char *connected_state,
     const LdsLidar::LinkStat &link) {
   if (!connected) {
+    const int64_t now =
+        std::chrono::steady_clock::now().time_since_epoch().count();
+    if (link.planned_group_power_cycle_active &&
+        link.planned_group_power_cycle_deadline_ns >= now) {
+      return "PLANNED_POWER_CYCLE";
+    }
     if (IsPowerCycleRequired(link)) {
       return "POWER_CYCLE_REQUIRED";
     }
@@ -1490,7 +1551,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
         ls.disconnect_count != 0 || ls.temp_change_count != 0 ||
         ls.fault_count != 0 || ls.recover_reboot_count != 0 ||
         ls.mode_fail_count != 0 || handshake_history || wake_history ||
-        normal_dropout_history || hard_power_history;
+        normal_dropout_history || hard_power_history ||
+        ls.planned_group_power_cycle_count != 0;
     if (has_history) {
       any_process_history = true;
       process_history << "  L" << static_cast<unsigned>(h) << " "
@@ -1500,6 +1562,11 @@ void StatsTimerCb(const ros::TimerEvent &) {
                         << ls.disconnect_count << "; outage duration="
                         << outage_duration << "; current link up=" << link_up
                         << "\n";
+      }
+      if (ls.planned_group_power_cycle_count != 0) {
+        process_history << "    planned shared power cycles="
+                        << ls.planned_group_power_cycle_count
+                        << " (maintenance; excluded from disconnect/trend faults)\n";
       }
       if (handshake_history) {
         process_history << "    handshake attempts (SDK): ACK="
@@ -1871,16 +1938,23 @@ int main(int argc, char **argv) {
   /** Per-second stats dashboard topic (view with scripts/livox_stats_monitor.py
    *  in a separate terminal for an always-current, isolated panel) */
   ros::Timer stats_timer;
+  ros::Subscriber group_power_cycle_intent_sub;
   if (data_src == kSourceRawLidar) {
     g_stats_pub = livox_node.advertise<std_msgs::String>("livox/lidar_stats", 1);
     g_power_cycle_request_pub = livox_node.advertise<std_msgs::String>(
         "livox/power_cycle_request", 16, true);
     g_recovery_state_pub = livox_node.advertise<std_msgs::String>(
         "livox/lidar_recovery_state", 32);
+    g_group_power_cycle_ack_pub = livox_node.advertise<std_msgs::String>(
+        "livox/group_power_cycle_ack", 8);
+    group_power_cycle_intent_sub = livox_node.subscribe(
+        "livox/group_power_cycle_intent", 8, GroupPowerCycleIntentCb);
     stats_timer = livox_node.createTimer(ros::Duration(1.0), StatsTimerCb);
     ROS_INFO("Publishing stats topic: livox/lidar_stats (1Hz)");
     ROS_INFO("Publishing recovery topics: livox/power_cycle_request (latched) "
              "and livox/lidar_recovery_state (1Hz)");
+    ROS_INFO("Shared-power intent barrier: livox/group_power_cycle_intent -> "
+             "livox/group_power_cycle_ack");
     ROS_INFO("Auto-recover (no-data/Config/Error watchdogs): %s",
              g_auto_recover ? "ENABLED" : "disabled");
     ROS_INFO("Handshake session recovery (broadcast-only watchdog): %s",

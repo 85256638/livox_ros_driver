@@ -33,6 +33,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -44,6 +45,9 @@ STATE_DB_SCHEMA_VERSION = 5
 REQUEST_TYPE = "POWER_CYCLE_REQUIRED"
 STATE_TYPE = "LIDAR_RECOVERY_STATE"
 STATUS_TYPE = "POWER_CYCLE_STATUS"
+INTENT_TYPE = "GROUP_POWER_CYCLE_INTENT"
+INTENT_CANCEL_TYPE = "GROUP_POWER_CYCLE_CANCEL"
+INTENT_ACK_TYPE = "GROUP_POWER_CYCLE_INTENT_ACK"
 RECOVERY_STATE_IDLE = "IDLE"
 RECOVERY_STATE_REQUIRED = REQUEST_TYPE
 RECOVERY_REASON_NONE = "NONE"
@@ -74,6 +78,8 @@ TERMINAL_EVENT_STATES = {
     "CYCLE_ALREADY_RECORDED",
     "RECOVERY_UNVERIFIED_AFTER_RESTART",
     "NON_TARGET_STATE_CHANGED",
+    "DRIVER_INTENT_ACK_TIMEOUT",
+    "DRIVER_INTENT_REJECTED",
 }
 ACTIVE_ALARM_STATES = {
     "UNMAPPED",
@@ -89,6 +95,8 @@ ACTIVE_ALARM_STATES = {
     "SUPPRESSED_DAILY_LIMIT",
     "SUPPRESSED_COOLDOWN",
     "NON_TARGET_STATE_CHANGED",
+    "DRIVER_INTENT_ACK_TIMEOUT",
+    "DRIVER_INTENT_REJECTED",
 }
 _BROADCAST_CODE_RE = re.compile(r"^[A-Za-z0-9]{15}$")
 _POWER_GROUP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -131,6 +139,10 @@ class Policy:
     ensure_on_retry_seconds: float = 30.0
     precheck_retry_seconds: float = 60.0
     precheck_max_attempts: int = 5
+    intent_ack_timeout_seconds: float = 3.0
+    intent_ack_attempts: int = 3
+    intent_retry_seconds: float = 0.5
+    intent_valid_for_seconds: float = 15.0
 
 
 @dataclass(frozen=True)
@@ -165,6 +177,8 @@ class ManagerConfig:
     state_topic: str
     status_topic: str
     heartbeat_topic: str
+    intent_topic: str
+    intent_ack_topic: str
     policy: Policy
     power_groups: Mapping[str, PowerGroup]
     member_to_group: Mapping[str, str]
@@ -928,6 +942,10 @@ def _policy_from_json(data: Mapping[str, Any]) -> Policy:
             "ensure_on_retry_seconds",
             "precheck_retry_seconds",
             "precheck_max_attempts",
+            "intent_ack_timeout_seconds",
+            "intent_ack_attempts",
+            "intent_retry_seconds",
+            "intent_valid_for_seconds",
         ),
         "policy",
     )
@@ -997,6 +1015,34 @@ def _policy_from_json(data: Mapping[str, Any]) -> Policy:
         precheck_max_attempts=_integer(
             data, "precheck_max_attempts", default=5, minimum=1, maximum=20
         ),
+        intent_ack_timeout_seconds=_number(
+            data,
+            "intent_ack_timeout_seconds",
+            default=3,
+            minimum=1,
+            maximum=10,
+        ),
+        intent_ack_attempts=_integer(
+            data,
+            "intent_ack_attempts",
+            default=3,
+            minimum=1,
+            maximum=5,
+        ),
+        intent_retry_seconds=_number(
+            data,
+            "intent_retry_seconds",
+            default=0.5,
+            minimum=0,
+            maximum=5,
+        ),
+        intent_valid_for_seconds=_number(
+            data,
+            "intent_valid_for_seconds",
+            default=15,
+            minimum=8,
+            maximum=60,
+        ),
     )
     if policy.status_stale_seconds >= policy.healthy_seconds:
         raise ConfigurationError(
@@ -1049,7 +1095,9 @@ def load_config(path: str) -> ManagerConfig:
     if not isinstance(topics, Mapping):
         raise ConfigurationError("topics must be an object")
     _reject_unknown(
-        topics, ("request", "state", "status", "heartbeat"), "topics"
+        topics,
+        ("request", "state", "status", "heartbeat", "intent", "intent_ack"),
+        "topics",
     )
     policy = _policy_from_json(raw.get("policy", {}))
     group_rows = raw.get("power_groups", {})
@@ -1180,6 +1228,12 @@ def load_config(path: str) -> ManagerConfig:
         ),
         heartbeat_topic=_topic(
             topics, "heartbeat", "/livox/power_cycle_heartbeat"
+        ),
+        intent_topic=_topic(
+            topics, "intent", "/livox/group_power_cycle_intent"
+        ),
+        intent_ack_topic=_topic(
+            topics, "intent_ack", "/livox/group_power_cycle_ack"
         ),
         policy=policy,
         power_groups=power_groups,
@@ -2432,11 +2486,13 @@ class PowerCycleManagerCore:
         store: StateStore,
         emit: Callable[[Mapping[str, Any]], None],
         *,
+        intent_emit: Optional[Callable[[Mapping[str, Any]], None]] = None,
         relay_factory: Callable[[PowerGroup, Policy], Any] = CorxLegacyTcpClient,
     ) -> None:
         self.config = config
         self.store = store
         self.emit = emit
+        self.intent_emit = intent_emit
         self.relay_factory = relay_factory
         self.store.bind_power_groups(
             tuple(
@@ -2451,6 +2507,8 @@ class PowerCycleManagerCore:
             str, Tuple[Mapping[str, Any], float, int]
         ] = {}
         self._state_sequence = 0
+        self._intent_acks: Dict[str, Mapping[str, Any]] = {}
+        self._pending_intent_tokens: set = set()
         self._queue: "queue.Queue[PowerCycleRequest]" = queue.Queue(maxsize=128)
         self._queued_ids: set = set()
         self._completed_ids: set = set()
@@ -2549,6 +2607,31 @@ class PowerCycleManagerCore:
                 self._condition.notify_all()
         if request is not None:
             self._enqueue(request)
+
+    def accept_intent_ack_payload(self, payload: Mapping[str, Any]) -> None:
+        if payload.get("schema_version") != WIRE_SCHEMA_VERSION:
+            raise ValueError("unsupported group-power ACK schema")
+        if payload.get("type") != INTENT_ACK_TYPE:
+            raise ValueError("not a GROUP_POWER_CYCLE_INTENT_ACK message")
+        token = _required_text(payload, "token", maximum=128)
+        _power_group_id(payload.get("group_id"))
+        _integer(payload, "driver_instance", minimum=1)
+        accepted = payload.get("accepted")
+        if not isinstance(accepted, bool):
+            raise ValueError("intent ACK accepted must be a boolean")
+        members = payload.get("members")
+        if not isinstance(members, list) or len(members) != 4:
+            raise ValueError("intent ACK must contain exactly four members")
+        if len({_broadcast_code(row) for row in members}) != 4:
+            raise ValueError("intent ACK members must be unique")
+        detail = payload.get("detail", "")
+        if not isinstance(detail, str) or len(detail) > 512:
+            raise ValueError("intent ACK detail is invalid")
+        with self._condition:
+            if token not in self._pending_intent_tokens:
+                return
+            self._intent_acks[token] = dict(payload)
+            self._condition.notify_all()
 
     def _enqueue(self, request: PowerCycleRequest) -> None:
         with self._condition:
@@ -2655,6 +2738,228 @@ class PowerCycleManagerCore:
                     self._queued_ids.discard(request.event_id)
                 self._queue.task_done()
 
+    def _prepare_driver_intent(
+        self, request: PowerCycleRequest, target: PowerGroup
+    ) -> Tuple[str, str, str]:
+        """Arm the Driver's planned-outage markers and wait for its ACK.
+
+        The barrier is disabled only for direct unit-test configurations which
+        deliberately leave both topics empty. Production JSON parsing always
+        supplies fixed absolute topics and therefore fails closed here.
+        """
+
+        if not self.config.intent_topic and not self.config.intent_ack_topic:
+            return "ACKED", "intent barrier disabled by direct test config", ""
+        if self.intent_emit is None:
+            return (
+                "DRIVER_INTENT_REJECTED",
+                "manager has no group-power intent publisher",
+                "",
+            )
+        token = uuid.uuid4().hex
+        payload = {
+            "schema_version": WIRE_SCHEMA_VERSION,
+            "type": INTENT_TYPE,
+            "token": token,
+            "group_id": target.group_id,
+            "driver_instance": request.driver_instance,
+            "valid_for_ms": int(
+                round(self.config.policy.intent_valid_for_seconds * 1000.0)
+            ),
+            "members": list(target.members),
+        }
+        deadline = time.monotonic() + self.config.policy.intent_ack_timeout_seconds
+        next_publish = 0.0
+
+        def finish(state: str, detail: str) -> Tuple[str, str, str]:
+            with self._condition:
+                self._pending_intent_tokens.discard(token)
+                self._intent_acks.pop(token, None)
+            return state, detail, token
+
+        with self._condition:
+            self._intent_acks.pop(token, None)
+            self._pending_intent_tokens.add(token)
+        while not self.stop_event.is_set():
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            if now >= next_publish:
+                try:
+                    self.intent_emit(payload)
+                except Exception as exc:
+                    return finish(
+                        "DRIVER_INTENT_REJECTED",
+                        "cannot publish Driver intent: %s" % exc,
+                    )
+                next_publish = now + 0.25
+            with self._condition:
+                ack = self._intent_acks.pop(token, None)
+                if ack is None:
+                    self._condition.wait(
+                        timeout=min(0.25, max(0.0, deadline - time.monotonic()))
+                    )
+                    ack = self._intent_acks.pop(token, None)
+            if ack is None:
+                continue
+            ack_members = tuple(ack.get("members", ()))
+            if (
+                ack.get("driver_instance") != request.driver_instance
+                or ack.get("group_id") != target.group_id
+                or ack_members != target.members
+            ):
+                return finish(
+                    "DRIVER_INTENT_REJECTED",
+                    "Driver ACK identity/member mapping does not match request",
+                )
+            detail = str(ack.get("detail") or "")
+            if ack.get("accepted") is not True:
+                return finish(
+                    "DRIVER_INTENT_REJECTED",
+                    detail or "Driver rejected planned shared-power outage",
+                )
+            return finish("ACKED", detail or "Driver armed all group members")
+        return finish(
+            "DRIVER_INTENT_ACK_TIMEOUT",
+            "Driver did not ACK planned shared-power outage within %.1fs"
+            % self.config.policy.intent_ack_timeout_seconds,
+        )
+
+    def _cancel_driver_intent(
+        self, request: PowerCycleRequest, target: PowerGroup, token: str
+    ) -> None:
+        if not token or self.intent_emit is None:
+            return
+        payload = {
+            "schema_version": WIRE_SCHEMA_VERSION,
+            "type": INTENT_CANCEL_TYPE,
+            "token": token,
+            "group_id": target.group_id,
+            "driver_instance": request.driver_instance,
+            "valid_for_ms": int(
+                round(self.config.policy.intent_valid_for_seconds * 1000.0)
+            ),
+            "members": list(target.members),
+        }
+        try:
+            self.intent_emit(payload)
+        except Exception as exc:
+            self._emit(
+                "INTENT_CANCEL_PUBLISH_FAILED",
+                request,
+                "WARN",
+                "unused Driver intent will expire automatically: %s" % exc,
+            )
+
+    def _start_driver_intent_keepalive(
+        self, request: PowerCycleRequest, target: PowerGroup, token: str
+    ) -> Tuple[threading.Event, Optional[threading.Thread]]:
+        stop = threading.Event()
+        if not token or self.intent_emit is None:
+            return stop, None
+        payload = {
+            "schema_version": WIRE_SCHEMA_VERSION,
+            "type": INTENT_TYPE,
+            "token": token,
+            "group_id": target.group_id,
+            "driver_instance": request.driver_instance,
+            "valid_for_ms": int(
+                round(self.config.policy.intent_valid_for_seconds * 1000.0)
+            ),
+            "members": list(target.members),
+        }
+
+        def refresh() -> None:
+            while not stop.is_set() and not self.stop_event.is_set():
+                try:
+                    self.intent_emit(payload)
+                except Exception:
+                    # The initial ACK already established the barrier. A
+                    # transient refresh failure is retried until the relay
+                    # operation finishes; the Driver marker also has its TTL.
+                    pass
+                stop.wait(1.0)
+
+        thread = threading.Thread(
+            target=refresh,
+            name="livox-group-power-intent-keepalive",
+            daemon=True,
+        )
+        thread.start()
+        return stop, thread
+
+    @staticmethod
+    def _stop_driver_intent_keepalive(
+        stop: threading.Event, thread: Optional[threading.Thread]
+    ) -> None:
+        stop.set()
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+    def _cancel_reserved_before_off(
+        self,
+        request: PowerCycleRequest,
+        target: PowerGroup,
+        cycle_id: int,
+        baseline_states: Sequence[bool],
+        state: str,
+        severity: str,
+        reason: str,
+    ) -> None:
+        """Confirm ON and atomically release an unused OFF reservation."""
+
+        try:
+            restore = self.relay_factory(target, self.config.policy)
+            warning = restore.ensure_state(
+                True,
+                retries=self.config.policy.restore_retries,
+                deadline_seconds=self.config.policy.restore_deadline_seconds,
+            )
+            if warning:
+                self._emit("RELAY_PROTOCOL_WARNING", request, "WARN", warning)
+            restored_states, restored_warning = restore.query()
+            if restored_warning:
+                self._emit(
+                    "RELAY_PROTOCOL_WARNING", request, "WARN", restored_warning
+                )
+            if not restored_states[target.channel - 1]:
+                raise RelayProtocolError(
+                    "latest B0 query no longer confirms target channel ON"
+                )
+            changed = [
+                index + 1
+                for index in range(4)
+                if index != target.channel - 1
+                and bool(restored_states[index]) != bool(baseline_states[index])
+            ]
+            if changed:
+                detail = (
+                    "%s; non-target relay channel(s) changed: %s; target "
+                    "remains ON"
+                    % (reason, ",".join(str(item) for item in changed))
+                )
+                state = "NON_TARGET_STATE_CHANGED"
+                severity = "CRITICAL"
+            else:
+                detail = "%s; no OFF was sent and target channel is confirmed ON" % reason
+            self.store.confirm_on_and_cancel_before_off(
+                cycle_id,
+                target.power_key,
+                request.event_id,
+                state,
+                detail,
+            )
+            self._terminal(request, state, severity, detail)
+        except Exception as exc:
+            detail = (
+                "%s; ON archival also failed: %s; persistent obligation retained"
+                % (reason, exc)
+            )
+            self.store.finish_cycle(cycle_id, "POWER_ON_UNCONFIRMED", detail)
+            self._terminal(
+                request, "POWER_ON_UNCONFIRMED", "CRITICAL", detail
+            )
+
     def _process(self, request: PowerCycleRequest, attempt: int) -> None:
         policy = self.config.policy
         target = self.config.group_for(request.broadcast_code)
@@ -2744,10 +3049,111 @@ class PowerCycleManagerCore:
             )
             return
 
-        cycle_id, reason, remaining = self.store.reserve_cycle(
-            request, target, policy
+        intent_state = "DRIVER_INTENT_ACK_TIMEOUT"
+        intent_detail = "Driver intent ACK was not attempted"
+        intent_token = ""
+        for intent_attempt in range(1, policy.intent_ack_attempts + 1):
+            intent_state, intent_detail, intent_token = (
+                self._prepare_driver_intent(request, target)
+            )
+            if intent_state == "ACKED":
+                break
+            self._cancel_driver_intent(request, target, intent_token)
+            if (
+                intent_state != "DRIVER_INTENT_ACK_TIMEOUT"
+                or intent_attempt >= policy.intent_ack_attempts
+            ):
+                self._terminal(
+                    request,
+                    intent_state,
+                    "CRITICAL",
+                    "%s (attempt %d/%d)"
+                    % (intent_detail, intent_attempt, policy.intent_ack_attempts),
+                )
+                return
+            self._emit(
+                "DRIVER_INTENT_ACK_RETRY",
+                request,
+                "WARN",
+                "%s; retrying in %.1fs (attempt %d/%d)"
+                % (
+                    intent_detail,
+                    policy.intent_retry_seconds,
+                    intent_attempt,
+                    policy.intent_ack_attempts,
+                ),
+            )
+            if self.stop_event.wait(policy.intent_retry_seconds):
+                self._terminal(
+                    request,
+                    "DRIVER_INTENT_ACK_TIMEOUT",
+                    "manager shutdown interrupted Driver intent ACK retry",
+                )
+                return
+            retry_trigger, retry_detail = self._wait_trigger_required(
+                request, 0.0
+            )
+            if retry_trigger is not True:
+                state = (
+                    "STALE_OR_RECOVERED"
+                    if retry_trigger is False
+                    else "PRECHECK_FAILED"
+                )
+                severity = "INFO" if retry_trigger is False else "ERROR"
+                self._terminal(
+                    request,
+                    state,
+                    severity,
+                    "intent retry trigger check: %s" % retry_detail,
+                )
+                return
+
+        self._emit("DRIVER_INTENT_ACKED", request, "INFO", intent_detail)
+        intent_keepalive_stop, intent_keepalive_thread = (
+            self._start_driver_intent_keepalive(
+                request, target, intent_token
+            )
         )
+
+        # ACK waiting creates a new race window. Recheck the exact cause and
+        # episode before consuming persistent safety budget.
+        post_ack_trigger, post_ack_detail = self._wait_trigger_required(
+            request, 0.0
+        )
+        if post_ack_trigger is not True:
+            self._stop_driver_intent_keepalive(
+                intent_keepalive_stop, intent_keepalive_thread
+            )
+            self._cancel_driver_intent(request, target, intent_token)
+            state = (
+                "STALE_OR_RECOVERED"
+                if post_ack_trigger is False
+                else "PRECHECK_FAILED"
+            )
+            severity = "INFO" if post_ack_trigger is False else "ERROR"
+            self._terminal(
+                request,
+                state,
+                severity,
+                "post-ACK trigger check: %s" % post_ack_detail,
+            )
+            return
+
+        try:
+            cycle_id, reason, remaining = self.store.reserve_cycle(
+                request, target, policy
+            )
+        except Exception:
+            self._stop_driver_intent_keepalive(
+                intent_keepalive_stop, intent_keepalive_thread
+            )
+            self._cancel_driver_intent(request, target, intent_token)
+            raise
         if cycle_id is None:
+            self._stop_driver_intent_keepalive(
+                intent_keepalive_stop, intent_keepalive_thread
+            )
+            self._cancel_driver_intent(request, target, intent_token)
             if reason == "cooldown":
                 self._terminal(
                     request,
@@ -2785,7 +3191,11 @@ class PowerCycleManagerCore:
         # crash at any later instruction is repaired on process restart.
         try:
             self.store.set_obligation(request, target)
-        except (sqlite3.Error, StateStoreError) as exc:
+        except Exception as exc:
+            self._stop_driver_intent_keepalive(
+                intent_keepalive_stop, intent_keepalive_thread
+            )
+            self._cancel_driver_intent(request, target, intent_token)
             detail = "could not persist must-be-ON obligation: %s" % exc
             try:
                 self.store.cancel_cycle_before_off(
@@ -2805,68 +3215,25 @@ class PowerCycleManagerCore:
             request, 0.0
         )
         if final_trigger is not True:
-            try:
-                restore = self.relay_factory(target, policy)
-                warning = restore.ensure_state(
-                    True,
-                    retries=policy.restore_retries,
-                    deadline_seconds=policy.restore_deadline_seconds,
-                )
-                if warning:
-                    self._emit(
-                        "RELAY_PROTOCOL_WARNING", request, "WARN", warning
-                    )
-                restored_states, restored_warning = restore.query()
-                if restored_warning:
-                    self._emit(
-                        "RELAY_PROTOCOL_WARNING",
-                        request,
-                        "WARN",
-                        restored_warning,
-                    )
-                if not restored_states[target.channel - 1]:
-                    raise RelayProtocolError(
-                        "latest B0 query no longer confirms target channel ON"
-                    )
-                changed = changed_non_target_channels(restored_states)
-                if changed:
-                    detail = (
-                        "trigger state changed before OFF and non-target relay "
-                        "channel(s) changed: %s; target remains ON"
-                        % ",".join(str(item) for item in changed)
-                    )
-                    state = "NON_TARGET_STATE_CHANGED"
-                    severity = "CRITICAL"
-                else:
-                    detail = (
-                        "%s after durable reservation; no OFF was sent and "
-                        "target channel is confirmed ON" % final_trigger_detail
-                    )
-                    if final_trigger is False:
-                        state = "STALE_OR_RECOVERED"
-                        severity = "INFO"
-                    else:
-                        state = "PRECHECK_FAILED"
-                        severity = "ERROR"
-                self.store.confirm_on_and_cancel_before_off(
-                    cycle_id,
-                    target.power_key,
-                    request.event_id,
-                    state,
-                    detail,
-                )
-                self._terminal(request, state, severity, detail)
-            except Exception as exc:
-                detail = (
-                    "trigger state changed before OFF; ON archival also failed: "
-                    "%s; persistent obligation retained" % exc
-                )
-                self.store.finish_cycle(
-                    cycle_id, "POWER_ON_UNCONFIRMED", detail
-                )
-                self._terminal(
-                    request, "POWER_ON_UNCONFIRMED", "CRITICAL", detail
-                )
+            self._stop_driver_intent_keepalive(
+                intent_keepalive_stop, intent_keepalive_thread
+            )
+            self._cancel_driver_intent(request, target, intent_token)
+            state = (
+                "STALE_OR_RECOVERED"
+                if final_trigger is False
+                else "PRECHECK_FAILED"
+            )
+            severity = "INFO" if final_trigger is False else "ERROR"
+            self._cancel_reserved_before_off(
+                request,
+                target,
+                cycle_id,
+                states,
+                state,
+                severity,
+                "%s after durable reservation" % final_trigger_detail,
+            )
             return
         off_confirmed = False
         off_phase_ok = False
@@ -2962,6 +3329,10 @@ class PowerCycleManagerCore:
                     request,
                     "CRITICAL",
                     "%s; persistent ON obligation retained" % exc,
+                )
+            finally:
+                self._stop_driver_intent_keepalive(
+                    intent_keepalive_stop, intent_keepalive_thread
                 )
 
         if not on_archived:
@@ -3428,6 +3799,9 @@ def run_ros(config: ManagerConfig) -> int:
     heartbeat_publisher = rospy.Publisher(
         config.heartbeat_topic, String, queue_size=8, latch=False
     )
+    intent_publisher = rospy.Publisher(
+        config.intent_topic, String, queue_size=8, latch=False
+    )
 
     def emit(payload: Mapping[str, Any]) -> None:
         text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -3447,6 +3821,10 @@ def run_ros(config: ManagerConfig) -> int:
             rospy.logwarn(line)
         else:
             rospy.loginfo(line)
+
+    def emit_intent(payload: Mapping[str, Any]) -> None:
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        intent_publisher.publish(String(data=text))
 
     try:
         singleton_lock = _acquire_singleton_lock(config.state_db)
@@ -3475,7 +3853,9 @@ def run_ros(config: ManagerConfig) -> int:
         endpoint_locks = _acquire_endpoint_locks(
             configured_targets + obligation_targets, config.state_db
         )
-        core = PowerCycleManagerCore(config, store, emit)
+        core = PowerCycleManagerCore(
+            config, store, emit, intent_emit=emit_intent
+        )
     except (OSError, BlockingIOError, sqlite3.Error, StateStoreError) as exc:
         rospy.logfatal("Cannot acquire durable relay safety ownership: %s", exc)
         for stream in reversed(endpoint_locks):
@@ -3500,6 +3880,15 @@ def run_ros(config: ManagerConfig) -> int:
             core.accept_state_payload(payload)
         except (ValueError, ConfigurationError, json.JSONDecodeError) as exc:
             rospy.logwarn_throttle(30, "Invalid recovery state ignored: %s", exc)
+
+    def intent_ack_cb(message: Any) -> None:
+        try:
+            payload = json.loads(message.data)
+            if not isinstance(payload, Mapping):
+                raise ValueError("intent ACK JSON root is not an object")
+            core.accept_intent_ack_payload(payload)
+        except (ValueError, ConfigurationError, json.JSONDecodeError) as exc:
+            rospy.logwarn_throttle(30, "Invalid group-power ACK ignored: %s", exc)
 
     def health_cb(_event: Any) -> None:
         if not core.is_alive() and not rospy.is_shutdown():
@@ -3548,6 +3937,9 @@ def run_ros(config: ManagerConfig) -> int:
     try:
         rospy.Subscriber(config.request_topic, String, request_cb, queue_size=32)
         rospy.Subscriber(config.state_topic, String, state_cb, queue_size=64)
+        rospy.Subscriber(
+            config.intent_ack_topic, String, intent_ack_cb, queue_size=16
+        )
         rospy.on_shutdown(core.stop)
         enabled_groups = sum(
             1 for item in config.power_groups.values() if item.enabled
@@ -3583,10 +3975,13 @@ def run_ros(config: ManagerConfig) -> int:
         # latched status remains the actionable alarm, not a startup banner.
         core.start()
         rospy.loginfo(
-            "Livox power-cycle manager started: mode=%s request=%s state=%s",
+            "Livox power-cycle manager started: mode=%s request=%s state=%s "
+            "intent=%s ack=%s",
             config.mode,
             config.request_topic,
             config.state_topic,
+            config.intent_topic,
+            config.intent_ack_topic,
         )
         health_timer = rospy.Timer(rospy.Duration(10.0), health_cb)
         rospy.spin()
@@ -3708,6 +4103,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 2
         config = replace(config, state_db=state_db_override)
     if args.mode is not None:
+        if config.mode != args.mode:
+            print(
+                "NOTICE: command-line --mode=%s overrides legacy JSON mode=%s; "
+                "the launch relay_power_cycle_enable switch is the hardware "
+                "authorization source" % (args.mode, config.mode),
+                file=sys.stderr,
+            )
         config = replace(config, mode=args.mode)
     if config.mode == "armed" and not any(
         item.enabled for item in config.power_groups.values()
