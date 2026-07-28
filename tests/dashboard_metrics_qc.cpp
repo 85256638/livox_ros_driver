@@ -51,6 +51,7 @@ bool TestWindowsAndCounterReset() {
   c.handshake_protocol_attempts += 5;
   c.disconnect_episodes += 1;
   c.handshake_stuck_episodes += 2;
+  c.wake_dropout_episodes += 8;
   c.power_reached_episodes += 3;
   c.power_request_edges += 7;
   c.fault_episodes += 4;
@@ -66,6 +67,7 @@ bool TestWindowsAndCounterReset() {
                  w.handshake_protocol_60s == 5,
              "handshake attempt deltas are wrong") ||
       !Check(w.disconnect_10m == 1 && w.handshake_stuck_10m == 2 &&
+                 w.wake_dropout_10m == 8 &&
                  w.power_reached_10m == 3 &&
                  w.power_request_edges_10m == 7 && w.fault_10m == 4 &&
                  w.reboot_10m == 5 && w.mode_fail_10m == 6,
@@ -88,6 +90,7 @@ bool TestWindowsAndCounterReset() {
   reset.handshake_protocol_attempts = 1;
   reset.disconnect_episodes = 1;
   reset.handshake_stuck_episodes = 1;
+  reset.wake_dropout_episodes = 1;
   reset.power_reached_episodes = 1;
   reset.power_request_edges = 1;
   reset.fault_episodes = 1;
@@ -103,8 +106,9 @@ bool TestWindowsAndCounterReset() {
                    w.handshake_network_60s == 5 &&
                    w.handshake_protocol_60s == 6,
                "handshake counter reset protection failed") &&
-         Check(w.disconnect_10m == 2 && w.handshake_stuck_10m == 3 &&
-                   w.power_reached_10m == 4 &&
+          Check(w.disconnect_10m == 2 && w.handshake_stuck_10m == 3 &&
+                    w.wake_dropout_10m == 9 &&
+                    w.power_reached_10m == 4 &&
                    w.power_request_edges_10m == 8 && w.fault_10m == 5 &&
                    w.reboot_10m == 6 && w.mode_fail_10m == 7,
                "episode/action counter reset protection failed");
@@ -122,6 +126,7 @@ bool TestConnectionGenerationRebound() {
   c.queue_drops = 5;
   c.handshake_timeout_attempts = 1000;
   c.handshake_stuck_episodes = 20;
+  c.wake_dropout_episodes = 30;
   c.power_reached_episodes = 4;
   c.power_request_edges = 9;
   metrics.Update("LIDAR-A", 7, 0, c);
@@ -131,6 +136,7 @@ bool TestConnectionGenerationRebound() {
   c.queue_drops = 8;
   c.handshake_timeout_attempts = 1002;
   c.handshake_stuck_episodes = 21;
+  c.wake_dropout_episodes = 31;
   c.power_reached_episodes = 5;
   c.power_request_edges = 11;
   DashboardWindow w = metrics.Update("LIDAR-A", 7, kSecond, c);
@@ -139,6 +145,7 @@ bool TestConnectionGenerationRebound() {
              "same-generation traffic must use ordinary differences") ||
       !Check(w.handshake_timeout_60s == 2 &&
                  w.handshake_stuck_10m == 1 &&
+                 w.wake_dropout_10m == 1 &&
                  w.power_reached_10m == 1 &&
                  w.power_request_edges_10m == 2,
              "same-generation process-counter differences are wrong")) {
@@ -154,6 +161,7 @@ bool TestConnectionGenerationRebound() {
   c.queue_drops = 9;
   c.handshake_timeout_attempts = 1005;
   c.handshake_stuck_episodes = 22;
+  c.wake_dropout_episodes = 32;
   c.power_reached_episodes = 6;
   c.power_request_edges = 14;
   w = metrics.Update("LIDAR-A", 8, 2 * kSecond, c);
@@ -162,6 +170,7 @@ bool TestConnectionGenerationRebound() {
              "generation rebound lost new-connection traffic") ||
       !Check(w.handshake_timeout_60s == 5 &&
                  w.handshake_stuck_10m == 2 &&
+                 w.wake_dropout_10m == 2 &&
                  w.power_reached_10m == 2 &&
                  w.power_request_edges_10m == 5,
              "generation edge must SafeDelta process-lifetime counters") ||
@@ -201,6 +210,7 @@ bool TestCodeReuseClearsHistory() {
   replacement.handshake_network_attempts = 30;
   replacement.disconnect_episodes = 40;
   replacement.handshake_stuck_episodes = 23;
+  replacement.wake_dropout_episodes = 9;
   replacement.power_reached_episodes = 6;
   replacement.power_request_edges = 14;
   replacement.fault_episodes = 20;
@@ -211,9 +221,10 @@ bool TestCodeReuseClearsHistory() {
          Check(w.observation_ns == 0 && w.received_60s == 0 &&
                    w.lost_60s == 0 && w.handshake_timeout_60s == 0 &&
                    w.handshake_network_60s == 0 &&
-                   w.disconnect_10m == 0 &&
-                   w.handshake_stuck_10m == 0 &&
-                   w.power_reached_10m == 0 &&
+                    w.disconnect_10m == 0 &&
+                    w.handshake_stuck_10m == 0 &&
+                    w.wake_dropout_10m == 0 &&
+                    w.power_reached_10m == 0 &&
                    w.power_request_edges_10m == 0 && w.fault_10m == 0,
                "handle reuse leaked the previous lidar's history");
 }
@@ -310,15 +321,17 @@ bool TestTrendThresholdsAndSleep() {
     return false;
   }
 
-  uint64_t *repeated[] = {&w.handshake_stuck_10m, &w.power_reached_10m,
-                          &w.fault_10m, &w.reboot_10m, &w.mode_fail_10m};
+  uint64_t *repeated[] = {&w.handshake_stuck_10m, &w.wake_dropout_10m,
+                          &w.power_reached_10m, &w.fault_10m,
+                          &w.reboot_10m, &w.mode_fail_10m};
   for (size_t i = 0; i < sizeof(repeated) / sizeof(repeated[0]); ++i) {
     DashboardWindow category = MatureWindow();
     if (i == 0) category.handshake_stuck_10m = 2;
-    if (i == 1) category.power_reached_10m = 2;
-    if (i == 2) category.fault_10m = 2;
-    if (i == 3) category.reboot_10m = 2;
-    if (i == 4) category.mode_fail_10m = 2;
+    if (i == 1) category.wake_dropout_10m = 2;
+    if (i == 2) category.power_reached_10m = 2;
+    if (i == 3) category.fault_10m = 2;
+    if (i == 4) category.reboot_10m = 2;
+    if (i == 5) category.mode_fail_10m = 2;
     if (!Check(EvaluateTrend(category, live) == kDashboardTrendUnstable,
                "same-kind repeated event/action should be UNSTABLE")) {
       return false;

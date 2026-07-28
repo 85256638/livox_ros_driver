@@ -56,6 +56,12 @@ inline std::string BuildLidarRecoveryStateJson(
     int64_t timestamp, uint64_t driver_instance, uint8_t handle,
     const char *broadcast_code, bool connected, const char *connect_state,
     const char *lidar_state, const char *handshake_state,
+    const char *recovery_state, const char *recovery_reason,
+    const char *wake_state, uint64_t wake_request_id,
+    uint64_t wake_connection_generation,
+    uint64_t wake_dropout_generation,
+    int64_t wake_started_at, int64_t wake_dropout_at,
+    int64_t wake_silence_at,
     bool broadcast_fresh, bool publishing, uint64_t published_packets,
     uint32_t power_cycle_required_count,
     int64_t power_cycle_required_at) {
@@ -72,6 +78,18 @@ inline std::string BuildLidarRecoveryStateJson(
        << ",\"lidar_state\":\"" << RecoveryJsonEscape(lidar_state) << "\""
        << ",\"handshake_state\":\"" << RecoveryJsonEscape(handshake_state)
        << "\""
+       << ",\"recovery_state\":\"" << RecoveryJsonEscape(recovery_state)
+       << "\""
+       << ",\"recovery_reason\":\"" << RecoveryJsonEscape(recovery_reason)
+       << "\""
+       << ",\"wake_state\":\"" << RecoveryJsonEscape(wake_state) << "\""
+       << ",\"wake_request_id\":" << wake_request_id
+       << ",\"wake_connection_generation\":"
+       << wake_connection_generation
+       << ",\"wake_dropout_generation\":" << wake_dropout_generation
+       << ",\"wake_started_at\":" << wake_started_at
+       << ",\"wake_dropout_at\":" << wake_dropout_at
+       << ",\"wake_silence_at\":" << wake_silence_at
        << ",\"broadcast_fresh\":"
        << (broadcast_fresh ? "true" : "false")
        << ",\"publishing\":" << (publishing ? "true" : "false")
@@ -85,7 +103,11 @@ inline std::string BuildLidarRecoveryStateJson(
 inline std::string BuildPowerCycleRequestJson(
     const char *event_id, int64_t timestamp, int64_t detected_at,
     uint64_t driver_instance, uint8_t handle, const char *broadcast_code,
-    bool broadcast_fresh, uint8_t session_reset_attempts,
+    const char *recovery_reason, bool broadcast_fresh,
+    uint64_t wake_request_id, uint64_t wake_connection_generation,
+    uint64_t wake_dropout_generation, int64_t wake_started_at,
+    int64_t wake_dropout_at, int64_t wake_silence_at,
+    uint8_t session_reset_attempts,
     uint32_t episode_count) {
   std::ostringstream json;
   json << "{\"schema_version\":1,\"type\":\"POWER_CYCLE_REQUIRED\""
@@ -96,8 +118,17 @@ inline std::string BuildPowerCycleRequestJson(
        << ",\"handle\":" << static_cast<unsigned>(handle)
        << ",\"broadcast_code\":\"" << RecoveryJsonEscape(broadcast_code)
        << "\""
+       << ",\"recovery_reason\":\"" << RecoveryJsonEscape(recovery_reason)
+       << "\""
        << ",\"broadcast_fresh\":"
        << (broadcast_fresh ? "true" : "false")
+       << ",\"wake_request_id\":" << wake_request_id
+       << ",\"wake_connection_generation\":"
+       << wake_connection_generation
+       << ",\"wake_dropout_generation\":" << wake_dropout_generation
+       << ",\"wake_started_at\":" << wake_started_at
+       << ",\"wake_dropout_at\":" << wake_dropout_at
+       << ",\"wake_silence_at\":" << wake_silence_at
        << ",\"session_reset_attempts\":"
        << static_cast<unsigned>(session_reset_attempts)
        << ",\"episode_count\":" << episode_count << "}";

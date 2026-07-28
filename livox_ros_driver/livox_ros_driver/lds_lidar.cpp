@@ -36,6 +36,7 @@
 #include "rapidjson/document.h"
 #include "rapidjson/filereadstream.h"
 #include "rapidjson/stringbuffer.h"
+#include "wake_dropout_policy.h"
 
 using namespace std;
 
@@ -58,6 +59,62 @@ const int64_t kHandshakePostResetObserveNs = 5000000000LL;
 const int64_t kHandshakeNetworkErrorGateNs = 5000000000LL;
 const uint8_t kHandshakeResetMaxAttempts =
     LdsLidar::HandshakeResetMaxAttempts();
+const int64_t kWakeObservationNs = LdsLidar::WakeObservationNs();
+const int64_t kWakeDropoutConfirmNs = LdsLidar::WakeDropoutConfirmNs();
+const int64_t kWakeBroadcastHandoffNs =
+    LdsLidar::WakeBroadcastHandoffNs();
+const uint32_t kWakeBroadcastHandoffMinFrames =
+    LdsLidar::WakeBroadcastHandoffMinFrames();
+
+/** Clear only live wake attribution. Process-lifetime episode/action counters
+ *  remain available to the dashboard after recovery. */
+void ClearWakeRecoveryState(LdsLidar::LinkStat *s) {
+  if (s == nullptr) {
+    return;
+  }
+  if (s->power_cycle_reason == LdsLidar::kPowerCycleReasonWakeDropout) {
+    s->power_cycle_reason = LdsLidar::kPowerCycleReasonNone;
+  }
+  s->wake_state = LdsLidar::kWakeRecoveryIdle;
+  s->wake_request_id = 0;
+  s->wake_connection_generation = 0;
+  s->wake_dropout_generation = 0;
+  s->wake_started_ns = 0;
+  s->wake_deadline_ns = 0;
+  s->wake_started_wall_s = 0;
+  s->wake_attributed_disconnect_ns = 0;
+  s->wake_attributed_disconnect_wall_s = 0;
+  s->wake_dropout_since_ns = 0;
+  s->wake_dropout_wall_s = 0;
+  s->wake_broadcast_return_since_ns = 0;
+  s->wake_broadcast_return_count = 0;
+  s->wake_dropout_counted_this_request = false;
+  s->wake_power_cycle_counted_this_request = false;
+  memset(s->wake_broadcast_code, 0, sizeof(s->wake_broadcast_code));
+}
+
+WakeDropoutPolicyInput BuildWakePolicyInput(
+    const LdsLidar::LinkStat &s, int64_t now_ns) {
+  WakeDropoutPolicyInput input;
+  input.armed = s.wake_state != LdsLidar::kWakeRecoveryIdle;
+  input.identity_matches =
+      s.broadcast_code[0] != '\0' && s.wake_broadcast_code[0] != '\0' &&
+      strncmp(s.broadcast_code, s.wake_broadcast_code,
+              sizeof(s.broadcast_code)) == 0;
+  input.generation_matches = s.wake_connection_generation != 0 &&
+                             s.wake_connection_generation ==
+                                 s.wake_dropout_generation;
+  input.connected = s.connect_since_ns != 0;
+  input.broadcast_fresh =
+      s.last_broadcast_ns != 0 &&
+      now_ns - s.last_broadcast_ns <= kBroadcastEpisodeGapNs;
+  input.request_id = s.wake_request_id;
+  input.wake_started_ns = s.wake_started_ns;
+  input.wake_deadline_ns = s.wake_deadline_ns;
+  input.attributed_disconnect_ns = s.wake_attributed_disconnect_ns;
+  input.dropout_since_ns = s.wake_dropout_since_ns;
+  return input;
+}
 
 /** Re-evaluate every hardware-escalation guard against one exact live
  *  broadcast episode.  Both the timer's candidate pass and its final commit
@@ -150,6 +207,7 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
   }
   int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
   HandshakeLinkState previous_handshake_state = s.handshake_state;
+  WakeRecoveryState previous_wake_state = s.wake_state;
   uint8_t reset_attempts = s.handshake_reset_attempts;
   int64_t handshake_since_ns = s.broadcast_only_since_ns;
   s.connect_since_ns = now;
@@ -164,6 +222,12 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
   s.handshake_event_valid = false;
   s.handshake_last_network_error_ns = 0;
   s.power_cycle_required_counted_this_episode = false;
+  s.power_cycle_reason = kPowerCycleReasonNone;
+  /** A real Connect is recovery evidence. In particular, clear a wake edge
+   *  after relay ON so the pre-cycle Normal request cannot create a second
+   *  dropout episode on the new connection. */
+  ClearWakeRecoveryState(&s);
+  s.planned_reboot_generation = 0;
   if (s.last_disconnect_ns != 0) {
     long long down_s = (now - s.last_disconnect_ns) / 1000000000LL;
     char buf[48];
@@ -187,6 +251,11 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
     HealthLogger::Get().LogEvent(handle, broadcast_code,
                                  "HANDSHAKE_RECOVERED", detail);
   }
+  if (previous_wake_state >= kWakeRecoveryNoBroadcast) {
+    PrintLidarEvent(handle, broadcast_code, "WAKE_LINK_RECOVERED");
+    HealthLogger::Get().LogEvent(handle, broadcast_code,
+                                 "WAKE_LINK_RECOVERED", "Connect returned");
+  }
 }
 
 void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
@@ -202,9 +271,48 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
   if (s.connect_since_ns == 0 && s.last_disconnect_ns != 0) {
     return;
   }
-  s.disconnect_count++;
-  s.last_disconnect_ns =
+  const int64_t now =
       std::chrono::steady_clock::now().time_since_epoch().count();
+  s.disconnect_count++;
+  s.last_disconnect_ns = now;
+  bool wake_no_broadcast = false;
+  const uint64_t current_generation =
+      connection_generation_[handle].load(std::memory_order_acquire);
+  const bool callback_identity_matches =
+      s.broadcast_code[0] != '\0' && broadcast_code != nullptr &&
+      broadcast_code[0] != '\0' &&
+      strncmp(s.broadcast_code, broadcast_code,
+              sizeof(s.broadcast_code)) == 0;
+  const bool planned_reboot_disconnect =
+      callback_identity_matches && s.planned_reboot_generation != 0 &&
+      s.planned_reboot_generation == current_generation;
+  if (planned_reboot_disconnect) {
+    /** This disconnect belongs to an explicit software reboot, not to the
+     *  earlier wake command. It must never grant shared-relay permission. */
+    ClearWakeRecoveryState(&s);
+    s.planned_reboot_generation = 0;
+  } else if (s.wake_state == kWakeRecoveryObserving) {
+    const bool same_identity =
+        callback_identity_matches && s.wake_broadcast_code[0] != '\0' &&
+        strncmp(s.wake_broadcast_code, s.broadcast_code,
+                sizeof(s.broadcast_code)) == 0;
+    if (same_identity &&
+        s.wake_connection_generation == current_generation &&
+        now <= s.wake_deadline_ns) {
+      s.wake_dropout_generation = current_generation;
+      s.wake_attributed_disconnect_ns = now;
+      s.wake_attributed_disconnect_wall_s =
+          static_cast<int64_t>(time(nullptr));
+      s.wake_dropout_since_ns = now;
+      s.wake_dropout_wall_s = s.wake_attributed_disconnect_wall_s;
+      s.wake_broadcast_return_since_ns = 0;
+      s.wake_broadcast_return_count = 0;
+      s.wake_state = kWakeRecoveryNoBroadcast;
+      wake_no_broadcast = true;
+    } else {
+      ClearWakeRecoveryState(&s);
+    }
+  }
   s.connect_since_ns = 0;
   s.health_code = 0;  /** stale once disconnected */
   s.last_broadcast_ns = 0;
@@ -218,8 +326,17 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
   s.handshake_reset_completed_ns = 0;
   s.handshake_last_network_error_ns = 0;
   s.power_cycle_required_counted_this_episode = false;
+  if (s.power_cycle_reason == kPowerCycleReasonHandshakeStuck) {
+    s.power_cycle_reason = kPowerCycleReasonNone;
+  }
   PrintLidarEvent(handle, broadcast_code, "DISCONNECTED");
   HealthLogger::Get().LogEvent(handle, broadcast_code, "DISCONNECT", "");
+  if (wake_no_broadcast) {
+    PrintLidarEvent(handle, broadcast_code, "WAKE_NO_BROADCAST");
+    HealthLogger::Get().LogEvent(
+        handle, broadcast_code, "WAKE_NO_BROADCAST",
+        "explicit low-power wake lost control link; confirming 10s silence");
+  }
 }
 
 void LdsLidar::OnLidarBroadcastEvent(uint8_t handle,
@@ -230,6 +347,8 @@ void LdsLidar::OnLidarBroadcastEvent(uint8_t handle,
   }
   int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
   bool new_episode = false;
+  bool wake_broadcast_returned = false;
+  bool wake_handoff_completed = false;
   {
     lock_guard<mutex> lock(link_stat_lock_[handle]);
     LinkStat &s = link_stat_[handle];
@@ -246,10 +365,40 @@ void LdsLidar::OnLidarBroadcastEvent(uint8_t handle,
     strncpy(s.broadcast_code, broadcast_code, sizeof(s.broadcast_code) - 1);
     s.broadcast_code[sizeof(s.broadcast_code) - 1] = '\0';
     s.broadcast_count++;
-    bool broadcast_gap =
-        s.last_broadcast_ns != 0 &&
-        now - s.last_broadcast_ns > kBroadcastEpisodeGapNs;
+    const int64_t previous_broadcast_ns = s.last_broadcast_ns;
+    bool broadcast_gap = previous_broadcast_ns != 0 &&
+                         now - previous_broadcast_ns >
+                             kBroadcastEpisodeGapNs;
     s.last_broadcast_ns = now;
+    if (s.connect_since_ns == 0 &&
+        s.wake_attributed_disconnect_ns != 0 &&
+        s.wake_state != kWakeRecoveryIdle) {
+      /** One residual frame is not stable recovery. Preserve the strict
+       *  in-window disconnect attribution, pause only the current continuous
+       *  silence interval, and hand ownership to the handshake path only
+       *  after several live frames spanning a full freshness interval. */
+      if (s.wake_broadcast_return_since_ns == 0 ||
+          previous_broadcast_ns == 0 || broadcast_gap) {
+        s.wake_broadcast_return_since_ns = now;
+        s.wake_broadcast_return_count = 1;
+        wake_broadcast_returned = true;
+      } else {
+        ++s.wake_broadcast_return_count;
+      }
+      if (s.power_cycle_reason == kPowerCycleReasonWakeDropout) {
+        s.power_cycle_reason = kPowerCycleReasonNone;
+      }
+      s.wake_state = kWakeRecoveryObserving;
+      s.wake_dropout_since_ns = 0;
+      s.wake_dropout_wall_s = 0;
+      if (s.wake_broadcast_return_count >=
+              kWakeBroadcastHandoffMinFrames &&
+          now - s.wake_broadcast_return_since_ns >=
+              kWakeBroadcastHandoffNs) {
+        ClearWakeRecoveryState(&s);
+        wake_handoff_completed = true;
+      }
+    }
     if (s.connect_since_ns == 0 && s.broadcast_only_since_ns == 0) {
       s.broadcast_only_since_ns = now;
       s.handshake_state = kHandshakeLinkBroadcastOnly;
@@ -262,6 +411,7 @@ void LdsLidar::OnLidarBroadcastEvent(uint8_t handle,
       s.handshake_event_valid = false;
       s.handshake_last_network_error_ns = 0;
       s.power_cycle_required_counted_this_episode = false;
+      s.power_cycle_reason = kPowerCycleReasonNone;
       new_episode = true;
     } else if (s.connect_since_ns == 0 && broadcast_gap) {
       /** Treat a broadcast gap as the end of the live episode even if the 1Hz
@@ -277,12 +427,208 @@ void LdsLidar::OnLidarBroadcastEvent(uint8_t handle,
       s.handshake_event_valid = false;
       s.handshake_last_network_error_ns = 0;
       s.power_cycle_required_counted_this_episode = false;
+      s.power_cycle_reason = kPowerCycleReasonNone;
       new_episode = true;
     }
   }
   if (new_episode) {
     PrintLidarEvent(handle, broadcast_code, "BROADCAST_ONLY");
     HealthLogger::Get().LogEvent(handle, broadcast_code, "BROADCAST_ONLY", "");
+  }
+  if (wake_broadcast_returned) {
+    PrintLidarEvent(handle, broadcast_code, "WAKE_BROADCAST_RETURNED");
+    HealthLogger::Get().LogEvent(
+        handle, broadcast_code, "WAKE_BROADCAST_RETURNED",
+        "wake hard-power path paused; awaiting stable broadcast handoff");
+  }
+  if (wake_handoff_completed) {
+    PrintLidarEvent(handle, broadcast_code, "WAKE_BROADCAST_STABLE");
+    HealthLogger::Get().LogEvent(
+        handle, broadcast_code, "WAKE_BROADCAST_STABLE",
+        "stable broadcasts returned; handshake recovery owns episode");
+  }
+}
+
+void LdsLidar::ArmWakeObservation(uint8_t handle, const char *broadcast_code,
+                                  uint64_t request_id,
+                                  uint64_t connection_generation) {
+  if (handle >= kMaxLidarCount || broadcast_code == nullptr ||
+      broadcast_code[0] == '\0' || request_id == 0) {
+    return;
+  }
+  const int64_t now =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  bool armed = false;
+  {
+    lock_guard<mutex> lock(link_stat_lock_[handle]);
+    LinkStat &s = link_stat_[handle];
+    if (s.connect_since_ns == 0 || s.broadcast_code[0] == '\0' ||
+        strncmp(s.broadcast_code, broadcast_code,
+                sizeof(s.broadcast_code)) != 0) {
+      return;
+    }
+    if (s.wake_state != kWakeRecoveryIdle &&
+        s.wake_request_id == request_id) {
+      return;  /** a retry must never extend the attribution window */
+    }
+    ClearWakeRecoveryState(&s);
+    s.wake_state = kWakeRecoveryObserving;
+    s.wake_request_id = request_id;
+    s.wake_connection_generation = connection_generation;
+    s.wake_started_ns = now;
+    s.wake_deadline_ns = now + kWakeObservationNs;
+    s.wake_started_wall_s = static_cast<int64_t>(time(nullptr));
+    strncpy(s.wake_broadcast_code, broadcast_code,
+            sizeof(s.wake_broadcast_code) - 1);
+    s.wake_broadcast_code[sizeof(s.wake_broadcast_code) - 1] = '\0';
+    armed = true;
+  }
+  if (armed) {
+    PrintLidarEvent(handle, broadcast_code, "WAKE_OBSERVING_60S");
+    HealthLogger::Get().LogEvent(
+        handle, broadcast_code, "WAKE_OBSERVING",
+        "explicit PowerSaving/StandBy -> Normal command accepted");
+  }
+}
+
+void LdsLidar::CancelWakeObservation(uint8_t handle,
+                                     uint64_t expected_request_id) {
+  if (handle >= kMaxLidarCount) {
+    return;
+  }
+  lock_guard<mutex> lock(link_stat_lock_[handle]);
+  LinkStat &s = link_stat_[handle];
+  if (expected_request_id != 0 &&
+      s.wake_request_id != expected_request_id) {
+    return;
+  }
+  ClearWakeRecoveryState(&s);
+}
+
+void LdsLidar::TickWakeDropoutRecovery(bool enable_recovery) {
+  const int64_t now =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  for (uint8_t handle = 0; handle < kMaxLidarCount; ++handle) {
+    bool became_no_broadcast = false;
+    bool became_dropout = false;
+    bool power_candidate = false;
+    uint64_t expected_request_id = 0;
+    int64_t expected_dropout_since = 0;
+    char broadcast_code[kBroadcastCodeSize] = {0};
+    {
+      lock_guard<mutex> lock(link_stat_lock_[handle]);
+      LinkStat &s = link_stat_[handle];
+      if (s.wake_state == kWakeRecoveryIdle ||
+          s.wake_state == kWakeRecoveryPowerCycleRequired) {
+        continue;
+      }
+      if (s.wake_state == kWakeRecoveryObserving) {
+        const WakeDropoutPolicyInput input = BuildWakePolicyInput(s, now);
+        if (s.wake_attributed_disconnect_ns == 0) {
+          if (WakeObservationExpired(input, now)) {
+            ClearWakeRecoveryState(&s);
+          }
+        } else if (!WakeDropoutAttributionValid(input)) {
+          ClearWakeRecoveryState(&s);
+        } else if (!input.broadcast_fresh) {
+          /** A residual frame returned and then stopped. Begin a fresh,
+           *  conservative ten-second continuous-silence interval instead of
+           *  losing the original in-window attribution. This confirmation may
+           *  cross the 60-second deadline because the causal disconnect was
+           *  already captured inside it. */
+          s.wake_state = kWakeRecoveryNoBroadcast;
+          s.wake_dropout_since_ns = now;
+          s.wake_dropout_wall_s = static_cast<int64_t>(time(nullptr));
+          s.wake_broadcast_return_since_ns = 0;
+          s.wake_broadcast_return_count = 0;
+          became_no_broadcast = true;
+          strncpy(broadcast_code, s.broadcast_code,
+                  sizeof(broadcast_code) - 1);
+        }
+      } else {
+        const WakeDropoutPolicyInput input = BuildWakePolicyInput(s, now);
+        if (!WakeDropoutEscalationReady(input, now,
+                                        kWakeDropoutConfirmNs)) {
+          continue;
+        }
+        if (s.wake_state == kWakeRecoveryNoBroadcast) {
+          s.wake_state = kWakeRecoveryDropout;
+          if (!s.wake_dropout_counted_this_request) {
+            s.wake_dropout_count++;
+            s.wake_dropout_counted_this_request = true;
+          }
+          became_dropout = true;
+        }
+        strncpy(broadcast_code, s.broadcast_code,
+                sizeof(broadcast_code) - 1);
+        expected_request_id = s.wake_request_id;
+        expected_dropout_since = s.wake_dropout_since_ns;
+        power_candidate = enable_recovery &&
+                          s.wake_state == kWakeRecoveryDropout;
+      }
+    }
+
+    if (became_no_broadcast) {
+      PrintLidarEvent(handle, broadcast_code, "WAKE_NO_BROADCAST");
+      HealthLogger::Get().LogEvent(
+          handle, broadcast_code, "WAKE_NO_BROADCAST",
+          "broadcast return was transient; confirming 10s silence");
+    }
+    if (became_dropout) {
+      PrintLidarEvent(handle, broadcast_code, "WAKE_DROPOUT");
+      HealthLogger::Get().LogEvent(
+          handle, broadcast_code, "WAKE_DROPOUT",
+          enable_recovery
+              ? "explicit wake lost control+broadcast for 10s"
+              : "explicit wake lost control+broadcast for 10s; detection only");
+    }
+    if (!power_candidate) {
+      continue;
+    }
+
+    bool committed = false;
+    const int64_t commit_now =
+        std::chrono::steady_clock::now().time_since_epoch().count();
+    {
+      lock_guard<mutex> lock(link_stat_lock_[handle]);
+      LinkStat &s = link_stat_[handle];
+      const WakeDropoutPolicyInput input = BuildWakePolicyInput(s, commit_now);
+      if (s.wake_state == kWakeRecoveryDropout &&
+          s.wake_request_id == expected_request_id &&
+          s.wake_dropout_since_ns == expected_dropout_since &&
+          WakeDropoutEscalationReady(input, commit_now,
+                                     kWakeDropoutConfirmNs)) {
+        s.wake_state = kWakeRecoveryPowerCycleRequired;
+        s.power_cycle_reason = kPowerCycleReasonWakeDropout;
+        s.power_cycle_required_count++;
+        if (!s.wake_power_cycle_counted_this_request) {
+          s.power_cycle_required_episode_count++;
+          s.wake_power_cycle_episode_count++;
+          s.wake_power_cycle_counted_this_request = true;
+        }
+        s.power_cycle_required_wall_s = static_cast<int64_t>(time(nullptr));
+        committed = true;
+        strncpy(broadcast_code, s.broadcast_code,
+                sizeof(broadcast_code) - 1);
+        broadcast_code[sizeof(broadcast_code) - 1] = '\0';
+      }
+    }
+    if (!committed) {
+      continue;
+    }
+
+    /** Do this after releasing link_stat_lock_: ResetModeRequestIfTarget takes
+     *  the per-handle SDK send lock. Leaving the pre-fault Normal request
+     *  queued would re-send it immediately after relay ON. */
+    ResetModeRequestIfTarget(handle, kLidarModeNormal,
+                             expected_request_id);
+    PrintLidarEvent(handle, broadcast_code, "POWER_CYCLE_REQUIRED");
+    HealthLogger::Get().LogEvent(
+        handle, broadcast_code, "POWER_CYCLE_REQUIRED",
+        "reason=WAKE_DROPOUT; no control link or broadcast for 10s");
+    printf("[LivoxRecover] Lidar[%d][%s] WAKE_DROPOUT confirmed; "
+           "physical group power cycle required\n",
+           handle, broadcast_code);
   }
 }
 
@@ -316,6 +662,9 @@ void LdsLidar::TickHandshakeRecovery(bool enable_recovery) {
         s.handshake_reset_completed_ns = 0;
         s.handshake_last_network_error_ns = 0;
         s.power_cycle_required_counted_this_episode = false;
+        if (s.power_cycle_reason == kPowerCycleReasonHandshakeStuck) {
+          s.power_cycle_reason = kPowerCycleReasonNone;
+        }
         continue;
       }
       if (s.handshake_state == kHandshakeLinkPowerCycleRequired) {
@@ -368,10 +717,17 @@ void LdsLidar::TickHandshakeRecovery(bool enable_recovery) {
         /** Count only this committed edge.  Keep the lock through external
          *  logging so a concurrent NETWORK_ERROR cannot cancel the episode
          *  and then be followed by a stale POWER_CYCLE_REQUIRED record. */
+        /** Sustained live broadcasts plus a completed session reset now make
+         *  handshake recovery the sole cause. Drop any still-observing wake
+         *  token so the live relay-manager frame cannot carry evidence from
+         *  two different recovery reasons. */
+        ClearWakeRecoveryState(&s);
         s.handshake_state = kHandshakeLinkPowerCycleRequired;
+        s.power_cycle_reason = kPowerCycleReasonHandshakeStuck;
         s.power_cycle_required_count++;
         if (!s.power_cycle_required_counted_this_episode) {
           s.power_cycle_required_episode_count++;
+          s.handshake_power_cycle_episode_count++;
           s.power_cycle_required_counted_this_episode = true;
         }
         s.power_cycle_required_wall_s = static_cast<int64_t>(time(nullptr));
@@ -526,7 +882,22 @@ livox_status LdsLidar::RequestLidarModeChange(const char *broadcast_code,
 }
 
 livox_status LdsLidar::RequestLidarModeChange(uint8_t handle, LidarMode mode) {
-  return SendModeChangeRequest(handle, mode, false);
+  return RequestLidarModeChange(handle, mode, 0);
+}
+
+livox_status LdsLidar::RequestLidarModeChange(uint8_t handle, LidarMode mode,
+                                              uint32_t delay_ms) {
+  int64_t not_before_ns = 0;
+  if (delay_ms != 0) {
+    not_before_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            (std::chrono::steady_clock::now() +
+             std::chrono::milliseconds(delay_ms))
+                .time_since_epoch())
+            .count();
+  }
+  return SendModeChangeRequest(handle, mode, false, 0, 0, 0,
+                               not_before_ns);
 }
 
 livox_status LdsLidar::RequestLidarReboot(uint8_t handle, uint16_t timeout_ms) {
@@ -553,6 +924,7 @@ livox_status LdsLidar::RequestLidarRebootImpl(
       return kStatusFailure;
     }
   }
+  uint64_t reboot_generation = 0;
   {
     lock_guard<mutex> lock(data_lock_[handle]);
     LidarDevice *p_lidar = &lidars_[handle];
@@ -560,8 +932,30 @@ livox_status LdsLidar::RequestLidarRebootImpl(
         p_lidar->handle != handle) {
       return kStatusNotConnected;
     }
+    reboot_generation = connection_generation_[handle].load(
+        std::memory_order_acquire);
   }
-  return RebootDevice(handle, timeout_ms, RebootCb, this);
+  {
+    lock_guard<mutex> lock(link_stat_lock_[handle]);
+    link_stat_[handle].planned_reboot_generation = reboot_generation;
+  }
+  /** Arm the competing-cause marker before entering the SDK, so even a
+   *  synchronous disconnect cannot be attributed to the earlier wake. A
+   *  definite synchronous enqueue rejection, however, leaves the original
+   *  wake evidence intact because no reboot command was accepted. */
+  const livox_status status =
+      RebootDevice(handle, timeout_ms, RebootCb, this);
+  {
+    lock_guard<mutex> lock(link_stat_lock_[handle]);
+    LinkStat &s = link_stat_[handle];
+    if (s.planned_reboot_generation == reboot_generation) {
+      s.planned_reboot_generation = 0;
+      if (status == kStatusSuccess) {
+        ClearWakeRecoveryState(&s);
+      }
+    }
+  }
+  return status;
 }
 
 livox_status LdsLidar::RequestRestartSampling(uint8_t handle) {
@@ -715,8 +1109,54 @@ bool LdsLidar::IsCurrentConfigContext(
   const LidarDevice &lidar = lidars_[handle];
   return lidar.handle == handle &&
          lidar.connect_state == kConnectStateConfig &&
-         connection_generation == connection_generation_[handle].load(
-                                      std::memory_order_acquire);
+          connection_generation == connection_generation_[handle].load(
+                                       std::memory_order_acquire);
+}
+
+livox_status LdsLidar::SendNextConfigCommand(
+    uint8_t handle, uint64_t connection_generation) {
+  if (handle >= kMaxLidarCount) {
+    return kStatusInvalidHandle;
+  }
+
+  uint32_t pending_bits = 0;
+  {
+    lock_guard<mutex> lock(data_lock_[handle]);
+    const LidarDevice &lidar = lidars_[handle];
+    if (lidar.handle != handle ||
+        lidar.connect_state != kConnectStateConfig ||
+        connection_generation != connection_generation_[handle].load(
+                                     std::memory_order_acquire)) {
+      return kStatusNotConnected;
+    }
+    pending_bits = lidar.config.set_bits;
+  }
+
+  /** One command per handle at a time. Each successful callback clears its bit
+   *  and calls this function for the next stage; timeout retries stay inside
+   *  the same stage. Never call a Send* function while holding data/config
+   *  locks because SDK callbacks can complete on another thread. */
+  if (pending_bits & kConfigCoordinate) {
+    printf("Lidar[%d] config pipeline -> coordinate\n", handle);
+    return SendCoordinateConfig(handle, 0, connection_generation);
+  }
+  if (pending_bits & kConfigReturnMode) {
+    printf("Lidar[%d] config pipeline -> return mode\n", handle);
+    return SendReturnModeConfig(handle, 0, connection_generation);
+  }
+  if (pending_bits & kConfigImuRate) {
+    printf("Lidar[%d] config pipeline -> IMU rate\n", handle);
+    return SendImuRateConfig(handle, 0, connection_generation);
+  }
+  if (pending_bits & kConfigGetExtrinsicParameter) {
+    printf("Lidar[%d] config pipeline -> extrinsic\n", handle);
+    return SendExtrinsicConfig(handle, 0, connection_generation);
+  }
+  if (pending_bits & kConfigSetHighSensitivity) {
+    printf("Lidar[%d] config pipeline -> sensitivity\n", handle);
+    return SendHighSensitivityConfig(handle, 0, connection_generation);
+  }
+  return pending_bits == 0 ? kStatusSuccess : kStatusFailure;
 }
 
 livox_status LdsLidar::SendCoordinateConfig(uint8_t handle,
@@ -967,10 +1407,18 @@ uint64_t LdsLidar::GetConnectionGeneration(uint8_t handle) const {
 
 namespace {
 /** Verify all requested modes from actual heartbeat state. Normal gets a
- *  longer retry budget because motor spin-up can take several seconds. */
+ *  longer no-ACK retry budget because command delivery can still fail. A
+ *  positive Normal ACK is different: Horizon reports response 2 while its
+ *  motor is spinning up, and field units need up to about 16 seconds. Re-sending
+ *  every two seconds during that healthy transition overloaded the command
+ *  service. Give the first positive ACK a fixed, non-extendable 20-second grace
+ *  and permit only two later probes, five seconds apart. */
 const int64_t kModeVerifyIntervalNs = 2LL * 1000000000LL;  // 2 s
 const uint8_t kSleepVerifyMaxRetries = 3;
-const uint8_t kNormalVerifyMaxRetries = 7;
+const uint8_t kNormalNoAckMaxRetries = 7;
+const int64_t kNormalSpinupGraceNs = 20LL * 1000000000LL;
+const int64_t kNormalPostGraceRetryIntervalNs = 5LL * 1000000000LL;
+const uint8_t kNormalPostGraceMaxRetries = 2;
 /** Initial config command plus two timeout retries. If all fail, keep the
  *  device in Config; the bounded Config watchdog handles escalation. */
 const uint8_t kConfigCommandMaxRetries = 2;
@@ -993,7 +1441,9 @@ void LdsLidar::TickSleepModeVerification() {
     uint64_t connection_generation = 0;
     uint8_t max_retries = kSleepVerifyMaxRetries;
     uint8_t attempt = 0;
-    bool resend = false, giveup = false, done = false, exhausted = false;
+    uint8_t post_grace_attempt = 0;
+    bool initial_send = false, resend = false, giveup = false, done = false,
+         exhausted = false, acknowledged_normal = false;
     LidarConnectState connect_state;
     LidarState actual_state;
     {
@@ -1013,10 +1463,11 @@ void LdsLidar::TickSleepModeVerification() {
       request_id = req.request_id;
       command_id = req.command_id;
       max_retries = (desired == kLidarModeNormal)
-                        ? kNormalVerifyMaxRetries
+                        ? kNormalNoAckMaxRetries
                         : kSleepVerifyMaxRetries;
-      /** Gate on elapsed time + actual state (not command_inflight): resending
-       *  is idempotent, so even a lost ack still gets retried after the interval. */
+      acknowledged_normal =
+          desired == kLidarModeNormal &&
+          req.normal_spinup_grace_deadline_ns != 0;
       if (connect_state == kConnectStateOff) {
         if (desired == kLidarModeNormal) {
           req.command_inflight = false;
@@ -1026,23 +1477,64 @@ void LdsLidar::TickSleepModeVerification() {
         }
       } else if (actual_state == ModeToState(req.desired_mode)) {
         done = true;  // mode actually took effect
-      } else if (now - req.last_command_ns >= kModeVerifyIntervalNs) {
-        if (req.sleep_retry_count < max_retries) {
-          req.sleep_retry_count++;
-          req.last_command_ns = now;
-          attempt = req.sleep_retry_count;
-          resend = true;
-        } else {
-          exhausted = true;  // tried the max times, still not switched
+      } else if (req.command_id == 0) {
+        /** A staggered broadcast wake has not sent its first command yet.
+         *  Dispatch it from this timer once due; never sleep the ROS callback. */
+        initial_send = !req.command_inflight &&
+                       (req.send_not_before_ns == 0 ||
+                        now >= req.send_not_before_ns);
+      } else if (!req.command_inflight) {
+        /** The paired SDK guarantees one terminal callback for every accepted
+         *  command, so an in-flight command must never be duplicated. */
+        if (acknowledged_normal) {
+          if (now >= req.normal_spinup_grace_deadline_ns &&
+              now - req.last_command_ns >=
+                  kNormalPostGraceRetryIntervalNs) {
+            max_retries = kNormalPostGraceMaxRetries;
+            if (req.normal_post_grace_retry_count <
+                kNormalPostGraceMaxRetries) {
+              req.normal_post_grace_retry_count++;
+              req.sleep_retry_count++;
+              req.last_command_ns = now;
+              post_grace_attempt = req.normal_post_grace_retry_count;
+              attempt = req.sleep_retry_count;
+              resend = true;
+            } else {
+              exhausted = true;
+            }
+          }
+        } else if (now - req.last_command_ns >= kModeVerifyIntervalNs) {
+          if (req.sleep_retry_count < max_retries) {
+            req.sleep_retry_count++;
+            req.last_command_ns = now;
+            attempt = req.sleep_retry_count;
+            resend = true;
+          } else {
+            exhausted = true;  // tried the max times, still not switched
+          }
         }
       }
     }
     if (done) {
       ResetModeRequestIfTarget(h, desired, request_id, 0,
                                connection_generation);
+    } else if (initial_send) {
+      printf("Lidar[%d] staggered Normal wake is due -- sending first command\n",
+             h);
+      livox_status s = SendModeChangeRequest(
+          h, desired, true, request_id, connection_generation, command_id);
+      if (s != kStatusSuccess) {
+        printf("Lidar[%d] delayed mode send returned %d\n", h, s);
+      }
     } else if (resend) {
-      printf("Lidar[%d] not in mode[%d] yet -- re-sending (attempt %u/%u)\n", h,
-             desired, attempt, max_retries);
+      if (acknowledged_normal) {
+        printf("Lidar[%d] not Normal after fixed 20s spin-up grace -- "
+               "re-sending probe %u/%u (total retry %u)\n",
+               h, post_grace_attempt, kNormalPostGraceMaxRetries, attempt);
+      } else {
+        printf("Lidar[%d] not in mode[%d] yet -- re-sending (attempt %u/%u)\n",
+               h, desired, attempt, max_retries);
+      }
       livox_status s = SendModeChangeRequest(
           h, desired, true, request_id, connection_generation, command_id);
       if (s != kStatusSuccess) {
@@ -1062,9 +1554,15 @@ void LdsLidar::TickSleepModeVerification() {
         link_stat_[h].mode_fail_wall_s = (int64_t)time(nullptr);
         link_stat_[h].mode_fail_mode = (uint8_t)desired;
       }
-      printf("Lidar[%d] did not enter mode[%d] after %u retries -- manual check "
-             "needed\n",
-             h, desired, max_retries);
+      if (acknowledged_normal) {
+        printf("Lidar[%d] did not enter Normal after the fixed spin-up grace "
+               "and %u probes -- manual check needed\n",
+               h, kNormalPostGraceMaxRetries);
+      } else {
+        printf("Lidar[%d] did not enter mode[%d] after %u retries -- manual "
+               "check needed\n",
+               h, desired, max_retries);
+      }
     } else if (giveup) {
       ResetModeRequestIfTarget(h, desired, request_id, command_id,
                                connection_generation);
@@ -1098,7 +1596,7 @@ void LdsLidar::MarkModeRequestDisconnected(uint8_t handle) {
 livox_status LdsLidar::SendModeChangeRequest(
     uint8_t handle, LidarMode mode, bool from_reconnect,
     uint64_t expected_request_id, uint64_t expected_generation,
-    uint64_t expected_command_id) {
+    uint64_t expected_command_id, int64_t initial_not_before_ns) {
   if (handle >= kMaxLidarCount) {
     return kStatusInvalidHandle;
   }
@@ -1108,6 +1606,8 @@ livox_status LdsLidar::SendModeChangeRequest(
   LidarConnectState connect_state = kConnectStateOff;
   LidarState actual_state = kLidarStateUnknown;
   uint64_t connection_generation = 0;
+  const int64_t now_ns =
+      std::chrono::steady_clock::now().time_since_epoch().count();
   char live_broadcast_code[kBroadcastCodeSize] = {0};
   {
     lock_guard<mutex> lock(data_lock_[handle]);
@@ -1130,22 +1630,25 @@ livox_status LdsLidar::SendModeChangeRequest(
     /** Idempotent broadcast/service semantics: a lidar already at the requested
      *  low-power target is a success and must not be disturbed. A conflicting
      *  in-flight request still wins until its lifecycle finishes. */
-    lock_guard<mutex> lock(mode_mutex_);
-    ModeChangeRequest &request = mode_requests_[handle];
-    if (request.active && request.desired_mode != mode) {
-      return kStatusFailure;
-    }
-    if (request.active) {
-      char broadcast_code[kBroadcastCodeSize] = {0};
-      strncpy(broadcast_code, request.broadcast_code,
-              sizeof(broadcast_code) - 1);
-      request = ModeChangeRequest();
-      if (broadcast_code[0] != '\0') {
-        strncpy(request.broadcast_code, broadcast_code,
-                sizeof(request.broadcast_code) - 1);
-        request.broadcast_code[sizeof(request.broadcast_code) - 1] = '\0';
+    {
+      lock_guard<mutex> lock(mode_mutex_);
+      ModeChangeRequest &request = mode_requests_[handle];
+      if (request.active && request.desired_mode != mode) {
+        return kStatusFailure;
+      }
+      if (request.active) {
+        char broadcast_code[kBroadcastCodeSize] = {0};
+        strncpy(broadcast_code, request.broadcast_code,
+                sizeof(broadcast_code) - 1);
+        request = ModeChangeRequest();
+        if (broadcast_code[0] != '\0') {
+          strncpy(request.broadcast_code, broadcast_code,
+                  sizeof(request.broadcast_code) - 1);
+          request.broadcast_code[sizeof(request.broadcast_code) - 1] = '\0';
+        }
       }
     }
+    CancelWakeObservation(handle);
     return kStatusSuccess;
   }
   /** A sleep/standby request is safe only after this session completed its
@@ -1160,6 +1663,9 @@ livox_status LdsLidar::SendModeChangeRequest(
 
   uint64_t request_id = 0;
   uint64_t command_id = 0;
+  bool send_now = false;
+  bool arm_wake_observation = false;
+  bool cancel_wake_observation = false;
   {
     lock_guard<mutex> lock(mode_mutex_);
     ModeChangeRequest &request = mode_requests_[handle];
@@ -1168,12 +1674,26 @@ livox_status LdsLidar::SendModeChangeRequest(
       request.waiting_for_reconnect = false;
       request.command_inflight = false;
       request.desired_mode = mode;
+      request.command_id = 0;
+      request.last_command_ns = 0;
+      request.send_not_before_ns = initial_not_before_ns;
+      request.normal_spinup_grace_deadline_ns = 0;
       request.sleep_retry_count = 0;
+      request.normal_post_grace_retry_count = 0;
+      request.explicit_wake_source =
+          connected && mode == kLidarModeNormal &&
+          (actual_state == kLidarStatePowerSaving ||
+           actual_state == kLidarStateStandBy);
+      request.explicit_wake_generation =
+          request.explicit_wake_source ? connection_generation : 0;
+      request.wake_observation_armed = false;
       request.request_id = ++next_mode_request_id_;
+      cancel_wake_observation = mode != kLidarModeNormal;
     } else if (!request.active || request.desired_mode != mode ||
                (expected_request_id != 0 &&
-                request.request_id != expected_request_id) ||
-               request.command_id != expected_command_id) {
+                 request.request_id != expected_request_id) ||
+               request.command_id != expected_command_id ||
+               request.command_inflight) {
       return kStatusFailure;
     }
     if (live_broadcast_code[0] != '\0') {
@@ -1185,18 +1705,43 @@ livox_status LdsLidar::SendModeChangeRequest(
     if (mode == kLidarModeNormal) {
       request.waiting_for_reconnect = !connected;
     }
-    if (connected) {
+    send_now = connected &&
+               (request.send_not_before_ns == 0 ||
+                now_ns >= request.send_not_before_ns);
+    if (send_now) {
       command_id = ++next_mode_command_id_;
       request.command_id = command_id;
       request.command_inflight = true;
       request.waiting_for_reconnect = false;
-      request.last_command_ns =
-          std::chrono::steady_clock::now().time_since_epoch().count();
+      request.last_command_ns = now_ns;
+      request.send_not_before_ns = 0;
+      const bool same_session_low_power_wake =
+          request.explicit_wake_source &&
+          request.explicit_wake_generation == connection_generation &&
+          (actual_state == kLidarStatePowerSaving ||
+           actual_state == kLidarStateStandBy);
+      if (mode == kLidarModeNormal && same_session_low_power_wake &&
+          !request.wake_observation_armed) {
+        request.wake_observation_armed = true;
+        arm_wake_observation = true;
+      } else if (mode == kLidarModeNormal &&
+                 request.explicit_wake_source &&
+                 !same_session_low_power_wake) {
+        /** The Normal intent may safely survive a reconnect, but the old
+         *  session's low-power fact may not. Never transfer hard-power
+         *  attribution to a new generation or a state already back in Normal. */
+        request.explicit_wake_source = false;
+        request.explicit_wake_generation = 0;
+      }
     } else if (mode != kLidarModeNormal) {
       request.active = false;
       request.command_inflight = false;
       request.waiting_for_reconnect = false;
     }
+  }
+
+  if (cancel_wake_observation) {
+    CancelWakeObservation(handle);
   }
 
   if (!connected) {
@@ -1208,13 +1753,27 @@ livox_status LdsLidar::SendModeChangeRequest(
     return kStatusNotConnected;
   }
 
+  if (!send_now) {
+    printf("Queue lidar[%d] Normal wake until its stagger deadline.\n", handle);
+    return kStatusSuccess;
+  }
+
   std::shared_ptr<AsyncCommandContext> context = CreateCommandContext(
       handle, connection_generation, 0, kAsyncModeCommand, mode, request_id,
       command_id);
+  if (arm_wake_observation) {
+    /** Arm immediately before enqueue so even a fast disconnect callback is
+     *  attributed. A synchronous SDK rejection below cancels the guard. */
+    ArmWakeObservation(handle, live_broadcast_code, request_id,
+                       connection_generation);
+  }
   livox_status status =
       LidarSetMode(handle, mode, SetModeCb, context.get());
   if (status != kStatusSuccess) {
     MarkCommandContextCompleted(context);
+    if (arm_wake_observation) {
+      CancelWakeObservation(handle, request_id);
+    }
   } else {
     return status;
   }
@@ -1229,6 +1788,11 @@ livox_status LdsLidar::SendModeChangeRequest(
       return status;
     }
     request.command_inflight = false;
+    if (arm_wake_observation) {
+      /** The synchronous enqueue failed and its LinkStat guard was cancelled
+       *  above. Permit a later reconnect retry to arm a fresh guard. */
+      request.wake_observation_armed = false;
+    }
     if (mode == kLidarModeNormal && ShouldWaitForReconnect(status)) {
       request.waiting_for_reconnect = true;
       deferred_until_reconnect = true;
@@ -1260,8 +1824,13 @@ void LdsLidar::MaybeRetryPendingModeRequest(uint8_t handle) {
   {
     lock_guard<mutex> lock(mode_mutex_);
     const ModeChangeRequest &request = mode_requests_[handle];
+    const int64_t now =
+        std::chrono::steady_clock::now().time_since_epoch().count();
     retry = request.active && request.desired_mode == kLidarModeNormal &&
-            request.waiting_for_reconnect && !request.command_inflight;
+            request.waiting_for_reconnect && !request.command_inflight &&
+            request.normal_spinup_grace_deadline_ns == 0 &&
+            (request.send_not_before_ns == 0 ||
+             now >= request.send_not_before_ns);
     request_id = request.request_id;
     command_id = request.command_id;
   }
@@ -1475,6 +2044,9 @@ void LdsLidar::OnDeviceHandshake(const DeviceHandshakeStatus *status) {
          *  relay manager also verifies the current recovery state immediately
          *  before opening a shared power group. */
         s.handshake_state = kHandshakeLinkStuck;
+        if (s.power_cycle_reason == kPowerCycleReasonHandshakeStuck) {
+          s.power_cycle_reason = kPowerCycleReasonNone;
+        }
         cancelled_power_cycle = true;
       }
     }
@@ -1753,52 +2325,10 @@ void LdsLidar::OnDeviceChange(const DeviceInfo *info, DeviceEvent type) {
       }
 
       livox_status send_status =
-          g_lds_ldiar->SendCoordinateConfig(handle, 0, config_generation);
+          g_lds_ldiar->SendNextConfigCommand(handle, config_generation);
       if (send_status != kStatusSuccess) {
-        printf("Lidar[%d] coordinate config was not accepted: %d\n", handle,
+        printf("Lidar[%d] config pipeline was not accepted: %d\n", handle,
                send_status);
-      }
-
-      if (kDeviceTypeLidarMid40 != device_info.type) {
-        send_status = g_lds_ldiar->SendReturnModeConfig(
-            handle, 0, config_generation);
-        if (send_status != kStatusSuccess) {
-          printf("Lidar[%d] return-mode config was not accepted: %d\n", handle,
-                 send_status);
-        }
-      }
-
-      if ((kDeviceTypeLidarMid70 != device_info.type) &&
-          (kDeviceTypeLidarMid40 != device_info.type)) {
-        send_status = g_lds_ldiar->SendImuRateConfig(
-            handle, 0, config_generation);
-        if (send_status != kStatusSuccess) {
-          printf("Lidar[%d] IMU config was not accepted: %d\n", handle,
-                 send_status);
-        }
-      }
-
-      if (config.extrinsic_parameter_source == kExtrinsicParameterFromLidar) {
-        send_status = g_lds_ldiar->SendExtrinsicConfig(
-            handle, 0, config_generation);
-        if (send_status != kStatusSuccess) {
-          printf("Lidar[%d] extrinsic config was not accepted: %d\n", handle,
-                 send_status);
-        }
-      }
-
-      if (kDeviceTypeLidarTele == device_info.type) {
-        send_status = g_lds_ldiar->SendHighSensitivityConfig(
-            handle, 0, config_generation);
-        if (send_status != kStatusSuccess) {
-          printf("Lidar[%d] sensitivity config was not accepted: %d\n", handle,
-                 send_status);
-        }
-        if (config.enable_high_sensitivity) {
-          printf("Enable high sensitivity\n");
-        } else {
-          printf("Disable high sensitivity\n");
-        }
       }
     }
   }
@@ -1935,6 +2465,7 @@ void LdsLidar::CompleteConfigCommand(
   }
 
   bool start_sampling = false;
+  bool send_next = false;
   {
     /** Keep config completion and lifecycle validation in one transaction.
      *  A callback from a connection that has already reset must not clear a
@@ -1952,9 +2483,16 @@ void LdsLidar::CompleteConfigCommand(
     }
     lidar.config.set_bits &= ~config_bit;
     start_sampling = (lidar.config.set_bits == 0);
+    send_next = !start_sampling;
   }
 
-  if (!start_sampling) {
+  if (send_next) {
+    livox_status status =
+        SendNextConfigCommand(handle, connection_generation);
+    if (status != kStatusSuccess) {
+      printf("Lidar[%d] next config pipeline stage was not accepted: %d\n",
+             handle, status);
+    }
     return;
   }
 
@@ -1990,6 +2528,7 @@ void LdsLidar::SetModeCb(livox_status status, uint8_t handle, uint8_t response,
   LdsLidar *lds_lidar = g_lds_ldiar;
   bool clear_request = false;
   bool wait_for_reconnect = false;
+  bool cancel_wake_observation = false;
   LidarMode desired_mode = context->mode;
   LidarState actual_state;
   uint64_t connection_generation = 0;
@@ -2016,22 +2555,37 @@ void LdsLidar::SetModeCb(livox_status status, uint8_t handle, uint8_t response,
 
     if (status == kStatusSuccess) {
       if (desired_mode == kLidarModeNormal) {
-        if (response == 0) {
+        if (response == 0 || response == 2) {
           if (actual_state == kLidarStateNormal) {
             printf("Lidar[%d] already in Normal; mode request complete\n",
                    handle);
             clear_request = true;
           } else {
-            printf("Lidar[%d] set mode Normal accepted, waiting for state "
-                   "change\n", handle);
+            /** response 2 explicitly means motor spin-up. response 0 also only
+             *  acknowledges the command, not the later heartbeat state. Start
+             *  one fixed grace window at the first positive ACK; a retry ACK
+             *  must not keep extending the logical request forever. */
+            if (request.normal_spinup_grace_deadline_ns == 0) {
+              request.normal_spinup_grace_deadline_ns =
+                  std::chrono::steady_clock::now()
+                      .time_since_epoch()
+                      .count() +
+                  kNormalSpinupGraceNs;
+              printf("Lidar[%d] set mode Normal ACK[%d]; fixed 20s spin-up "
+                     "grace started\n",
+                     handle, response);
+            } else {
+              printf("Lidar[%d] set mode Normal ACK[%d]; original spin-up "
+                     "grace retained (not extended)\n",
+                     handle, response);
+            }
           }
           request.waiting_for_reconnect = false;
-        } else if (response == 2) {
-          printf("Lidar[%d] set mode Normal: spinning up, waiting...\n", handle);
-          request.waiting_for_reconnect = false;
         } else {
-          printf("Lidar[%d] set mode Normal FAILED, response[%d]\n", handle, response);
+          printf("Lidar[%d] set mode Normal FAILED, response[%d]\n", handle,
+                 response);
           clear_request = true;
+          cancel_wake_observation = true;
         }
       } else {
         /** PowerSaving/Standby: the lidar acked, but some units ack "success"
@@ -2052,6 +2606,7 @@ void LdsLidar::SetModeCb(livox_status status, uint8_t handle, uint8_t response,
          *  active so the verify tick re-sends it. */
       } else {
         clear_request = true;
+        cancel_wake_observation = true;
       }
     }
   }
@@ -2060,6 +2615,10 @@ void LdsLidar::SetModeCb(livox_status status, uint8_t handle, uint8_t response,
     lds_lidar->ResetModeRequestIfTarget(
         handle, desired_mode, context->mode_request_id,
         context->mode_command_id, context->connection_generation);
+    if (cancel_wake_observation) {
+      lds_lidar->CancelWakeObservation(handle,
+                                       context->mode_request_id);
+    }
   } else if (wait_for_reconnect) {
     printf("Lidar[%d] will verify/retry Normal on timer or reconnect.\n",
            handle);

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Fail-safe CORX relay power-cycle manager for Livox LiDAR recovery.
 
-The Livox driver publishes a POWER_CYCLE_REQUIRED event only after its bounded
-local handshake recovery is exhausted.  This independent ROS node validates an
-explicit power-group whitelist (one or more broadcast codes sharing one relay
-channel), applies persistent group-level rate limits, confirms every relay
-state transition, and verifies that every group member resumes point-cloud
-publication after power is restored.
+The Livox driver publishes a POWER_CYCLE_REQUIRED event only after a bounded
+soft-recovery path is exhausted: either a live-broadcast handshake stall or an
+explicit low-power wake followed by sustained broadcast loss.  This independent
+ROS node validates the cause-specific live evidence and an explicit power-group
+whitelist (one or more broadcast codes sharing one relay channel), applies
+persistent group-level rate limits, confirms every relay state transition, and
+verifies that every group member resumes point-cloud publication after power is
+restored.
 
 No third-party Python package is required.  ROS imports are deliberately kept
 inside ``run_ros`` so configuration, relay and persistence tests can run on a
@@ -37,10 +39,20 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 WIRE_SCHEMA_VERSION = 1
 CONFIG_SCHEMA_VERSION = 2
-STATE_DB_SCHEMA_VERSION = 3
+STATE_DB_SCHEMA_VERSION = 4
 REQUEST_TYPE = "POWER_CYCLE_REQUIRED"
 STATE_TYPE = "LIDAR_RECOVERY_STATE"
 STATUS_TYPE = "POWER_CYCLE_STATUS"
+RECOVERY_STATE_IDLE = "IDLE"
+RECOVERY_STATE_REQUIRED = REQUEST_TYPE
+RECOVERY_REASON_NONE = "NONE"
+RECOVERY_REASON_HANDSHAKE = "HANDSHAKE_STUCK"
+RECOVERY_REASON_WAKE_DROPOUT = "WAKE_DROPOUT"
+RECOVERY_REASONS = {
+    RECOVERY_REASON_HANDSHAKE,
+    RECOVERY_REASON_WAKE_DROPOUT,
+}
+WAKE_STATE_REQUIRED = REQUEST_TYPE
 TERMINAL_EVENT_STATES = {
     "RECOVERY_VERIFIED",
     "RECOVERY_TIMEOUT",
@@ -79,6 +91,9 @@ _LEGACY_COMMAND_HEADER = b"\xCC\xDD"
 _LEGACY_STATUS_HEADER = b"\xAA\xBB\xB0"
 _DEFAULT_OFF_SECONDS = 10.0
 _MINIMUM_OFF_SECONDS = 5.0
+_WAKE_OBSERVATION_MAX_SECONDS = 60.0
+_WAKE_DROPOUT_CONFIRM_MIN_SECONDS = 10.0
+_EVENT_TIME_FUTURE_TOLERANCE_SECONDS = 2.0
 
 
 class ConfigurationError(ValueError):
@@ -160,6 +175,38 @@ class PowerCycleRequest:
     driver_instance: int
     handle: int
     episode_count: int
+    recovery_reason: str = RECOVERY_REASON_HANDSHAKE
+    wake_request_id: int = 0
+    wake_connection_generation: int = 0
+    wake_dropout_generation: int = 0
+    wake_started_at: float = 0.0
+    wake_dropout_at: float = 0.0
+    wake_silence_at: float = 0.0
+
+    @property
+    def identity(self) -> Tuple[Any, ...]:
+        """Exact live-state identity, including the recovery cause.
+
+        ``event_id`` intentionally retains the original schema-1 four-field
+        format.  The cause and wake evidence are therefore part of every live
+        pre-OFF comparison instead of being inferred from that legacy id.
+        """
+
+        return (
+            self.event_id,
+            self.broadcast_code,
+            self.driver_instance,
+            self.handle,
+            self.episode_count,
+            int(self.detected_at),
+            self.recovery_reason,
+            self.wake_request_id,
+            self.wake_connection_generation,
+            self.wake_dropout_generation,
+            int(self.wake_started_at),
+            int(self.wake_dropout_at),
+            int(self.wake_silence_at),
+        )
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "PowerCycleRequest":
@@ -174,6 +221,53 @@ class PowerCycleRequest:
         driver_instance = _integer(payload, "driver_instance", minimum=0)
         handle = _integer(payload, "handle", minimum=0, maximum=255)
         episode_count = _integer(payload, "episode_count", minimum=1)
+        recovery_reason = _recovery_reason(
+            payload, legacy_default=RECOVERY_REASON_HANDSHAKE
+        )
+        if recovery_reason not in RECOVERY_REASONS:
+            raise ValueError("POWER_CYCLE_REQUIRED request has no valid cause")
+        (
+            wake_request_id,
+            wake_connection_generation,
+            wake_dropout_generation,
+            wake_started_at,
+            wake_dropout_at,
+            wake_silence_at,
+        ) = _recovery_evidence(payload, recovery_reason)
+        if (
+            recovery_reason == RECOVERY_REASON_WAKE_DROPOUT
+            and not _wake_timing_evidence_valid(
+                wake_started_at,
+                wake_dropout_at,
+                wake_silence_at,
+                detected_at,
+            )
+        ):
+            raise ValueError(
+                "WAKE_DROPOUT request violates the 60s attribution window "
+                "or 10s dropout confirmation"
+            )
+        if detected_at > timestamp + _EVENT_TIME_FUTURE_TOLERANCE_SECONDS:
+            raise ValueError("power-cycle detection follows request timestamp")
+        broadcast_fresh = payload.get("broadcast_fresh")
+        if not isinstance(broadcast_fresh, bool):
+            raise ValueError("broadcast_fresh must be a boolean in request")
+        expected_broadcast_fresh = (
+            recovery_reason == RECOVERY_REASON_HANDSHAKE
+        )
+        if broadcast_fresh is not expected_broadcast_fresh:
+            raise ValueError(
+                "%s request has inconsistent broadcast_fresh"
+                % recovery_reason
+            )
+        recovery_state = payload.get("recovery_state")
+        if (
+            recovery_state is not None
+            and recovery_state != RECOVERY_STATE_REQUIRED
+        ):
+            raise ValueError(
+                "POWER_CYCLE_REQUIRED request has inconsistent recovery_state"
+            )
         expected_event_id = "%s:%d:%d:%d" % (
             broadcast_code,
             driver_instance,
@@ -190,32 +284,21 @@ class PowerCycleRequest:
             driver_instance=driver_instance,
             handle=handle,
             episode_count=episode_count,
+            recovery_reason=recovery_reason,
+            wake_request_id=wake_request_id,
+            wake_connection_generation=wake_connection_generation,
+            wake_dropout_generation=wake_dropout_generation,
+            wake_started_at=wake_started_at,
+            wake_dropout_at=wake_dropout_at,
+            wake_silence_at=wake_silence_at,
         )
 
     @classmethod
     def from_state(cls, payload: Mapping[str, Any]) -> "PowerCycleRequest":
-        broadcast_code = _broadcast_code(payload.get("broadcast_code"))
-        driver_instance = _integer(payload, "driver_instance", minimum=0)
-        detected_at = _number(payload, "power_cycle_required_at", minimum=0)
-        episode_count = _integer(
-            payload, "power_cycle_required_count", minimum=1
-        )
-        handle = _integer(payload, "handle", minimum=0, maximum=255)
-        event_id = "%s:%d:%d:%d" % (
-            broadcast_code,
-            driver_instance,
-            int(detected_at),
-            episode_count,
-        )
-        return cls(
-            event_id=event_id,
-            broadcast_code=broadcast_code,
-            timestamp=time.time(),
-            detected_at=detected_at,
-            driver_instance=driver_instance,
-            handle=handle,
-            episode_count=episode_count,
-        )
+        request = _request_from_live_recovery_state(payload)
+        if request is None:
+            raise ValueError("recovery state does not require a power cycle")
+        return request
 
 
 def _required_text(
@@ -292,6 +375,276 @@ def _broadcast_code(value: Any) -> str:
             "broadcast_code must be exactly 15 ASCII letters/digits"
         )
     return value
+
+
+def _recovery_reason(
+    payload: Mapping[str, Any], *, legacy_default: str
+) -> str:
+    """Return a normalized recovery cause without widening legacy behavior."""
+
+    value = payload.get("recovery_reason", legacy_default)
+    if not isinstance(value, str) or value not in (
+        RECOVERY_REASON_NONE,
+        RECOVERY_REASON_HANDSHAKE,
+        RECOVERY_REASON_WAKE_DROPOUT,
+    ):
+        raise ValueError(
+            "recovery_reason must be NONE, HANDSHAKE_STUCK, or WAKE_DROPOUT"
+        )
+    return value
+
+
+def _recovery_evidence(
+    payload: Mapping[str, Any], recovery_reason: str
+) -> Tuple[int, int, int, float, float, float]:
+    """Validate cause-specific evidence carried by an active event.
+
+    A wake dropout is intentionally impossible to infer from a generic
+    disconnected row: the Driver must identify the explicit wake request, the
+    matching arm/dropout connection generations, the attributed disconnect,
+    and the current continuous-silence edge. Handshake requests must not
+    smuggle wake evidence into an otherwise valid legacy event.
+    """
+
+    wake_request_id = _integer(
+        payload, "wake_request_id", default=0, minimum=0
+    )
+    wake_connection_generation = _integer(
+        payload, "wake_connection_generation", default=0, minimum=0
+    )
+    wake_dropout_generation = _integer(
+        payload, "wake_dropout_generation", default=0, minimum=0
+    )
+    wake_started_at = _number(
+        payload, "wake_started_at", default=0, minimum=0
+    )
+    wake_dropout_at = _number(
+        payload, "wake_dropout_at", default=0, minimum=0
+    )
+    wake_silence_at = _number(
+        payload, "wake_silence_at", default=0, minimum=0
+    )
+    if recovery_reason == RECOVERY_REASON_WAKE_DROPOUT:
+        if (
+            wake_request_id <= 0
+            or wake_connection_generation <= 0
+            or wake_dropout_generation <= 0
+            or wake_connection_generation != wake_dropout_generation
+            or wake_started_at <= 0
+            or wake_dropout_at <= 0
+            or wake_silence_at <= 0
+            or wake_started_at > wake_dropout_at
+            or wake_dropout_at > wake_silence_at
+        ):
+            raise ValueError(
+                "WAKE_DROPOUT requires ordered positive wake evidence"
+            )
+    elif (
+        wake_request_id != 0
+        or wake_connection_generation != 0
+        or wake_dropout_generation != 0
+        or wake_started_at != 0
+        or wake_dropout_at != 0
+        or wake_silence_at != 0
+    ):
+        raise ValueError(
+            "HANDSHAKE_STUCK request contains WAKE_DROPOUT evidence"
+        )
+    return (
+        wake_request_id,
+        wake_connection_generation,
+        wake_dropout_generation,
+        wake_started_at,
+        wake_dropout_at,
+        wake_silence_at,
+    )
+
+
+def _wake_timing_evidence_valid(
+    wake_started_at: float,
+    wake_dropout_at: float,
+    wake_silence_at: float,
+    detected_at: float,
+) -> bool:
+    """Apply the Driver's wake attribution and confirmation bounds again."""
+
+    attribution_seconds = wake_dropout_at - wake_started_at
+    confirmation_seconds = detected_at - wake_silence_at
+    return (
+        0 <= attribution_seconds <= _WAKE_OBSERVATION_MAX_SECONDS
+        and confirmation_seconds >= _WAKE_DROPOUT_CONFIRM_MIN_SECONDS
+    )
+
+
+def _request_from_live_recovery_state(
+    payload: Mapping[str, Any],
+) -> Optional[PowerCycleRequest]:
+    """Validate and normalize one live recovery-state row.
+
+    This is the single authority used both when a ROS state is cached and at
+    every pre-OFF recheck.  Legacy schema-1 handshake rows did not include the
+    generic recovery fields; only their existing
+    ``handshake_state=POWER_CYCLE_REQUIRED`` shape is inferred.
+    """
+
+    broadcast_code = _broadcast_code(payload.get("broadcast_code"))
+    state_timestamp = _number(payload, "timestamp", minimum=0)
+    driver_instance = _integer(payload, "driver_instance", minimum=0)
+    handle = _integer(payload, "handle", minimum=0, maximum=255)
+    connected = payload.get("connected")
+    broadcast_fresh = payload.get("broadcast_fresh")
+    publishing = payload.get("publishing")
+    for name, value in (
+        ("connected", connected),
+        ("broadcast_fresh", broadcast_fresh),
+        ("publishing", publishing),
+    ):
+        if not isinstance(value, bool):
+            raise ValueError("%s must be a boolean in recovery state" % name)
+
+    connect_state = _required_text(payload, "connect_state", maximum=32)
+    handshake_state = _required_text(
+        payload, "handshake_state", maximum=64
+    )
+    explicit_recovery_state = payload.get("recovery_state")
+    if explicit_recovery_state is None:
+        recovery_state = (
+            RECOVERY_STATE_REQUIRED
+            if handshake_state == REQUEST_TYPE
+            else RECOVERY_STATE_IDLE
+        )
+    else:
+        if explicit_recovery_state not in (
+            RECOVERY_STATE_IDLE,
+            RECOVERY_STATE_REQUIRED,
+        ):
+            raise ValueError(
+                "recovery_state must be IDLE or POWER_CYCLE_REQUIRED"
+            )
+        recovery_state = explicit_recovery_state
+
+    legacy_reason = (
+        RECOVERY_REASON_HANDSHAKE
+        if recovery_state == RECOVERY_STATE_REQUIRED
+        and handshake_state == REQUEST_TYPE
+        else RECOVERY_REASON_NONE
+    )
+    recovery_reason = _recovery_reason(
+        payload, legacy_default=legacy_reason
+    )
+    wake_state = payload.get("wake_state", RECOVERY_STATE_IDLE)
+    if not isinstance(wake_state, str) or not wake_state:
+        raise ValueError("wake_state must be a non-empty string")
+
+    if recovery_state == RECOVERY_STATE_IDLE:
+        if (
+            recovery_reason != RECOVERY_REASON_NONE
+            or handshake_state == REQUEST_TYPE
+            or wake_state == WAKE_STATE_REQUIRED
+        ):
+            raise ValueError(
+                "recovery state is internally inconsistent: IDLE has an "
+                "active recovery cause"
+            )
+        return None
+
+    if recovery_reason not in RECOVERY_REASONS:
+        raise ValueError(
+            "recovery state is internally inconsistent: active state has no "
+            "valid cause"
+        )
+    episode_count = _integer(
+        payload, "power_cycle_required_count", minimum=1
+    )
+    detected_at = _number(
+        payload, "power_cycle_required_at", minimum=0
+    )
+    if detected_at <= 0:
+        raise ValueError(
+            "recovery state is internally inconsistent: detected time is zero"
+        )
+    if (
+        detected_at
+        > state_timestamp + _EVENT_TIME_FUTURE_TOLERANCE_SECONDS
+    ):
+        raise ValueError(
+            "recovery state is internally inconsistent: power-cycle "
+            "detection follows state timestamp"
+        )
+    if (
+        connected is not False
+        or connect_state != "Off"
+        or publishing is not False
+    ):
+        raise ValueError(
+            "recovery state is internally inconsistent: power-cycle target "
+            "must be disconnected Off and not publishing"
+        )
+
+    if recovery_reason == RECOVERY_REASON_HANDSHAKE:
+        if (
+            handshake_state != REQUEST_TYPE
+            or broadcast_fresh is not True
+            or wake_state != RECOVERY_STATE_IDLE
+        ):
+            raise ValueError(
+                "recovery state is internally inconsistent: "
+                "HANDSHAKE_STUCK requires a fresh broadcast"
+            )
+    else:
+        if (
+            handshake_state != RECOVERY_STATE_IDLE
+            or wake_state != WAKE_STATE_REQUIRED
+            or broadcast_fresh is not False
+        ):
+            raise ValueError(
+                "recovery state is internally inconsistent: WAKE_DROPOUT "
+                "requires IDLE handshake and absent broadcast"
+            )
+
+    (
+        wake_request_id,
+        wake_connection_generation,
+        wake_dropout_generation,
+        wake_started_at,
+        wake_dropout_at,
+        wake_silence_at,
+    ) = _recovery_evidence(payload, recovery_reason)
+    if (
+        recovery_reason == RECOVERY_REASON_WAKE_DROPOUT
+        and not _wake_timing_evidence_valid(
+            wake_started_at,
+            wake_dropout_at,
+            wake_silence_at,
+            detected_at,
+        )
+    ):
+        raise ValueError(
+            "recovery state is internally inconsistent: WAKE_DROPOUT "
+            "violates the 60s attribution window or 10s confirmation"
+        )
+    event_id = "%s:%d:%d:%d" % (
+        broadcast_code,
+        driver_instance,
+        int(detected_at),
+        episode_count,
+    )
+    return PowerCycleRequest(
+        event_id=event_id,
+        broadcast_code=broadcast_code,
+        timestamp=time.time(),
+        detected_at=detected_at,
+        driver_instance=driver_instance,
+        handle=handle,
+        episode_count=episode_count,
+        recovery_reason=recovery_reason,
+        wake_request_id=wake_request_id,
+        wake_connection_generation=wake_connection_generation,
+        wake_dropout_generation=wake_dropout_generation,
+        wake_started_at=wake_started_at,
+        wake_dropout_at=wake_dropout_at,
+        wake_silence_at=wake_silence_at,
+    )
 
 
 def _power_group_id(value: Any) -> str:
@@ -608,6 +961,7 @@ class StateStore:
             "first_seen",
             "last_update",
             "detail",
+            "recovery_reason",
         ),
         "power_cycles": (
             "id",
@@ -637,6 +991,7 @@ class StateStore:
             "label",
             "created_at",
             "last_attempt",
+            "recovery_reason",
         ),
         "power_group_bindings": (
             "group_id",
@@ -758,9 +1113,10 @@ class StateStore:
                 "unexpected table(s) in dedicated state database: %s"
                 % ",".join(sorted(unknown))
             )
-        if version not in {0, 2, STATE_DB_SCHEMA_VERSION}:
+        if version not in {0, 2, 3, STATE_DB_SCHEMA_VERSION}:
             raise StateStoreError(
-                "unsupported state database schema version %d (expected 2 or %d)"
+                "unsupported state database schema version %d "
+                "(expected 2, 3, or %d)"
                 % (version, STATE_DB_SCHEMA_VERSION)
             )
         if version == 2:
@@ -816,6 +1172,39 @@ class StateStore:
             # a recovered half-migration.
             db.execute("UPDATE power_cycles SET budget_charged=1")
 
+        if version in {2, 3}:
+            # Every schema-2/3 row predates WAKE_DROPOUT, so
+            # HANDSHAKE_STUCK is the only safe and exact migration default.
+            for table in ("power_events", "power_obligations"):
+                # Older databases may legitimately have been created before
+                # either table was first needed.  CREATE TABLE below will
+                # install the complete v4 shape; only existing tables need an
+                # in-place compatibility check and ALTER.
+                if table not in tables:
+                    continue
+                expected_previous = tuple(
+                    column
+                    for column in self._EXPECTED_COLUMNS[table]
+                    if column != "recovery_reason"
+                )
+                actual_previous = tuple(
+                    str(row[1])
+                    for row in db.execute(
+                        "PRAGMA table_info(%s)" % table
+                    ).fetchall()
+                )
+                if actual_previous != expected_previous:
+                    raise StateStoreError(
+                        "state table %s cannot be migrated to schema 4: %s"
+                        % (table, ",".join(actual_previous))
+                    )
+                db.execute(
+                    "ALTER TABLE %s ADD COLUMN recovery_reason TEXT "
+                    "NOT NULL DEFAULT 'HANDSHAKE_STUCK' "
+                    "CHECK(recovery_reason IN "
+                    "('HANDSHAKE_STUCK','WAKE_DROPOUT'))" % table
+                )
+
         schema_statements = (
             """
             CREATE TABLE IF NOT EXISTS power_events (
@@ -828,7 +1217,9 @@ class StateStore:
               next_attempt REAL NOT NULL DEFAULT 0,
               first_seen REAL NOT NULL,
               last_update REAL NOT NULL,
-              detail TEXT NOT NULL DEFAULT ''
+              detail TEXT NOT NULL DEFAULT '',
+              recovery_reason TEXT NOT NULL
+                CHECK(recovery_reason IN ('HANDSHAKE_STUCK','WAKE_DROPOUT'))
             )
             """,
             """
@@ -870,7 +1261,9 @@ class StateStore:
               allow_omitted_checksum INTEGER NOT NULL,
               label TEXT NOT NULL,
               created_at REAL NOT NULL,
-              last_attempt REAL NOT NULL DEFAULT 0
+              last_attempt REAL NOT NULL DEFAULT 0,
+              recovery_reason TEXT NOT NULL
+                CHECK(recovery_reason IN ('HANDSHAKE_STUCK','WAKE_DROPOUT'))
             )
             """,
             """
@@ -993,7 +1386,7 @@ class StateStore:
             db.execute(
                 "INSERT OR IGNORE INTO power_events"
                 "(event_id,trigger_bcode,group_id,power_key,status,first_seen,"
-                "last_update) VALUES(?,?,?,?,?,?,?)",
+                "last_update,recovery_reason) VALUES(?,?,?,?,?,?,?,?)",
                 (
                     request.event_id,
                     request.broadcast_code,
@@ -1002,35 +1395,71 @@ class StateStore:
                     "NEW",
                     now,
                     now,
+                    request.recovery_reason,
                 ),
             )
             row = db.execute(
-                "SELECT status,attempts,next_attempt,last_update,group_id,power_key "
+                "SELECT status,attempts,next_attempt,last_update,group_id,"
+                "power_key,recovery_reason "
                 "FROM power_events "
                 "WHERE event_id=?",
                 (request.event_id,),
             ).fetchone()
             assert row is not None
-            status, attempts, next_attempt, last_update, stored_group, stored_key = row
+            (
+                status,
+                attempts,
+                next_attempt,
+                last_update,
+                stored_group,
+                stored_key,
+                stored_reason,
+            ) = row
             if status in TERMINAL_EVENT_STATES:
                 return False, int(attempts), "terminal"
             if status == "OBSERVED" and not allow_observed:
                 return False, int(attempts), "observed"
-            if stored_group != group_id or stored_key != power_key:
-                if status == "OBSERVED" and allow_observed:
+            mapping_changed = (
+                stored_group != group_id or stored_key != power_key
+            )
+            reason_changed = stored_reason != request.recovery_reason
+            if mapping_changed or reason_changed:
+                # Observe mode may safely adopt a newly armed whitelist
+                # mapping, but it must never reinterpret an existing legacy
+                # event_id as a different recovery cause.  The schema-1 event
+                # id does not include recovery_reason, so cause changes are an
+                # identity collision and must fail closed.
+                if (
+                    status == "OBSERVED"
+                    and allow_observed
+                    and not reason_changed
+                ):
                     db.execute(
                         "UPDATE power_events SET group_id=?,power_key=?,"
                         "status='NEW',last_update=?,detail='' WHERE event_id=?",
-                        (group_id, power_key, now, request.event_id),
+                        (
+                            group_id,
+                            power_key,
+                            now,
+                            request.event_id,
+                        ),
                     )
                     status = "NEW"
                     stored_group = group_id
                     stored_key = power_key
                 else:
                     detail = (
-                        "event identity mapping changed from %s/%s to %s/%s; "
+                        "event identity mapping/reason changed from %s/%s/%s "
+                        "to %s/%s/%s; "
                         "automatic power action refused"
-                        % (stored_group, stored_key, group_id, power_key)
+                        % (
+                            stored_group,
+                            stored_key,
+                            stored_reason,
+                            group_id,
+                            power_key,
+                            request.recovery_reason,
+                        )
                     )
                     db.execute(
                         "UPDATE power_events SET status='MAPPING_CHANGED',"
@@ -1289,7 +1718,8 @@ class StateStore:
                 "INSERT INTO power_obligations"
                 "(power_key,group_id,event_id,trigger_bcode,members_json,host,"
                 "port,channel,address,allow_omitted_checksum,label,created_at,"
-                "last_attempt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                "last_attempt,recovery_reason) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?)",
                 (
                     target.power_key,
                     target.group_id,
@@ -1303,6 +1733,7 @@ class StateStore:
                     1 if target.allow_omitted_status_checksum else 0,
                     target.label,
                     time.time(),
+                    request.recovery_reason,
                 ),
             )
 
@@ -1336,14 +1767,17 @@ class StateStore:
                     "must-be-ON obligation disappeared before ON archival"
                 )
 
-    def obligations(self) -> List[Tuple[PowerGroup, str, str, float]]:
+    def obligations(
+        self,
+    ) -> List[Tuple[PowerGroup, str, str, str, float]]:
         with self._db() as db:
             rows = db.execute(
                 "SELECT group_id,event_id,trigger_bcode,members_json,host,port,"
-                "channel,address,allow_omitted_checksum,label,last_attempt "
+                "channel,address,allow_omitted_checksum,label,recovery_reason,"
+                "last_attempt "
                 "FROM power_obligations"
             ).fetchall()
-        result: List[Tuple[PowerGroup, str, str, float]] = []
+        result: List[Tuple[PowerGroup, str, str, str, float]] = []
         for row in rows:
             try:
                 raw_members = json.loads(str(row[3]))
@@ -1365,7 +1799,15 @@ class StateStore:
                 address=int(row[7]),
                 allow_omitted_status_checksum=bool(row[8]),
             )
-            result.append((target, str(row[1]), str(row[2]), float(row[10])))
+            reason = str(row[10])
+            if reason not in RECOVERY_REASONS:
+                raise StateStoreError(
+                    "invalid recovery reason in persisted ON obligation: %s"
+                    % reason
+                )
+            result.append(
+                (target, str(row[1]), str(row[2]), reason, float(row[11]))
+            )
         return result
 
     def has_obligations(self) -> bool:
@@ -1474,24 +1916,36 @@ class StateStore:
                         (now, target.group_id),
                     )
 
-    def current_alerts(self) -> List[Tuple[str, str, str, str, str]]:
+    def current_alerts(
+        self,
+    ) -> List[Tuple[str, str, str, str, str, str]]:
         """Return the durable still-actionable alarm snapshot per endpoint."""
 
         with self._db() as db:
             rows = db.execute(
-                "SELECT event_id,trigger_bcode,group_id,state,detail "
-                "FROM power_alarms ORDER BY updated_at"
+                "SELECT a.event_id,a.trigger_bcode,a.group_id,a.state,a.detail,"
+                "e.recovery_reason FROM power_alarms AS a "
+                "LEFT JOIN power_events AS e ON e.event_id=a.event_id "
+                "ORDER BY a.updated_at"
             ).fetchall()
-        return [
-            (
-                str(event_id),
-                str(trigger),
-                str(group_id),
-                str(status),
-                str(detail),
+        result = []
+        for event_id, trigger, group_id, status, detail, reason in rows:
+            if reason not in RECOVERY_REASONS:
+                raise StateStoreError(
+                    "durable alarm has no valid recovery reason: %s"
+                    % event_id
+                )
+            result.append(
+                (
+                    str(event_id),
+                    str(trigger),
+                    str(group_id),
+                    str(status),
+                    str(detail),
+                    str(reason),
+                )
             )
-            for event_id, trigger, group_id, status, detail in rows
-        ]
+        return result
 
 
 def _double_checksum(body: bytes) -> bytes:
@@ -1682,7 +2136,14 @@ class PowerCycleManagerCore:
         )
 
     def start(self) -> None:
-        for event_id, trigger, _group_id, status, detail in self.store.current_alerts():
+        for (
+            event_id,
+            trigger,
+            _group_id,
+            status,
+            detail,
+            recovery_reason,
+        ) in self.store.current_alerts():
             request = PowerCycleRequest(
                 event_id=event_id,
                 broadcast_code=trigger,
@@ -1691,6 +2152,7 @@ class PowerCycleManagerCore:
                 driver_instance=0,
                 handle=255,
                 episode_count=1,
+                recovery_reason=recovery_reason,
             )
             self._emit(status, request, "CRITICAL", detail)
             self._mark_completed(event_id)
@@ -1748,31 +2210,7 @@ class PowerCycleManagerCore:
         _integer(payload, "handle", minimum=0, maximum=255)
         _integer(payload, "power_cycle_required_count", minimum=0)
         _number(payload, "power_cycle_required_at", minimum=0)
-        for boolean_name in (
-            "connected",
-            "broadcast_fresh",
-            "publishing",
-        ):
-            if not isinstance(payload.get(boolean_name), bool):
-                raise ValueError(
-                    "%s must be a boolean in recovery state" % boolean_name
-                )
-        connect_state = _required_text(payload, "connect_state", maximum=32)
-        handshake_state = _required_text(
-            payload, "handshake_state", maximum=64
-        )
-        required = handshake_state == REQUEST_TYPE
-        if required and not (
-            payload.get("connected") is False
-            and connect_state == "Off"
-            and payload.get("publishing") is False
-            and payload.get("broadcast_fresh") is True
-            and payload.get("power_cycle_required_count", 0) > 0
-        ):
-            raise ValueError(
-                "POWER_CYCLE_REQUIRED state is internally inconsistent"
-            )
-        request = PowerCycleRequest.from_state(payload) if required else None
+        request = _request_from_live_recovery_state(payload)
         if self.config.group_for(code) is not None:
             with self._condition:
                 self._state_sequence += 1
@@ -1849,12 +2287,24 @@ class PowerCycleManagerCore:
                     if reason in {"terminal", "observed", "mapping_changed"}:
                         self._mark_completed(request.event_id)
                     if reason == "mapping_changed":
+                        persisted_alert = next(
+                            (
+                                row
+                                for row in self.store.current_alerts()
+                                if row[0] == request.event_id
+                            ),
+                            None,
+                        )
+                        if persisted_alert is None:
+                            raise StateStoreError(
+                                "mapping-change alarm disappeared before emit"
+                            )
                         self._emit(
                             "MAPPING_CHANGED",
                             request,
                             "CRITICAL",
-                            "persisted event mapping changed; automatic power "
-                            "action refused",
+                            persisted_alert[4],
+                            recovery_reason=persisted_alert[5],
                         )
                     continue
                 self._process(request, attempt)
@@ -1935,8 +2385,9 @@ class PowerCycleManagerCore:
                 request,
                 "MAPPING_MISMATCH",
                 "CRITICAL",
-                "shared channel is already OFF while trigger LiDAR broadcast is "
-                "fresh; refusing to energize an unverified power group",
+                "shared channel is already OFF while the triggering recovery "
+                "condition is still live; refusing to energize an unverified "
+                "power group",
             )
             return
 
@@ -2284,17 +2735,10 @@ class PowerCycleManagerCore:
                         <= self.config.policy.status_stale_seconds
                     ):
                         try:
-                            exact_event = bool(
-                                trigger.get("handshake_state") == REQUEST_TYPE
-                                and trigger.get("broadcast_fresh") is True
-                                and trigger.get("driver_instance")
-                                == request.driver_instance
-                                and trigger.get("power_cycle_required_count")
-                                == request.episode_count
-                                and int(
-                                    trigger.get("power_cycle_required_at", -1)
-                                )
-                                == int(request.detected_at)
+                            current = _request_from_live_recovery_state(trigger)
+                            exact_event = (
+                                current is not None
+                                and current.identity == request.identity
                             )
                         except (TypeError, ValueError):
                             exact_event = False
@@ -2302,12 +2746,13 @@ class PowerCycleManagerCore:
                             return (
                                 False,
                                 "current trigger state no longer matches this "
-                                "POWER_CYCLE_REQUIRED event identity",
+                                "POWER_CYCLE_REQUIRED event identity and cause",
                             )
                         return (
                             True,
                             "triggering LiDAR still matches the exact live "
-                            "POWER_CYCLE_REQUIRED event",
+                            "POWER_CYCLE_REQUIRED %s event"
+                            % request.recovery_reason,
                         )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -2344,6 +2789,10 @@ class PowerCycleManagerCore:
                             and payload.get("connect_state") == "Sampling"
                             and payload.get("lidar_state") == "Normal"
                             and payload.get("handshake_state") == "IDLE"
+                            and payload.get(
+                                "recovery_state", RECOVERY_STATE_IDLE
+                            )
+                            == RECOVERY_STATE_IDLE
                             and payload.get("publishing") is True
                         )
                     if not member_healthy:
@@ -2372,7 +2821,13 @@ class PowerCycleManagerCore:
         now = time.time()
         now_mono = time.monotonic()
         policy = self.config.policy
-        for target, event_id, trigger_bcode, last_attempt in self.store.obligations():
+        for (
+            target,
+            event_id,
+            trigger_bcode,
+            recovery_reason,
+            last_attempt,
+        ) in self.store.obligations():
             previous_mono = self._obligation_attempt_mono.get(target.power_key)
             if not self._obligation_first_pass:
                 if previous_mono is not None:
@@ -2391,6 +2846,7 @@ class PowerCycleManagerCore:
                 driver_instance=0,
                 handle=255,
                 episode_count=1,
+                recovery_reason=recovery_reason,
             )
             try:
                 relay = self.relay_factory(target, policy)
@@ -2448,6 +2904,7 @@ class PowerCycleManagerCore:
         severity: str,
         detail: str,
         target: Optional[PowerGroup] = None,
+        recovery_reason: Optional[str] = None,
     ) -> None:
         if target is None:
             target = self.config.group_for(request.broadcast_code)
@@ -2459,6 +2916,7 @@ class PowerCycleManagerCore:
             "severity": severity,
             "event_id": request.event_id,
             "broadcast_code": request.broadcast_code,
+            "recovery_reason": recovery_reason or request.recovery_reason,
             "power_group": target.group_id if target else "",
             "members": list(target.members) if target else [],
             "label": target.label if target else request.broadcast_code,
@@ -2585,10 +3043,10 @@ def repair_obligations_without_config(state_db: str) -> int:
             print("No persisted must-be-ON obligations.")
             return 0
         locks = _acquire_endpoint_locks(
-            [target for target, _event, _trigger, _last in obligations],
+            [target for target, _event, _trigger, _reason, _last in obligations],
             state_db,
         )
-        for target, event_id, trigger, _last_attempt in obligations:
+        for target, event_id, trigger, _reason, _last_attempt in obligations:
             store.touch_obligation(target.power_key)
             try:
                 warning = CorxLegacyTcpClient(target, policy).ensure_state(
@@ -2684,7 +3142,8 @@ def run_ros(config: ManagerConfig) -> int:
             group for group in config.power_groups.values() if group.enabled
         ]
         obligation_targets = [
-            target for target, _event, _trigger, _last in store.obligations()
+            target
+            for target, _event, _trigger, _reason, _last in store.obligations()
         ]
         endpoint_locks = _acquire_endpoint_locks(
             configured_targets + obligation_targets, config.state_db

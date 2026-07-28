@@ -13,6 +13,9 @@ HEADER = (
 DRIVER = (
     ROOT / "livox_ros_driver" / "livox_ros_driver" / "livox_ros_driver.cpp"
 ).read_text(encoding="utf-8")
+WAKE_POLICY = (
+    ROOT / "livox_ros_driver" / "livox_ros_driver" / "wake_dropout_policy.h"
+).read_text(encoding="utf-8")
 
 
 class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
@@ -121,13 +124,15 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         self.assertIn('" | TRANSITION: RECOVERING="', stats)
         self.assertIn('" | OK: STABLE="', stats)
         current_classification = stats[
-            stats.index("const bool handshake_incident") :
+            stats.index("const bool power_reason_handshake") :
             stats.index("const DashboardTrend trend")
         ]
         self.assertIn('display_state == "HANDSHAKE_STUCK"', current_classification)
         self.assertIn(
             'display_state == "POWER_CYCLE_REQUIRED"', current_classification
         )
+        self.assertIn("power_reason_handshake", current_classification)
+        self.assertIn("power_reason_wake", current_classification)
         self.assertIn(
             '(dashboard_connected && health_tags != "OK")',
             current_classification,
@@ -140,6 +145,8 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         self.assertIn('display_state == "POWER_CYCLE_REQUIRED"', alerts)
         self.assertIn("[CRIT]", alerts)
         self.assertIn("[ALERT]", alerts)
+        self.assertIn('active_alerts << " reason="', alerts)
+        self.assertIn("PowerCycleReasonStr(ls.power_cycle_reason)", alerts)
         self.assertRegex(
             alerts,
             re.compile(
@@ -186,7 +193,8 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         self.assertIn('<< "    handshake failure episodes: stuck="', stats)
         self.assertIn('<< "; escalated-to-power="', stats)
         self.assertIn('<< " (subset of stuck)\\n"', stats)
-        self.assertIn('<< "    POWER_CYCLE_REQUIRED entries="', stats)
+        self.assertIn('<< "    POWER_CYCLE_REQUIRED: episodes="', stats)
+        self.assertIn('<< "; entries=" << ls.power_cycle_required_count', stats)
         self.assertIn("may repeat within one episode", stats)
         self.assertIn('<< "    session reset actions: accepted="', stats)
 
@@ -283,7 +291,9 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
             stats.index("const bool current_incident") :
             stats.index("const DashboardTrend trend")
         ]
-        self.assertIn("handshake_incident || config_exhausted", current)
+        self.assertIn(
+            "handshake_incident || wake_incident || config_exhausted", current
+        )
         self.assertIn('display_state == "CONFIG" && !config_exhausted', current)
 
     def test_process_history_keeps_last_sdk_event_after_reconnect(self):
@@ -323,6 +333,251 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         )
         self.assertNotIn("kDeviceHandshakeNetworkError", alerts)
         self.assertIn("last SDK event:", alerts)
+
+    def test_broadcast_normal_wake_is_staggered_without_blocking_spinner(self):
+        service = DRIVER[
+            DRIVER.index("bool LidarModeServiceCb(") :
+            DRIVER.index("bool LidarRebootServiceCb(")
+        ]
+        self.assertIn("kBroadcastNormalStaggerMs = 2000", DRIVER)
+        self.assertIn("normal_wake_index++ * kBroadcastNormalStaggerMs", service)
+        self.assertIn(
+            "h, static_cast<LidarMode>(req.mode), delay_ms", service
+        )
+        self.assertNotIn("sleep_for", service)
+        self.assertNotIn("ros::Duration", service)
+        self.assertIn("send_not_before_ns", HEADER)
+
+    def test_positive_normal_ack_has_fixed_grace_and_bounded_slow_probes(self):
+        self.assertIn(
+            "kNormalSpinupGraceNs = 20LL * 1000000000LL", CPP
+        )
+        self.assertIn(
+            "kNormalPostGraceRetryIntervalNs = 5LL * 1000000000LL", CPP
+        )
+        self.assertIn("kNormalPostGraceMaxRetries = 2", CPP)
+        self.assertIn("normal_spinup_grace_deadline_ns", HEADER)
+        self.assertIn("normal_post_grace_retry_count", HEADER)
+
+        tick = CPP[
+            CPP.index("void LdsLidar::TickSleepModeVerification") :
+            CPP.index("void LdsLidar::MarkModeRequestDisconnected")
+        ]
+        self.assertIn("req.command_id == 0", tick)
+        self.assertIn("!req.command_inflight", tick)
+        self.assertIn("now >= req.normal_spinup_grace_deadline_ns", tick)
+        self.assertIn("kNormalPostGraceRetryIntervalNs", tick)
+        self.assertIn("kNormalPostGraceMaxRetries", tick)
+
+        callback = CPP[
+            CPP.index("void LdsLidar::SetModeCb") :
+            CPP.index("void LdsLidar::RebootCb")
+        ]
+        self.assertIn("response == 0 || response == 2", callback)
+        self.assertIn(
+            "if (request.normal_spinup_grace_deadline_ns == 0)", callback
+        )
+        self.assertIn("kNormalSpinupGraceNs", callback)
+        self.assertIn("original spin-up", callback)
+        self.assertIn("request.request_id != context->mode_request_id", callback)
+        self.assertIn("request.command_id != context->mode_command_id", callback)
+        self.assertIn("context->connection_generation", callback)
+
+    def test_config_commands_form_one_serial_per_handle_pipeline(self):
+        pipeline = CPP[
+            CPP.index("livox_status LdsLidar::SendNextConfigCommand") :
+            CPP.index("livox_status LdsLidar::SendCoordinateConfig")
+        ]
+        ordered = [
+            "pending_bits & kConfigCoordinate",
+            "pending_bits & kConfigReturnMode",
+            "pending_bits & kConfigImuRate",
+            "pending_bits & kConfigGetExtrinsicParameter",
+            "pending_bits & kConfigSetHighSensitivity",
+        ]
+        self.assertEqual(sorted(pipeline.index(item) for item in ordered),
+                         [pipeline.index(item) for item in ordered])
+
+        state_change = CPP[
+            CPP.index("void LdsLidar::OnDeviceChange") :
+            CPP.index("void LdsLidar::DeviceInformationCb")
+        ]
+        self.assertIn("SendNextConfigCommand(handle, config_generation)",
+                      state_change)
+        for parallel_send in (
+            "SendCoordinateConfig(handle, 0, config_generation)",
+            "SendReturnModeConfig(handle, 0, config_generation)",
+            "SendImuRateConfig(handle, 0, config_generation)",
+            "SendExtrinsicConfig(handle, 0, config_generation)",
+            "SendHighSensitivityConfig(handle, 0, config_generation)",
+        ):
+            self.assertNotIn(parallel_send, state_change)
+
+        completion = CPP[
+            CPP.index("void LdsLidar::CompleteConfigCommand") :
+            CPP.index("void LdsLidar::SetModeCb")
+        ]
+        self.assertIn("SendNextConfigCommand(handle, connection_generation)",
+                      completion)
+        self.assertIn("kConfigCommandMaxRetries = 2", CPP)
+
+    def test_wake_dropout_arms_only_for_explicit_low_power_wake(self):
+        send = CPP[
+            CPP.index("livox_status LdsLidar::SendModeChangeRequest") :
+            CPP.index("void LdsLidar::MaybeRetryPendingModeRequest")
+        ]
+        self.assertIn("request.explicit_wake_source =", send)
+        self.assertIn("request.explicit_wake_generation =", send)
+        self.assertIn(
+            "request.explicit_wake_generation == connection_generation", send
+        )
+        self.assertIn("same_session_low_power_wake", send)
+        self.assertIn("actual_state == kLidarStatePowerSaving", send)
+        self.assertIn("actual_state == kLidarStateStandBy", send)
+        self.assertIn("mode == kLidarModeNormal", send)
+        self.assertIn("ArmWakeObservation(handle, live_broadcast_code", send)
+        self.assertIn("CancelWakeObservation(handle)", send)
+        self.assertNotIn("actual_state == kLidarStateNormal ||", send)
+
+    def test_staggered_wake_never_transfers_low_power_fact_to_new_generation(self):
+        send = CPP[
+            CPP.index("livox_status LdsLidar::SendModeChangeRequest") :
+            CPP.index("void LdsLidar::MaybeRetryPendingModeRequest")
+        ]
+        self.assertIn(
+            "request.explicit_wake_generation == connection_generation", send
+        )
+        self.assertIn("!same_session_low_power_wake", send)
+        self.assertIn("request.explicit_wake_source = false", send)
+        self.assertIn("request.explicit_wake_generation = 0", send)
+        self.assertLess(
+            send.index("same_session_low_power_wake"),
+            send.index("ArmWakeObservation(handle, live_broadcast_code"),
+        )
+
+    def test_wake_dropout_has_identity_window_and_double_checked_escalation(self):
+        self.assertRegex(
+            HEADER,
+            re.compile(r"WakeObservationNs\(\)\s*\{\s*return 60000000000LL;"),
+        )
+        self.assertRegex(
+            HEADER,
+            re.compile(r"WakeDropoutConfirmNs\(\)\s*\{\s*return 10000000000LL;"),
+        )
+        for evidence in (
+            "wake_request_id",
+            "wake_connection_generation",
+            "wake_dropout_generation",
+            "wake_broadcast_code",
+            "wake_dropout_since_ns",
+        ):
+            self.assertIn(evidence, HEADER)
+        tick = CPP[
+            CPP.index("void LdsLidar::TickWakeDropoutRecovery") :
+            CPP.index("void LdsLidar::TickHandshakeRecovery")
+        ]
+        self.assertGreaterEqual(tick.count("WakeDropoutEscalationReady"), 2)
+        self.assertIn("s.wake_request_id == expected_request_id", tick)
+        self.assertIn("s.wake_dropout_since_ns == expected_dropout_since", tick)
+        self.assertIn("ResetModeRequestIfTarget(handle, kLidarModeNormal", tick)
+        self.assertIn("input.identity_matches", WAKE_POLICY)
+        self.assertIn("input.generation_matches", WAKE_POLICY)
+        self.assertIn("!input.broadcast_fresh", WAKE_POLICY)
+        self.assertIn(
+            "input.attributed_disconnect_ns <= input.wake_deadline_ns",
+            WAKE_POLICY,
+        )
+        self.assertIn(
+            "input.dropout_since_ns >= input.attributed_disconnect_ns",
+            WAKE_POLICY,
+        )
+
+    def test_connect_clears_wake_and_transient_broadcast_keeps_attribution(self):
+        connect = CPP[
+            CPP.index("void LdsLidar::OnLidarConnectEvent") :
+            CPP.index("void LdsLidar::OnLidarDisconnectEvent")
+        ]
+        broadcast = CPP[
+            CPP.index("void LdsLidar::OnLidarBroadcastEvent") :
+            CPP.index("void LdsLidar::ArmWakeObservation")
+        ]
+        self.assertIn("ClearWakeRecoveryState(&s)", connect)
+        self.assertIn("s.wake_attributed_disconnect_ns != 0", broadcast)
+        self.assertIn("s.wake_state != kWakeRecoveryIdle", broadcast)
+        self.assertIn("s.wake_state = kWakeRecoveryObserving", broadcast)
+        self.assertIn("s.wake_dropout_since_ns = 0", broadcast)
+        self.assertIn("awaiting stable broadcast handoff", broadcast)
+        self.assertIn("kWakeBroadcastHandoffMinFrames", broadcast)
+        self.assertIn("kWakeBroadcastHandoffNs", broadcast)
+
+        tick = CPP[
+            CPP.index("void LdsLidar::TickWakeDropoutRecovery") :
+            CPP.index("void LdsLidar::TickHandshakeRecovery")
+        ]
+        self.assertIn("s.wake_attributed_disconnect_ns == 0", tick)
+        self.assertIn("WakeDropoutAttributionValid(input)", tick)
+        self.assertIn("!input.broadcast_fresh", tick)
+        self.assertIn("s.wake_state = kWakeRecoveryNoBroadcast", tick)
+        self.assertIn("s.wake_dropout_since_ns = now", tick)
+
+    def test_wake_disconnect_identity_is_fail_closed(self):
+        disconnect = CPP[
+            CPP.index("void LdsLidar::OnLidarDisconnectEvent") :
+            CPP.index("void LdsLidar::OnLidarBroadcastEvent")
+        ]
+        self.assertIn("broadcast_code != nullptr", disconnect)
+        self.assertIn("broadcast_code[0] != '\\0'", disconnect)
+        self.assertIn("callback_identity_matches", disconnect)
+        self.assertIn(
+            "strncmp(s.broadcast_code, broadcast_code", disconnect
+        )
+        self.assertIn(
+            "strncmp(s.wake_broadcast_code, s.broadcast_code", disconnect
+        )
+        self.assertNotIn("broadcast_code == nullptr ||", disconnect)
+        self.assertIn("s.wake_dropout_generation = current_generation", disconnect)
+
+    def test_deliberate_soft_reboot_uses_planned_marker_and_preserves_rejection(self):
+        reboot = CPP[
+            CPP.index("livox_status LdsLidar::RequestLidarRebootImpl") :
+            CPP.index("livox_status LdsLidar::RequestRestartSampling")
+        ]
+        self.assertIn("planned_reboot_generation = reboot_generation", reboot)
+        self.assertIn("RebootDevice(handle", reboot)
+        self.assertIn("if (status == kStatusSuccess)", reboot)
+        self.assertIn("ClearWakeRecoveryState(&s)", reboot)
+        self.assertLess(
+            reboot.index("planned_reboot_generation = reboot_generation"),
+            reboot.index("RebootDevice(handle"),
+        )
+        disconnect = CPP[
+            CPP.index("void LdsLidar::OnLidarDisconnectEvent") :
+            CPP.index("void LdsLidar::OnLidarBroadcastEvent")
+        ]
+        self.assertIn("planned_reboot_disconnect", disconnect)
+        self.assertIn("ClearWakeRecoveryState(&s)", disconnect)
+
+    def test_handshake_power_commit_discards_observing_wake_evidence(self):
+        commit = CPP[
+            CPP.index("if (power_cycle_candidate)") :
+            CPP.index("if (!request_reset)")
+        ]
+        self.assertIn("ClearWakeRecoveryState(&s)", commit)
+        self.assertLess(
+            commit.index("ClearWakeRecoveryState(&s)"),
+            commit.index("s.power_cycle_reason = kPowerCycleReasonHandshakeStuck"),
+        )
+
+    def test_wire_and_dashboard_keep_wake_separate_from_handshake(self):
+        self.assertIn('return "WAKE_NO_BROADCAST";', DRIVER)
+        self.assertIn('return "WAKE_DROPOUT";', DRIVER)
+        self.assertIn('return "HANDSHAKE_STUCK";', DRIVER)
+        self.assertIn("PowerCycleReasonStr(link.power_cycle_reason)", DRIVER)
+        self.assertIn("WakeStateStr(link.wake_state)", DRIVER)
+        self.assertIn("dashboard_counters.wake_dropout_episodes", DRIVER)
+        self.assertIn('<< "    wake-dropout episodes="', DRIVER)
+        self.assertIn('<< "    handshake failure episodes: stuck="', DRIVER)
+        self.assertIn("ls.handshake_power_cycle_episode_count", DRIVER)
 
 
 if __name__ == "__main__":

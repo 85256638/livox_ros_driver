@@ -51,6 +51,10 @@ const int32_t kSdkVersionMajorLimit = 2;
 
 /** Pointer to LdsLidar for service callback, only valid when data_src == raw lidar */
 static LdsLidar *g_read_lidar = nullptr;
+/** Four simultaneous Horizon motor starts reproduced a command-service storm in
+ *  the field. Broadcast Normal remains one logical service request, but its
+ *  per-device sends are queued 0/2/4/6 seconds apart by the 1 Hz mode tick. */
+static const uint32_t kBroadcastNormalStaggerMs = 2000;
 
 /** A broadcast service request must only target a live SDK handle.  ResetLidar
  *  deliberately sets LidarDevice::handle to kMaxSourceLidar, so checking both
@@ -84,13 +88,22 @@ bool LidarModeServiceCb(livox_ros_driver::LidarMode::Request &req,
     livox_status last_failure = kStatusSuccess;
     bool requested = false;
     bool have_failure = false;
+    uint32_t normal_wake_index = 0;
     for (uint8_t h = 0; h < kMaxLidarCount; h++) {
       if (!IsCurrentConnectedHandle(h)) {
         continue;
       }
       requested = true;
+      const uint32_t delay_ms =
+          req.mode == static_cast<uint8_t>(kLidarModeNormal)
+              ? normal_wake_index++ * kBroadcastNormalStaggerMs
+              : 0;
       livox_status s = g_read_lidar->RequestLidarModeChange(
-          h, static_cast<LidarMode>(req.mode));
+          h, static_cast<LidarMode>(req.mode), delay_ms);
+      if (s == kStatusSuccess && delay_ms != 0) {
+        ROS_INFO("LiDAR Normal wake queued for handle=%d, not-before +%.1fs",
+                 h, delay_ms / 1000.0);
+      }
       if (s != kStatusSuccess) {
         ROS_WARN("LiDAR mode change failed for handle=%d: %d", h, s);
         /** Preserve a partial failure: a later successful handle must not make
@@ -204,6 +217,47 @@ static const char *HandshakeStateStr(LdsLidar::HandshakeLinkState state) {
   }
 }
 
+static const char *WakeStateStr(LdsLidar::WakeRecoveryState state) {
+  switch (state) {
+    case LdsLidar::kWakeRecoveryObserving:
+      return "OBSERVING";
+    case LdsLidar::kWakeRecoveryNoBroadcast:
+      return "WAKE_NO_BROADCAST";
+    case LdsLidar::kWakeRecoveryDropout:
+      return "WAKE_DROPOUT";
+    case LdsLidar::kWakeRecoveryPowerCycleRequired:
+      return "POWER_CYCLE_REQUIRED";
+    default:
+      return "IDLE";
+  }
+}
+
+static const char *PowerCycleReasonStr(LdsLidar::PowerCycleReason reason) {
+  switch (reason) {
+    case LdsLidar::kPowerCycleReasonHandshakeStuck:
+      return "HANDSHAKE_STUCK";
+    case LdsLidar::kPowerCycleReasonWakeDropout:
+      return "WAKE_DROPOUT";
+    default:
+      return "NONE";
+  }
+}
+
+static bool IsPowerCycleRequired(const LdsLidar::LinkStat &link) {
+  return (link.power_cycle_reason ==
+              LdsLidar::kPowerCycleReasonHandshakeStuck &&
+          link.handshake_state ==
+              LdsLidar::kHandshakeLinkPowerCycleRequired) ||
+         (link.power_cycle_reason ==
+              LdsLidar::kPowerCycleReasonWakeDropout &&
+          link.wake_state ==
+              LdsLidar::kWakeRecoveryPowerCycleRequired);
+}
+
+static const char *RecoveryStateStr(const LdsLidar::LinkStat &link) {
+  return IsPowerCycleRequired(link) ? "POWER_CYCLE_REQUIRED" : "IDLE";
+}
+
 static const char *HandshakeResetPhaseStr(
     LdsLidar::HandshakeResetPhase phase) {
   switch (phase) {
@@ -267,6 +321,13 @@ static void PublishRecoveryState(
       static_cast<int64_t>(time(nullptr)), g_driver_instance_id, handle,
       broadcast_code, connected, ConnectStateStr(connect_state),
       LidarStateStr(lidar_state), HandshakeStateStr(link.handshake_state),
+      RecoveryStateStr(link),
+      IsPowerCycleRequired(link) ? PowerCycleReasonStr(link.power_cycle_reason)
+                                 : "NONE",
+      WakeStateStr(link.wake_state), link.wake_request_id,
+      link.wake_connection_generation, link.wake_dropout_generation,
+      link.wake_started_wall_s, link.wake_attributed_disconnect_wall_s,
+      link.wake_dropout_wall_s,
       broadcast_fresh, publishing, published_packets,
       link.power_cycle_required_count, link.power_cycle_required_wall_s);
   g_recovery_state_pub.publish(msg);
@@ -284,11 +345,21 @@ static void PublishPowerCycleRequest(uint8_t handle, const char *broadcast_code,
   event_id << broadcast_code << ":" << g_driver_instance_id << ":"
            << detected_at << ":" << link.power_cycle_required_count;
   const std::string event_id_text = event_id.str();
+  const bool wake_reason =
+      link.power_cycle_reason == LdsLidar::kPowerCycleReasonWakeDropout;
   std_msgs::String msg;
   msg.data = BuildPowerCycleRequestJson(
       event_id_text.c_str(), static_cast<int64_t>(time(nullptr)), detected_at,
-      g_driver_instance_id, handle, broadcast_code, broadcast_fresh,
-      link.handshake_reset_attempts, link.power_cycle_required_count);
+      g_driver_instance_id, handle, broadcast_code,
+      PowerCycleReasonStr(link.power_cycle_reason), broadcast_fresh,
+      wake_reason ? link.wake_request_id : 0,
+      wake_reason ? link.wake_connection_generation : 0,
+      wake_reason ? link.wake_dropout_generation : 0,
+      wake_reason ? link.wake_started_wall_s : 0,
+      wake_reason ? link.wake_attributed_disconnect_wall_s : 0,
+      wake_reason ? link.wake_dropout_wall_s : 0,
+      wake_reason ? 0 : link.handshake_reset_attempts,
+      link.power_cycle_required_count);
   g_power_cycle_request_pub.publish(msg);
   ROS_ERROR("[LivoxPowerCycle] published request event_id=%s lidar[%u][%s]",
             event_id_text.c_str(), static_cast<unsigned>(handle),
@@ -356,6 +427,15 @@ static std::string DashboardNowState(
     bool connected, bool broadcast_recent, const char *connected_state,
     const LdsLidar::LinkStat &link) {
   if (!connected) {
+    if (IsPowerCycleRequired(link)) {
+      return "POWER_CYCLE_REQUIRED";
+    }
+    if (link.wake_state == LdsLidar::kWakeRecoveryDropout) {
+      return "WAKE_DROPOUT";
+    }
+    if (link.wake_state == LdsLidar::kWakeRecoveryNoBroadcast) {
+      return "WAKE_NO_BROADCAST";
+    }
     if (broadcast_recent &&
         link.handshake_state != LdsLidar::kHandshakeLinkIdle) {
       return HandshakeStateStr(link.handshake_state);
@@ -482,6 +562,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
    *  wedged. Track that separately from an ordinary disconnected device and,
    *  when auto recovery is enabled, perform bounded local-session resets. */
   g_read_lidar->TickHandshakeRecovery(g_auto_recover);
+  g_read_lidar->TickWakeDropoutRecovery(g_auto_recover);
   static uint64_t prev_recv[kMaxLidarCount] = {0};
   static uint64_t prev_pub[kMaxLidarCount] = {0};
   static uint64_t prev_connection_generation[kMaxLidarCount] = {0};
@@ -903,13 +984,10 @@ void StatsTimerCb(const ros::TimerEvent &) {
       /** Close any open silent episode; the DISCONNECT event already marks the
        *  transition, so no separate DATA row is needed here. */
       nodata_logged[h] = false;
-      const char *offline_state = "DISCONNECTED";
-      if (broadcast_recent &&
-          ls.handshake_state != LdsLidar::kHandshakeLinkIdle) {
-        offline_state = HandshakeStateStr(ls.handshake_state);
-      }
+      const std::string offline_state =
+          DashboardNowState(false, broadcast_recent, "DISCONNECTED", ls);
       if (do_snapshot) {
-        hlog.LogSnapshot(h, last_bcode[h], offline_state, "-", "-", "-", 0, "-",
+        hlog.LogSnapshot(h, last_bcode[h], offline_state.c_str(), "-", "-", "-", 0, "-",
                          st.receive_packet_count, st.loss_packet_count,
                          st.queue_drop_count, loss_pct_d, disc);
       }
@@ -919,9 +997,13 @@ void StatsTimerCb(const ros::TimerEvent &) {
      *  lock; the relay manager performs its own final live-state precheck for
      *  any cancellation which races this immutable committed-edge snapshot. */
     const int64_t expected_power_episode = ls.broadcast_only_since_ns;
+    const uint64_t expected_wake_request_id = ls.wake_request_id;
+    const int64_t expected_wake_dropout = ls.wake_dropout_since_ns;
+    const LdsLidar::PowerCycleReason expected_power_reason =
+        ls.power_cycle_reason;
     const uint32_t expected_power_count = ls.power_cycle_required_count;
     const bool expected_power_edge =
-        ls.handshake_state == LdsLidar::kHandshakeLinkPowerCycleRequired &&
+        IsPowerCycleRequired(ls) &&
         expected_power_count > emitted_power_cycle_count[h];
     bool publish_power_edge = false;
     {
@@ -933,9 +1015,13 @@ void StatsTimerCb(const ros::TimerEvent &) {
               LdsLidar::HandshakeBroadcastFreshNs();
       publish_power_edge =
           expected_power_edge &&
-          live.handshake_state ==
-              LdsLidar::kHandshakeLinkPowerCycleRequired &&
-          live.broadcast_only_since_ns == expected_power_episode &&
+          IsPowerCycleRequired(live) &&
+          live.power_cycle_reason == expected_power_reason &&
+          (expected_power_reason ==
+                   LdsLidar::kPowerCycleReasonHandshakeStuck
+               ? live.broadcast_only_since_ns == expected_power_episode
+               : live.wake_request_id == expected_wake_request_id &&
+                     live.wake_dropout_since_ns == expected_wake_dropout) &&
           live.power_cycle_required_count == expected_power_count;
       /** Keep the later footer coherent with the state just published. */
       ls = live;
@@ -1000,6 +1086,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
         ls.handshake_protocol_error_count;
     dashboard_counters.disconnect_episodes = ls.disconnect_count;
     dashboard_counters.handshake_stuck_episodes = ls.handshake_stuck_count;
+    dashboard_counters.wake_dropout_episodes = ls.wake_dropout_count;
     dashboard_counters.power_reached_episodes =
         ls.power_cycle_required_episode_count;
     dashboard_counters.power_request_edges =
@@ -1011,16 +1098,26 @@ void StatsTimerCb(const ros::TimerEvent &) {
         dashboard_bcode, connection_generation, now_ns, dashboard_counters);
 
     DashboardLiveSignals live_signals;
+    const bool power_reason_handshake =
+        display_state == "POWER_CYCLE_REQUIRED" &&
+        ls.power_cycle_reason ==
+            LdsLidar::kPowerCycleReasonHandshakeStuck;
+    const bool power_reason_wake =
+        display_state == "POWER_CYCLE_REQUIRED" &&
+        ls.power_cycle_reason == LdsLidar::kPowerCycleReasonWakeDropout;
     const bool handshake_incident =
         display_state == "HANDSHAKE_STUCK" ||
-        display_state == "POWER_CYCLE_REQUIRED";
+        power_reason_handshake;
+    const bool wake_incident =
+        display_state == "WAKE_NO_BROADCAST" ||
+        display_state == "WAKE_DROPOUT" || power_reason_wake;
     const bool config_exhausted =
         display_state == "CONFIG" && g_auto_recover &&
         config_reboots[h] >= kConfigRebootMaxAttempts;
     const bool current_incident =
         display_state == "DISCONNECTED" || display_state == "NO_DATA" ||
         display_state == "ERROR" || display_state == "?" ||
-        handshake_incident || config_exhausted ||
+        handshake_incident || wake_incident || config_exhausted ||
         (dashboard_connected && health_tags != "OK");
     live_signals.incident_active = current_incident;
     live_signals.recovery_active =
@@ -1062,7 +1159,31 @@ void StatsTimerCb(const ros::TimerEvent &) {
       active_alerts << "  " << (critical ? "[CRIT]" : "[ALERT]") << " L"
                     << static_cast<unsigned>(h) << " " << dashboard_bcode
                     << " " << display_state;
-      if (handshake_incident && ls.broadcast_only_since_ns != 0) {
+      if (critical) {
+        active_alerts << " reason="
+                      << PowerCycleReasonStr(ls.power_cycle_reason);
+      }
+      if (wake_incident && ls.wake_dropout_since_ns != 0) {
+        const int64_t wake_age_ns = now_ns - ls.wake_dropout_since_ns;
+        active_alerts << " age=" << FmtDur(wake_age_ns) << "\n";
+        active_alerts
+            << "    wake: explicit PowerSaving/StandBy -> Normal; "
+               "control=down; broadcast=absent";
+        if (display_state == "WAKE_NO_BROADCAST") {
+          const long long age_s = wake_age_ns / 1000000000LL;
+          const long long remaining_s = age_s >= 10 ? 0 : 10 - age_s;
+          active_alerts << "; confirming " << remaining_s
+                        << "s before escalation";
+        } else if (display_state == "WAKE_DROPOUT" && !g_auto_recover) {
+          active_alerts << "; confirmed; detection only (auto_recover=off)";
+        } else if (power_reason_wake) {
+          active_alerts << "; confirmed; shared power-cycle request published";
+        }
+        active_alerts << "\n";
+        active_alerts << "    wake request=" << ls.wake_request_id
+                      << "; observation=60s; dropout-confirm=10s; "
+                         "broadcast-handoff=3s/3frames\n";
+      } else if (handshake_incident && ls.broadcast_only_since_ns != 0) {
         active_alerts << " age="
                       << FmtDur(now_ns - ls.broadcast_only_since_ns) << "\n";
         active_alerts << "    handshake: broadcast=alive; reset="
@@ -1125,16 +1246,21 @@ void StatsTimerCb(const ros::TimerEvent &) {
         ls.handshake_reset_count != 0 ||
         ls.handshake_reset_fail_count != 0 ||
         ls.handshake_stuck_count != 0 ||
-        ls.power_cycle_required_episode_count != 0 ||
-        ls.power_cycle_required_count != 0 ||
+        ls.handshake_power_cycle_episode_count != 0 ||
         ls.handshake_timeout_count != 0 ||
         ls.handshake_rejected_count != 0 ||
         ls.handshake_network_error_count != 0 ||
         ls.handshake_protocol_error_count != 0;
+    const bool wake_history = ls.wake_dropout_count != 0 ||
+                              ls.wake_power_cycle_episode_count != 0;
+    const bool hard_power_history =
+        ls.power_cycle_required_episode_count != 0 ||
+        ls.power_cycle_required_count != 0;
     const bool has_history =
         ls.disconnect_count != 0 || ls.temp_change_count != 0 ||
         ls.fault_count != 0 || ls.recover_reboot_count != 0 ||
-        ls.mode_fail_count != 0 || handshake_history;
+        ls.mode_fail_count != 0 || handshake_history || wake_history ||
+        hard_power_history;
     if (has_history) {
       any_process_history = true;
       process_history << "  L" << static_cast<unsigned>(h) << " "
@@ -1158,11 +1284,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
         process_history << "    handshake failure episodes: stuck="
                         << ls.handshake_stuck_count
                         << "; escalated-to-power="
-                        << ls.power_cycle_required_episode_count
+                        << ls.handshake_power_cycle_episode_count
                         << " (subset of stuck)\n";
-        process_history << "    POWER_CYCLE_REQUIRED entries="
-                        << ls.power_cycle_required_count
-                        << " (may repeat within one episode)\n";
         process_history << "    session reset actions: accepted="
                         << ls.handshake_reset_count
                         << "; rejected=" << ls.handshake_reset_fail_count
@@ -1178,6 +1301,20 @@ void StatsTimerCb(const ros::TimerEvent &) {
                           << " at=" << FmtWall(ls.last_handshake_event_wall_s)
                           << "\n";
         }
+      }
+      if (wake_history) {
+        process_history << "    wake-dropout episodes="
+                        << ls.wake_dropout_count
+                        << "; escalated-to-power="
+                        << ls.wake_power_cycle_episode_count << "\n";
+        process_history << "      cause: explicit low-power -> Normal, then "
+                           "control+broadcast absent for 10s\n";
+      }
+      if (hard_power_history) {
+        process_history << "    POWER_CYCLE_REQUIRED: episodes="
+                        << ls.power_cycle_required_episode_count
+                        << "; entries=" << ls.power_cycle_required_count
+                        << " (all causes; entries may repeat within one episode)\n";
       }
       if (ls.fault_count != 0) {
         process_history << "    hardware fault episodes=" << ls.fault_count

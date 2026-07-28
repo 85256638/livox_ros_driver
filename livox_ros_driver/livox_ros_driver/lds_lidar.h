@@ -59,6 +59,11 @@ class LdsLidar : public Lds {
   livox_status RequestLidarModeChange(const char *broadcast_code,
                                       LidarMode mode);
   livox_status RequestLidarModeChange(uint8_t handle, LidarMode mode);
+  /** Queue a mode request with a steady-clock not-before delay. This is used
+   *  by broadcast Normal requests to stagger motor spin-up without blocking
+   *  the single ROS spinner thread. */
+  livox_status RequestLidarModeChange(uint8_t handle, LidarMode mode,
+                                      uint32_t delay_ms);
   /** Called at 1 Hz: verify every in-progress mode request from actual state
    *  and re-send within its bounded retry budget. */
   void TickSleepModeVerification();
@@ -66,8 +71,16 @@ class LdsLidar : public Lds {
    *  broadcasting, and (when enabled) clear its local SDK handshake session
    *  once before escalating on a bounded schedule. */
   void TickHandshakeRecovery(bool enable_recovery);
+  /** Called at 1 Hz: detect a control+broadcast dropout attributable to one
+   *  explicit PowerSaving/StandBy -> Normal request and, when enabled, commit
+   *  a reason-tagged hard-power escalation after ten quiet seconds. */
+  void TickWakeDropoutRecovery(bool enable_recovery);
   static int64_t HandshakeBroadcastFreshNs() { return 3000000000LL; }
   static uint8_t HandshakeResetMaxAttempts() { return 1; }
+  static int64_t WakeObservationNs() { return 60000000000LL; }
+  static int64_t WakeDropoutConfirmNs() { return 10000000000LL; }
+  static int64_t WakeBroadcastHandoffNs() { return 3000000000LL; }
+  static uint32_t WakeBroadcastHandoffMinFrames() { return 3; }
   livox_status RequestLidarReboot(uint8_t handle, uint16_t timeout_ms = 100);
   /** Watchdog variant: reject if a planned mode request won the per-handle
    *  send race. Manual reboot remains an explicit override. */
@@ -105,6 +118,22 @@ class LdsLidar : public Lds {
     kHandshakeResetQueued,
     kHandshakeResetCompleted,
     kHandshakeResetRejected
+  };
+
+  /** Wake recovery is independent of broadcast-only handshake recovery. */
+  enum WakeRecoveryState {
+    kWakeRecoveryIdle = 0,
+    kWakeRecoveryObserving,
+    kWakeRecoveryNoBroadcast,
+    kWakeRecoveryDropout,
+    kWakeRecoveryPowerCycleRequired
+  };
+
+  /** Current cause of the generic POWER_CYCLE_REQUIRED edge. */
+  enum PowerCycleReason {
+    kPowerCycleReasonNone = 0,
+    kPowerCycleReasonHandshakeStuck,
+    kPowerCycleReasonWakeDropout
   };
 
   struct LinkStat {
@@ -155,13 +184,49 @@ class LdsLidar : public Lds {
      *  re-entry in the same episode, so this is a transition sequence rather
      *  than an incident count. */
     uint32_t power_cycle_required_count = 0;
-    /** Number of distinct broadcast-only episodes which reached
+    /** Number of distinct handshake or wake-dropout episodes which reached
      *  POWER_CYCLE_REQUIRED at least once. */
     uint32_t power_cycle_required_episode_count = 0;
     /** Per-episode latch preventing a cancelled/re-offered edge from being
      *  counted as another distinct failure episode. */
     bool power_cycle_required_counted_this_episode = false;
     int64_t power_cycle_required_wall_s = 0;
+    PowerCycleReason power_cycle_reason = kPowerCycleReasonNone;
+    /** Cause-specific episode counts keep wake failures out of handshake
+     *  history while the generic counts above retain unique event identity. */
+    uint32_t handshake_power_cycle_episode_count = 0;
+    uint32_t wake_power_cycle_episode_count = 0;
+    /** An explicit wake guard survives completion of ModeChangeRequest because
+     *  field units can enter Normal/Config and then disappear tens of seconds
+     *  later. Identity and generation are captured before the command send. */
+    WakeRecoveryState wake_state = kWakeRecoveryIdle;
+    uint64_t wake_request_id = 0;
+    uint64_t wake_connection_generation = 0;
+    /** Generation captured by the disconnect callback.  Keeping the concrete
+     *  value (rather than only a boolean) lets the relay manager validate the
+     *  same-session evidence carried on the recovery wire. */
+    uint64_t wake_dropout_generation = 0;
+    /** A deliberate soft reboot temporarily owns the next disconnect. */
+    uint64_t planned_reboot_generation = 0;
+    int64_t wake_started_ns = 0;
+    int64_t wake_deadline_ns = 0;
+    int64_t wake_started_wall_s = 0;
+    /** First strict-identity disconnect attributed inside the 60s window. */
+    int64_t wake_attributed_disconnect_ns = 0;
+    int64_t wake_attributed_disconnect_wall_s = 0;
+    /** Start of the current uninterrupted no-broadcast confirmation interval. */
+    int64_t wake_dropout_since_ns = 0;
+    int64_t wake_dropout_wall_s = 0;
+    /** A few residual broadcast frames do not prove stable recovery. */
+    int64_t wake_broadcast_return_since_ns = 0;
+    uint32_t wake_broadcast_return_count = 0;
+    uint32_t wake_dropout_count = 0;
+    /** One explicit wake request can contain more than one silence interval
+     *  when a stray broadcast frame briefly returns.  Count the causal wake
+     *  episode once while allowing a later live power edge to be re-offered. */
+    bool wake_dropout_counted_this_request = false;
+    bool wake_power_cycle_counted_this_request = false;
+    char wake_broadcast_code[kBroadcastCodeSize] = {0};
     /** Exact reason from the paired SDK's handshake diagnostics. A handshake
      *  ACK is not a public kEventConnect: DeviceInfo may still be pending, so
      *  these events never clear the recovery budget. */
@@ -189,6 +254,10 @@ class LdsLidar : public Lds {
   void OnLidarConnectEvent(uint8_t handle, const char *broadcast_code);
   void OnLidarDisconnectEvent(uint8_t handle, const char *broadcast_code);
   void OnLidarBroadcastEvent(uint8_t handle, const char *broadcast_code);
+  void ArmWakeObservation(uint8_t handle, const char *broadcast_code,
+                          uint64_t request_id,
+                          uint64_t connection_generation);
+  void CancelWakeObservation(uint8_t handle, uint64_t expected_request_id = 0);
   livox_status RequestLidarRebootImpl(uint8_t handle, uint16_t timeout_ms,
                                       bool require_mode_idle);
 
@@ -201,7 +270,13 @@ class LdsLidar : public Lds {
       request_id = 0;
       command_id = 0;
       last_command_ns = 0;
+      send_not_before_ns = 0;
+      normal_spinup_grace_deadline_ns = 0;
       sleep_retry_count = 0;
+      normal_post_grace_retry_count = 0;
+      explicit_wake_source = false;
+      explicit_wake_generation = 0;
+      wake_observation_armed = false;
       memset(broadcast_code, 0, sizeof(broadcast_code));
     }
 
@@ -212,7 +287,13 @@ class LdsLidar : public Lds {
     uint64_t request_id;       /**< identifies callbacks belonging to this request */
     uint64_t command_id;       /**< identifies the latest send attempt */
     int64_t last_command_ns;    /**< steady_clock ns of the last SetMode send (for sleep verify/retry) */
+    int64_t send_not_before_ns; /**< delayed first send; never sleeps a callback thread */
+    int64_t normal_spinup_grace_deadline_ns; /**< fixed by first positive Normal ACK; retries never extend it */
     uint8_t sleep_retry_count;  /**< verification re-sends for the request */
+    uint8_t normal_post_grace_retry_count; /**< retries after acknowledged spin-up grace */
+    bool explicit_wake_source; /**< initial explicit request saw PowerSaving/StandBy */
+    uint64_t explicit_wake_generation; /**< session which supplied that low-power fact */
+    bool wake_observation_armed; /**< first accepted SDK enqueue armed LinkStat */
     char broadcast_code[kBroadcastCodeSize];
   };
 
@@ -272,11 +353,14 @@ class LdsLidar : public Lds {
                                      bool from_reconnect,
                                      uint64_t expected_request_id = 0,
                                      uint64_t expected_generation = 0,
-                                     uint64_t expected_command_id = 0);
+                                     uint64_t expected_command_id = 0,
+                                     int64_t initial_not_before_ns = 0);
   void MaybeRetryPendingModeRequest(uint8_t handle);
   uint64_t GetActiveNormalRequestId(uint8_t handle);
   void CompleteConfigCommand(uint8_t handle, uint32_t config_bit,
                              uint64_t connection_generation);
+  livox_status SendNextConfigCommand(uint8_t handle,
+                                     uint64_t connection_generation);
   livox_status SendStartSampling(uint8_t handle,
                                  uint64_t expected_generation = 0);
   livox_status SendCoordinateConfig(uint8_t handle, uint8_t retry_count = 0,

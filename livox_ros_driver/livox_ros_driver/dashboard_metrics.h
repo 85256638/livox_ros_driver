@@ -27,6 +27,9 @@ struct DashboardCounters {
 
   uint64_t disconnect_episodes;
   uint64_t handshake_stuck_episodes;
+  /** Explicit low-power -> Normal wake episodes which lost both the control
+   *  session and device broadcasts for the confirmation interval. */
+  uint64_t wake_dropout_episodes;
   /** Unique broadcast-only episodes which actually reached the hard-power
    *  state.  This is an incident count, not a request/retry count. */
   uint64_t power_reached_episodes;
@@ -50,6 +53,7 @@ struct DashboardCounters {
         handshake_protocol_attempts(0),
         disconnect_episodes(0),
         handshake_stuck_episodes(0),
+        wake_dropout_episodes(0),
         power_reached_episodes(0),
         power_request_edges(0),
         fault_episodes(0),
@@ -77,6 +81,7 @@ struct DashboardWindow {
   /** Episodes/actions in (now - 10 min, now]. */
   uint64_t disconnect_10m;
   uint64_t handshake_stuck_10m;
+  uint64_t wake_dropout_10m;
   uint64_t power_reached_10m;
   uint64_t power_request_edges_10m;
   uint64_t fault_10m;
@@ -100,6 +105,7 @@ struct DashboardWindow {
         handshake_protocol_60s(0),
         disconnect_10m(0),
         handshake_stuck_10m(0),
+        wake_dropout_10m(0),
         power_reached_10m(0),
         power_request_edges_10m(0),
         fault_10m(0),
@@ -115,6 +121,7 @@ struct DashboardWindow {
 
   bool HasRecentEpisodeOrAction() const {
     return disconnect_10m != 0 || handshake_stuck_10m != 0 ||
+           wake_dropout_10m != 0 ||
            power_reached_10m != 0 || power_request_edges_10m != 0 ||
            fault_10m != 0 || reboot_10m != 0 || mode_fail_10m != 0;
   }
@@ -251,6 +258,9 @@ class DashboardMetrics {
     d.handshake_stuck_episodes =
         SafeDelta(current.handshake_stuck_episodes,
                   previous.handshake_stuck_episodes);
+    d.wake_dropout_episodes =
+        SafeDelta(current.wake_dropout_episodes,
+                  previous.wake_dropout_episodes);
     d.power_reached_episodes =
         SafeDelta(current.power_reached_episodes,
                   previous.power_reached_episodes);
@@ -282,6 +292,7 @@ class DashboardMetrics {
            d.handshake_network_attempts != 0 ||
            d.handshake_protocol_attempts != 0 ||
            d.disconnect_episodes != 0 || d.handshake_stuck_episodes != 0 ||
+           d.wake_dropout_episodes != 0 ||
            d.power_reached_episodes != 0 || d.power_request_edges != 0 ||
            d.fault_episodes != 0 || d.reboot_actions != 0 ||
            d.mode_fail_episodes != 0;
@@ -301,6 +312,7 @@ class DashboardMetrics {
   static void AddLong(const DashboardCounters &d, DashboardWindow *out) {
     out->disconnect_10m += d.disconnect_episodes;
     out->handshake_stuck_10m += d.handshake_stuck_episodes;
+    out->wake_dropout_10m += d.wake_dropout_episodes;
     out->power_reached_10m += d.power_reached_episodes;
     out->power_request_edges_10m += d.power_request_edges;
     out->fault_10m += d.fault_episodes;
@@ -422,7 +434,8 @@ inline DashboardTrend EvaluateTrend(const DashboardWindow &window,
    *  are also excluded because retries/re-offers are actions within an episode;
    *  only the unique power-reached episode count is stability evidence. */
   const bool repeated_same_kind =
-      window.handshake_stuck_10m >= 2 || window.power_reached_10m >= 2 ||
+      window.handshake_stuck_10m >= 2 || window.wake_dropout_10m >= 2 ||
+      window.power_reached_10m >= 2 ||
       window.fault_10m >= 2 || window.reboot_10m >= 2 ||
       window.mode_fail_10m >= 2;
   if (loss_unstable || repeated_same_kind) {

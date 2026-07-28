@@ -155,12 +155,51 @@ def _required_state(broadcast_code=BCODE, driver_instance=123, episode_count=1):
         "connect_state": "Off",
         "lidar_state": "?",
         "handshake_state": "POWER_CYCLE_REQUIRED",
+        "recovery_state": "POWER_CYCLE_REQUIRED",
+        "recovery_reason": "HANDSHAKE_STUCK",
+        "wake_state": "IDLE",
+        "wake_request_id": 0,
+        "wake_connection_generation": 0,
+        "wake_dropout_generation": 0,
+        "wake_started_at": 0,
+        "wake_dropout_at": 0,
+        "wake_silence_at": 0,
         "broadcast_fresh": True,
         "publishing": False,
         "published_packets": 0,
         "power_cycle_required_count": episode_count,
         "power_cycle_required_at": now,
     }
+
+
+def _wake_required_state(
+    broadcast_code=BCODE,
+    driver_instance=123,
+    episode_count=1,
+    wake_request_id=77,
+):
+    now = int(time.time())
+    payload = _required_state(
+        broadcast_code, driver_instance, episode_count
+    )
+    payload.update(
+        {
+            "timestamp": now,
+            "handshake_state": "IDLE",
+            "recovery_state": "POWER_CYCLE_REQUIRED",
+            "recovery_reason": "WAKE_DROPOUT",
+            "wake_state": "POWER_CYCLE_REQUIRED",
+            "wake_request_id": wake_request_id,
+            "wake_connection_generation": 9,
+            "wake_dropout_generation": 9,
+            "wake_started_at": now - 20,
+            "wake_dropout_at": now - 10,
+            "wake_silence_at": now - 10,
+            "broadcast_fresh": False,
+            "power_cycle_required_at": now,
+        }
+    )
+    return payload
 
 
 def _healthy_state(broadcast_code=BCODE):
@@ -172,12 +211,40 @@ def _healthy_state(broadcast_code=BCODE):
             "connect_state": "Sampling",
             "lidar_state": "Normal",
             "handshake_state": "IDLE",
+            "recovery_state": "IDLE",
+            "recovery_reason": "NONE",
+            "wake_state": "IDLE",
+            "wake_request_id": 0,
+            "wake_connection_generation": 0,
+            "wake_dropout_generation": 0,
+            "wake_started_at": 0,
+            "wake_dropout_at": 0,
+            "wake_silence_at": 0,
             "broadcast_fresh": False,
             "publishing": True,
             "published_packets": 100,
         }
     )
     return payload
+
+
+def _request_payload_from_state(state):
+    request = dict(state)
+    request.update(
+        {
+            "type": "POWER_CYCLE_REQUIRED",
+            "event_id": "%s:%d:%d:%d"
+            % (
+                state["broadcast_code"],
+                state["driver_instance"],
+                int(state["power_cycle_required_at"]),
+                state["power_cycle_required_count"],
+            ),
+            "detected_at": state["power_cycle_required_at"],
+            "episode_count": state["power_cycle_required_count"],
+        }
+    )
+    return request
 
 
 def _trigger_group(core, required_states):
@@ -392,6 +459,101 @@ class ConfigTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             manager.PowerCycleRequest.from_payload(payload)
+
+    def test_legacy_schema1_handshake_infers_recovery_reason(self):
+        state = _required_state()
+        for field in (
+            "recovery_state",
+            "recovery_reason",
+            "wake_state",
+            "wake_request_id",
+            "wake_started_at",
+            "wake_dropout_at",
+            "wake_silence_at",
+        ):
+            state.pop(field)
+
+        from_state = manager.PowerCycleRequest.from_state(state)
+        from_request = manager.PowerCycleRequest.from_payload(
+            _request_payload_from_state(state)
+        )
+
+        self.assertEqual(
+            from_state.recovery_reason, manager.RECOVERY_REASON_HANDSHAKE
+        )
+        self.assertEqual(from_request.identity, from_state.identity)
+
+    def test_wake_request_requires_explicit_ordered_evidence(self):
+        payload = _request_payload_from_state(_wake_required_state())
+        request = manager.PowerCycleRequest.from_payload(payload)
+        self.assertEqual(
+            request.recovery_reason, manager.RECOVERY_REASON_WAKE_DROPOUT
+        )
+        self.assertGreater(request.wake_request_id, 0)
+
+        for field, value in (
+            ("recovery_reason", "UNKNOWN"),
+            ("wake_request_id", 0),
+            ("wake_connection_generation", 0),
+            ("wake_dropout_generation", 0),
+            ("wake_dropout_generation", payload["wake_connection_generation"] + 1),
+            ("wake_started_at", payload["wake_dropout_at"] + 1),
+            ("wake_dropout_at", payload["detected_at"] + 1),
+            ("wake_silence_at", payload["wake_dropout_at"] - 1),
+            ("broadcast_fresh", True),
+        ):
+            with self.subTest(field=field):
+                invalid = dict(payload)
+                invalid[field] = value
+                with self.assertRaises(ValueError):
+                    manager.PowerCycleRequest.from_payload(invalid)
+
+    def test_wake_request_enforces_attribution_and_confirmation_boundaries(self):
+        payload = _request_payload_from_state(_wake_required_state())
+        detected_at = payload["detected_at"]
+
+        payload["wake_dropout_at"] = detected_at - 10
+        payload["wake_silence_at"] = detected_at - 10
+        payload["wake_started_at"] = payload["wake_dropout_at"] - 60
+        manager.PowerCycleRequest.from_payload(payload)
+
+        too_late = dict(payload)
+        too_late["wake_started_at"] = too_late["wake_dropout_at"] - 61
+        with self.assertRaisesRegex(ValueError, "60s attribution"):
+            manager.PowerCycleRequest.from_payload(too_late)
+
+        too_short = dict(payload)
+        too_short["wake_silence_at"] = detected_at - 9
+        with self.assertRaisesRegex(ValueError, "10s dropout"):
+            manager.PowerCycleRequest.from_payload(too_short)
+
+    def test_wake_live_state_enforces_generation_and_timing_evidence(self):
+        payload = _wake_required_state()
+        manager.PowerCycleRequest.from_state(payload)
+
+        for field, value in (
+            ("wake_connection_generation", 0),
+            ("wake_dropout_generation", 0),
+            ("wake_dropout_generation", payload["wake_connection_generation"] + 1),
+            ("wake_started_at", payload["wake_dropout_at"] - 61),
+            ("wake_silence_at", payload["power_cycle_required_at"] - 9),
+        ):
+            with self.subTest(field=field):
+                invalid = dict(payload)
+                invalid[field] = value
+                with self.assertRaises(ValueError):
+                    manager.PowerCycleRequest.from_state(invalid)
+
+        future_detection = dict(payload)
+        future_detection["power_cycle_required_at"] = payload["timestamp"] + 3
+        future_detection["wake_dropout_at"] = (
+            future_detection["power_cycle_required_at"] - 10
+        )
+        future_detection["wake_silence_at"] = future_detection[
+            "wake_dropout_at"
+        ]
+        with self.assertRaisesRegex(ValueError, "follows state timestamp"):
+            manager.PowerCycleRequest.from_state(future_detection)
 
     def test_normal_state_db_override_must_match_resolved_config_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1110,12 +1272,99 @@ class StoreTests(unittest.TestCase):
             self.assertNotIn("power_events", tables)
             manager.StateStore(str(path))
 
+    def test_schema_v3_migrates_persisted_reason_as_handshake(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite3"
+            target = _group()
+            request = manager.PowerCycleRequest.from_state(_required_state())
+            store = manager.StateStore(str(path))
+            store.start_event(
+                request, target.group_id, target.power_key, 60
+            )
+            store.finish_event(
+                request.event_id, "RECOVERY_TIMEOUT", "legacy alarm"
+            )
+            store.set_obligation(request, target)
+
+            db = sqlite3.connect(str(path))
+            try:
+                db.executescript(
+                    """
+                    ALTER TABLE power_events RENAME TO power_events_v4;
+                    CREATE TABLE power_events (
+                      event_id TEXT PRIMARY KEY,
+                      trigger_bcode TEXT NOT NULL,
+                      group_id TEXT NOT NULL,
+                      power_key TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      attempts INTEGER NOT NULL DEFAULT 0,
+                      next_attempt REAL NOT NULL DEFAULT 0,
+                      first_seen REAL NOT NULL,
+                      last_update REAL NOT NULL,
+                      detail TEXT NOT NULL DEFAULT ''
+                    );
+                    INSERT INTO power_events
+                      (event_id,trigger_bcode,group_id,power_key,status,
+                       attempts,next_attempt,first_seen,last_update,detail)
+                    SELECT event_id,trigger_bcode,group_id,power_key,status,
+                           attempts,next_attempt,first_seen,last_update,detail
+                      FROM power_events_v4;
+                    DROP TABLE power_events_v4;
+
+                    ALTER TABLE power_obligations
+                      RENAME TO power_obligations_v4;
+                    CREATE TABLE power_obligations (
+                      power_key TEXT PRIMARY KEY,
+                      group_id TEXT NOT NULL,
+                      event_id TEXT NOT NULL,
+                      trigger_bcode TEXT NOT NULL,
+                      members_json TEXT NOT NULL,
+                      host TEXT NOT NULL,
+                      port INTEGER NOT NULL,
+                      channel INTEGER NOT NULL,
+                      address INTEGER NOT NULL,
+                      allow_omitted_checksum INTEGER NOT NULL,
+                      label TEXT NOT NULL,
+                      created_at REAL NOT NULL,
+                      last_attempt REAL NOT NULL DEFAULT 0
+                    );
+                    INSERT INTO power_obligations
+                      (power_key,group_id,event_id,trigger_bcode,members_json,
+                       host,port,channel,address,allow_omitted_checksum,label,
+                       created_at,last_attempt)
+                    SELECT power_key,group_id,event_id,trigger_bcode,members_json,
+                           host,port,channel,address,allow_omitted_checksum,label,
+                           created_at,last_attempt
+                      FROM power_obligations_v4;
+                    DROP TABLE power_obligations_v4;
+                    PRAGMA user_version=3;
+                    """
+                )
+            finally:
+                db.close()
+
+            migrated = manager.StateStore(str(path))
+            obligation = migrated.obligations()[0]
+            alert = migrated.current_alerts()[0]
+            self.assertEqual(
+                obligation[3], manager.RECOVERY_REASON_HANDSHAKE
+            )
+            self.assertEqual(alert[5], manager.RECOVERY_REASON_HANDSHAKE)
+            db = sqlite3.connect(str(path))
+            try:
+                self.assertEqual(
+                    db.execute("PRAGMA user_version").fetchone()[0],
+                    manager.STATE_DB_SCHEMA_VERSION,
+                )
+            finally:
+                db.close()
+
     def test_obligation_survives_reopen_with_group_and_trigger_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.sqlite3"
             store = manager.StateStore(str(path))
             request = manager.PowerCycleRequest.from_state(
-                _required_state(MEMBERS[2])
+                _wake_required_state(MEMBERS[2])
             )
             target = _group()
             ready, attempt, _ = store.start_event(
@@ -1137,6 +1386,9 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(obligations[0][0].group_id, target.group_id)
             self.assertEqual(obligations[0][1], request.event_id)
             self.assertEqual(obligations[0][2], MEMBERS[2])
+            self.assertEqual(
+                obligations[0][3], manager.RECOVERY_REASON_WAKE_DROPOUT
+            )
             self.assertEqual(obligations[0][0].members, MEMBERS)
             allowed, reason, _ = reopened.cycle_limit(
                 target.power_key, manager.Policy()
@@ -1350,6 +1602,106 @@ class StoreTests(unittest.TestCase):
             )
             self.assertFalse(reopened.current_alerts())
 
+    def test_wake_alarm_survives_manager_restart_with_original_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite3"
+            target = _group()
+            failed = manager.PowerCycleRequest.from_state(
+                _wake_required_state(MEMBERS[1])
+            )
+            store = manager.StateStore(str(path))
+            store.start_event(
+                failed, target.group_id, target.power_key, 60
+            )
+            store.finish_event(
+                failed.event_id, "RECOVERY_TIMEOUT", "wake recovery failed"
+            )
+
+            statuses = []
+            config = _config(path, target)
+            core = manager.PowerCycleManagerCore(
+                config,
+                manager.StateStore(str(path)),
+                statuses.append,
+                relay_factory=_FakeRelay,
+            )
+            core.start()
+            core.stop()
+
+            alarm = manager.StateStore(str(path)).current_alerts()[0]
+            self.assertEqual(alarm[5], manager.RECOVERY_REASON_WAKE_DROPOUT)
+            replay = next(
+                row for row in statuses if row["state"] == "RECOVERY_TIMEOUT"
+            )
+            self.assertEqual(
+                replay["recovery_reason"],
+                manager.RECOVERY_REASON_WAKE_DROPOUT,
+            )
+
+    def test_same_event_id_with_changed_reason_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = manager.StateStore(str(Path(tmp) / "state.sqlite3"))
+            target = _group()
+            handshake = manager.PowerCycleRequest.from_state(_required_state())
+            wake_payload = _wake_required_state()
+            wake_payload["power_cycle_required_at"] = handshake.detected_at
+            wake_payload["wake_dropout_at"] = handshake.detected_at - 10
+            wake_payload["wake_silence_at"] = handshake.detected_at - 10
+            wake_payload["wake_started_at"] = handshake.detected_at - 20
+            wake = manager.PowerCycleRequest.from_state(wake_payload)
+            self.assertEqual(wake.event_id, handshake.event_id)
+
+            self.assertTrue(
+                store.start_event(
+                    handshake, target.group_id, target.power_key, 60
+                )[0]
+            )
+            ready, _attempt, reason = store.start_event(
+                wake, target.group_id, target.power_key, 60
+            )
+            self.assertFalse(ready)
+            self.assertEqual(reason, "mapping_changed")
+            alert = store.current_alerts()[0]
+            self.assertEqual(alert[3], "MAPPING_CHANGED")
+            self.assertEqual(alert[5], manager.RECOVERY_REASON_HANDSHAKE)
+
+    def test_observed_event_cannot_adopt_a_different_recovery_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = manager.StateStore(str(Path(tmp) / "state.sqlite3"))
+            target = _group()
+            handshake = manager.PowerCycleRequest.from_state(_required_state())
+            self.assertTrue(
+                store.start_event(
+                    handshake,
+                    "unmapped.%s" % handshake.broadcast_code,
+                    "unmapped|%s" % handshake.broadcast_code,
+                    60,
+                )[0]
+            )
+            store.observe_event(handshake.event_id, "observe only")
+
+            wake_payload = _wake_required_state()
+            wake_payload["power_cycle_required_at"] = handshake.detected_at
+            wake_payload["wake_dropout_at"] = handshake.detected_at - 10
+            wake_payload["wake_silence_at"] = handshake.detected_at - 10
+            wake_payload["wake_started_at"] = handshake.detected_at - 20
+            wake = manager.PowerCycleRequest.from_state(wake_payload)
+            self.assertEqual(wake.event_id, handshake.event_id)
+
+            ready, _attempt, reason = store.start_event(
+                wake,
+                target.group_id,
+                target.power_key,
+                60,
+                allow_observed=True,
+            )
+            self.assertFalse(ready)
+            self.assertEqual(reason, "mapping_changed")
+            alert = store.current_alerts()[0]
+            self.assertEqual(alert[3], "MAPPING_CHANGED")
+            self.assertEqual(alert[5], manager.RECOVERY_REASON_HANDSHAKE)
+            self.assertFalse(store.obligations())
+
     def test_group_rename_cannot_reset_physical_endpoint_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = manager.StateStore(str(Path(tmp) / "state.sqlite3"))
@@ -1476,6 +1828,35 @@ class _TriggerRecoveringStore(manager.StateStore):
         self.core.accept_state_payload(
             _healthy_state(request.broadcast_code)
         )
+
+
+class _TriggerGenerationChangingStore(manager.StateStore):
+    core = None
+
+    def set_obligation(self, request, target):
+        super().set_obligation(request, target)
+        changed = _wake_required_state(
+            request.broadcast_code,
+            request.driver_instance,
+            request.episode_count,
+            request.wake_request_id,
+        )
+        changed.update(
+            {
+                "timestamp": int(time.time()),
+                "power_cycle_required_at": request.detected_at,
+                "wake_started_at": request.wake_started_at,
+                "wake_dropout_at": request.wake_dropout_at,
+                "wake_silence_at": request.wake_silence_at,
+                "wake_connection_generation": (
+                    request.wake_connection_generation + 1
+                ),
+                "wake_dropout_generation": (
+                    request.wake_dropout_generation + 1
+                ),
+            }
+        )
+        self.core.accept_state_payload(changed)
 
 
 class _FailingObligationStore(manager.StateStore):
@@ -1605,6 +1986,152 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn(BCODE, core._latest)
             self.assertEqual(core.queue_size(), 0)
 
+    def test_recovery_cause_cross_combinations_are_rejected_before_cache(self):
+        handshake = _required_state()
+        wake = _wake_required_state()
+        cases = (
+            (
+                "handshake_without_broadcast",
+                dict(handshake, broadcast_fresh=False),
+            ),
+            (
+                "handshake_with_wake_reason",
+                dict(handshake, recovery_reason="WAKE_DROPOUT"),
+            ),
+            (
+                "handshake_with_observing_wake",
+                dict(handshake, wake_state="OBSERVING"),
+            ),
+            (
+                "handshake_with_unknown_wake_state",
+                dict(handshake, wake_state="UNKNOWN"),
+            ),
+            (
+                "wake_with_broadcast",
+                dict(wake, broadcast_fresh=True),
+            ),
+            (
+                "wake_with_handshake_power_state",
+                dict(wake, handshake_state="POWER_CYCLE_REQUIRED"),
+            ),
+            (
+                "wake_without_wake_state",
+                dict(wake, wake_state="IDLE"),
+            ),
+            (
+                "wake_without_request_identity",
+                dict(wake, wake_request_id=0),
+            ),
+            (
+                "idle_with_active_reason",
+                dict(handshake, recovery_state="IDLE"),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp) / "state.sqlite3", _group())
+            core = manager.PowerCycleManagerCore(
+                config,
+                manager.StateStore(config.state_db),
+                lambda _row: None,
+                relay_factory=_FakeRelay,
+            )
+            for name, payload in cases:
+                with self.subTest(case=name), self.assertRaises(ValueError):
+                    core.accept_state_payload(payload)
+            self.assertNotIn(BCODE, core._latest)
+            self.assertEqual(core.queue_size(), 0)
+
+    def test_reason_collision_emits_persisted_reason_and_never_cycles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            statuses = []
+            emitted = threading.Event()
+
+            def emit(row):
+                statuses.append(dict(row))
+                if row["state"] == "MAPPING_CHANGED":
+                    emitted.set()
+
+            _FakeRelay.reset(on=True)
+            config = _config(Path(tmp) / "state.sqlite3", _group())
+            store = manager.StateStore(config.state_db)
+            handshake = manager.PowerCycleRequest.from_state(_required_state())
+            store.start_event(
+                handshake,
+                "unmapped.%s" % handshake.broadcast_code,
+                "unmapped|%s" % handshake.broadcast_code,
+                60,
+            )
+            store.observe_event(handshake.event_id, "observe only")
+
+            wake = _wake_required_state()
+            wake["power_cycle_required_at"] = handshake.detected_at
+            wake["wake_dropout_at"] = handshake.detected_at - 10
+            wake["wake_silence_at"] = handshake.detected_at - 10
+            wake["wake_started_at"] = handshake.detected_at - 20
+
+            core = manager.PowerCycleManagerCore(
+                config, store, emit, relay_factory=_FakeRelay
+            )
+            core.start()
+            core.accept_state_payload(wake)
+            self.assertTrue(emitted.wait(2), statuses)
+            core.stop()
+
+            row = next(
+                item for item in statuses if item["state"] == "MAPPING_CHANGED"
+            )
+            self.assertEqual(
+                row["recovery_reason"], manager.RECOVERY_REASON_HANDSHAKE
+            )
+            self.assertIn("HANDSHAKE_STUCK", row["detail"])
+            self.assertIn("WAKE_DROPOUT", row["detail"])
+            self.assertNotIn(False, _FakeRelay.transitions)
+            self.assertFalse(store.obligations())
+
+    def test_exact_precheck_matches_recovery_reason_and_wake_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(
+                Path(tmp) / "state.sqlite3",
+                _group(),
+                policy=_policy(status_stale_seconds=1),
+            )
+            core = manager.PowerCycleManagerCore(
+                config,
+                manager.StateStore(config.state_db),
+                lambda _row: None,
+                relay_factory=_FakeRelay,
+            )
+            handshake = _required_state()
+            wake = _wake_required_state()
+            wake["power_cycle_required_at"] = handshake[
+                "power_cycle_required_at"
+            ]
+            wake["wake_dropout_at"] = wake["power_cycle_required_at"] - 10
+            wake["wake_started_at"] = wake["wake_dropout_at"] - 10
+            wake_request = manager.PowerCycleRequest.from_state(wake)
+
+            core.accept_state_payload(handshake)
+            ready, detail = core._wait_trigger_required(wake_request, 0.03)
+            self.assertFalse(ready, detail)
+            self.assertIn("identity and cause", detail)
+
+            core.accept_state_payload(wake)
+            ready, detail = core._wait_trigger_required(wake_request, 0.03)
+            self.assertTrue(ready, detail)
+
+            changed_evidence = dict(wake)
+            changed_evidence["wake_request_id"] += 1
+            core.accept_state_payload(changed_evidence)
+            ready, detail = core._wait_trigger_required(wake_request, 0.03)
+            self.assertFalse(ready, detail)
+
+            changed_generation = dict(wake)
+            changed_generation["wake_connection_generation"] += 1
+            changed_generation["wake_dropout_generation"] += 1
+            core.accept_state_payload(changed_generation)
+            ready, detail = core._wait_trigger_required(wake_request, 0.03)
+            self.assertFalse(ready, detail)
+
     def test_single_cached_state_cannot_pass_relay_precheck_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
             statuses = []
@@ -1629,7 +2156,7 @@ class CoreTests(unittest.TestCase):
                 relay_factory=_FakeRelay,
             )
             core.start()
-            core.accept_state_payload(_required_state())
+            core.accept_state_payload(_wake_required_state())
             self.assertTrue(retry.wait(1), statuses)
             core.stop()
             self.assertEqual(_FakeRelay.transitions, [])
@@ -1676,6 +2203,49 @@ class CoreTests(unittest.TestCase):
             recovered, unhealthy = core._wait_group_healthy(
                 _group(), 123, 0.04, 0.02
             )
+            self.assertFalse(recovered)
+            self.assertEqual(tuple(unhealthy), MEMBERS)
+
+    def test_group_health_defensively_requires_recovery_state_idle(self):
+        """Even a corrupted/legacy cache row cannot verify post-ON health."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(
+                Path(tmp) / "state.sqlite3",
+                _group(),
+                policy=_policy(status_stale_seconds=1),
+            )
+            core = manager.PowerCycleManagerCore(
+                config,
+                manager.StateStore(config.state_db),
+                lambda _row: None,
+                relay_factory=_FakeRelay,
+            )
+            result = []
+            worker = threading.Thread(
+                target=lambda: result.append(
+                    core._wait_group_healthy(_group(), 123, 0.08, 0.01)
+                )
+            )
+            worker.start()
+            time.sleep(0.01)
+            while worker.is_alive():
+                with core._condition:
+                    for code in MEMBERS:
+                        payload = _healthy_state(code)
+                        payload["recovery_state"] = "POWER_CYCLE_REQUIRED"
+                        core._state_sequence += 1
+                        core._latest[code] = (
+                            payload,
+                            time.monotonic(),
+                            core._state_sequence,
+                        )
+                    core._condition.notify_all()
+                time.sleep(0.005)
+            worker.join(timeout=1)
+
+            self.assertEqual(len(result), 1)
+            recovered, unhealthy = result[0]
             self.assertFalse(recovered)
             self.assertEqual(tuple(unhealthy), MEMBERS)
 
@@ -1784,6 +2354,70 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(row["broadcast_code"], trigger)
             self.assertEqual(row["power_group"], GROUP_ID)
             self.assertEqual(tuple(row["members"]), MEMBERS)
+
+    def test_wake_dropout_triggers_one_shared_cycle_and_group_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            statuses = []
+            verified = threading.Event()
+            trigger = MEMBERS[1]
+
+            def emit(row):
+                statuses.append(dict(row))
+                if row["state"] == "RECOVERY_VERIFIED":
+                    verified.set()
+
+            _FakeRelay.reset(on=True)
+            policy = _policy(
+                off_seconds=0.01,
+                boot_timeout_seconds=2,
+                healthy_seconds=0.05,
+                status_stale_seconds=1,
+                minimum_cycle_interval_seconds=60,
+            )
+            config = _config(Path(tmp) / "state.sqlite3", _group(), policy=policy)
+            core = manager.PowerCycleManagerCore(
+                config,
+                manager.StateStore(config.state_db),
+                emit,
+                relay_factory=_FakeRelay,
+            )
+            core.start()
+            trigger_feeder = _trigger_group(
+                core, _wake_required_state(trigger)
+            )
+
+            def publish_recovery():
+                _wait_until(
+                    lambda: any(
+                        row["state"] == "POWER_ON_CONFIRMED"
+                        for row in statuses
+                    ),
+                    timeout=1,
+                )
+                # Do not let the remaining synthetic pre-OFF frames overwrite
+                # post-ON healthy rows for the triggering member.
+                trigger_feeder.join(timeout=1)
+                time.sleep(0.02)
+                _publish_health(core, repeats=6)
+
+            feeder = threading.Thread(target=publish_recovery)
+            feeder.start()
+            try:
+                self.assertTrue(verified.wait(3), statuses)
+            finally:
+                feeder.join(timeout=2)
+                core.stop()
+
+            self.assertEqual(_FakeRelay.transitions, [False, True])
+            power_off = next(
+                row for row in statuses if row["state"] == "POWER_OFF_COMMAND"
+            )
+            self.assertEqual(
+                power_off["recovery_reason"],
+                manager.RECOVERY_REASON_WAKE_DROPOUT,
+            )
+            self.assertEqual(power_off["broadcast_code"], trigger)
+            self.assertFalse(manager.StateStore(config.state_db).obligations())
 
     def test_recovery_is_not_verified_until_last_member_is_healthy(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1950,7 +2584,7 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(cycle_count, 1)
             self.assertEqual(group_count, 1)
 
-    def test_channel_off_during_fresh_broadcast_is_mapping_mismatch(self):
+    def test_channel_off_during_live_recovery_is_mapping_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             statuses = []
             mismatch = threading.Event()
@@ -1969,10 +2603,15 @@ class CoreTests(unittest.TestCase):
                 relay_factory=_FakeRelay,
             )
             core.start()
-            _trigger_group(core, _required_state())
+            _trigger_group(core, _wake_required_state())
             self.assertTrue(mismatch.wait(2), statuses)
             core.stop()
             self.assertEqual(_FakeRelay.transitions, [])
+            row = next(
+                row for row in statuses if row["state"] == "MAPPING_MISMATCH"
+            )
+            self.assertIn("recovery condition is still live", row["detail"])
+            self.assertNotIn("broadcast is fresh", row["detail"])
 
     def test_non_target_relay_change_aborts_and_restores_target_on(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2006,7 +2645,7 @@ class CoreTests(unittest.TestCase):
             self.assertFalse(_CrossTalkRelay.states[1])
             self.assertFalse(manager.StateStore(config.state_db).obligations())
 
-    def test_trigger_recovered_after_reservation_never_sends_off(self):
+    def test_wake_trigger_recovered_after_reservation_never_sends_off(self):
         with tempfile.TemporaryDirectory() as tmp:
             statuses = []
             stopped = threading.Event()
@@ -2024,7 +2663,7 @@ class CoreTests(unittest.TestCase):
             )
             store.core = core
             core.start()
-            _trigger_group(core, _required_state())
+            _trigger_group(core, _wake_required_state())
             self.assertTrue(stopped.wait(2), statuses)
             core.stop()
             self.assertNotIn(False, _FakeRelay.transitions)
@@ -2040,6 +2679,33 @@ class CoreTests(unittest.TestCase):
             finally:
                 db.close()
             self.assertEqual(charged, 0)
+
+    def test_wake_generation_change_after_b0_never_sends_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            statuses = []
+            stopped = threading.Event()
+
+            def emit(row):
+                statuses.append(dict(row))
+                if row["state"] == "STALE_OR_RECOVERED":
+                    stopped.set()
+
+            _FakeRelay.reset(on=True)
+            config = _config(Path(tmp) / "state.sqlite3", _group())
+            store = _TriggerGenerationChangingStore(config.state_db)
+            core = manager.PowerCycleManagerCore(
+                config, store, emit, relay_factory=_FakeRelay
+            )
+            store.core = core
+            core.start()
+            _trigger_group(core, _wake_required_state())
+            self.assertTrue(stopped.wait(2), statuses)
+            core.stop()
+            self.assertNotIn(False, _FakeRelay.transitions)
+            self.assertFalse(store.obligations())
+            self.assertTrue(
+                store.cycle_limit(_group().power_key, config.policy)[0]
+            )
 
     def test_no_off_path_keeps_obligation_if_latest_b0_is_not_on(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2186,7 +2852,7 @@ class CoreTests(unittest.TestCase):
             )
             store = manager.StateStore(config.state_db)
             request = manager.PowerCycleRequest.from_state(
-                _required_state(MEMBERS[2])
+                _wake_required_state(MEMBERS[2])
             )
             store.set_obligation(request, _group())
             core = manager.PowerCycleManagerCore(
@@ -2202,6 +2868,10 @@ class CoreTests(unittest.TestCase):
             )
             self.assertEqual(row["broadcast_code"], MEMBERS[2])
             self.assertEqual(row["power_group"], GROUP_ID)
+            self.assertEqual(
+                row["recovery_reason"],
+                manager.RECOVERY_REASON_WAKE_DROPOUT,
+            )
 
 
 if __name__ == "__main__":
