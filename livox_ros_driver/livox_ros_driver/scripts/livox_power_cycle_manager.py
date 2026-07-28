@@ -2,9 +2,10 @@
 """Fail-safe CORX relay power-cycle manager for Livox LiDAR recovery.
 
 The Livox driver publishes a POWER_CYCLE_REQUIRED event only after a bounded
-soft-recovery path is exhausted: either a live-broadcast handshake stall or an
-explicit low-power wake followed by sustained broadcast loss.  This independent
-ROS node validates the cause-specific live evidence and an explicit power-group
+soft-recovery/attribution path reaches one of four strict causes: a live-
+broadcast handshake stall, an explicit low-power wake dropout, a sustained
+dropout after healthy Normal publication, or a configured member missing at
+startup.  This independent ROS node validates cause-specific live evidence and an explicit power-group
 whitelist (one or more broadcast codes sharing one relay channel), applies
 persistent group-level rate limits, confirms every relay state transition, and
 verifies that every group member resumes point-cloud publication after power is
@@ -39,7 +40,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 WIRE_SCHEMA_VERSION = 1
 CONFIG_SCHEMA_VERSION = 2
-STATE_DB_SCHEMA_VERSION = 4
+STATE_DB_SCHEMA_VERSION = 5
 REQUEST_TYPE = "POWER_CYCLE_REQUIRED"
 STATE_TYPE = "LIDAR_RECOVERY_STATE"
 STATUS_TYPE = "POWER_CYCLE_STATUS"
@@ -48,9 +49,13 @@ RECOVERY_STATE_REQUIRED = REQUEST_TYPE
 RECOVERY_REASON_NONE = "NONE"
 RECOVERY_REASON_HANDSHAKE = "HANDSHAKE_STUCK"
 RECOVERY_REASON_WAKE_DROPOUT = "WAKE_DROPOUT"
+RECOVERY_REASON_NORMAL_DROPOUT = "NORMAL_DROPOUT"
+RECOVERY_REASON_STARTUP_MISSING = "STARTUP_MISSING"
 RECOVERY_REASONS = {
     RECOVERY_REASON_HANDSHAKE,
     RECOVERY_REASON_WAKE_DROPOUT,
+    RECOVERY_REASON_NORMAL_DROPOUT,
+    RECOVERY_REASON_STARTUP_MISSING,
 }
 WAKE_STATE_REQUIRED = REQUEST_TYPE
 TERMINAL_EVENT_STATES = {
@@ -93,6 +98,9 @@ _DEFAULT_OFF_SECONDS = 10.0
 _MINIMUM_OFF_SECONDS = 5.0
 _WAKE_OBSERVATION_MAX_SECONDS = 60.0
 _WAKE_DROPOUT_CONFIRM_MIN_SECONDS = 10.0
+_NORMAL_HEALTHY_ARM_MIN_SECONDS = 30.0
+_NORMAL_DROPOUT_CONFIRM_MIN_SECONDS = 5.0
+_STARTUP_MISSING_GRACE_MIN_SECONDS = 30.0
 _EVENT_TIME_FUTURE_TOLERANCE_SECONDS = 2.0
 
 
@@ -182,6 +190,12 @@ class PowerCycleRequest:
     wake_started_at: float = 0.0
     wake_dropout_at: float = 0.0
     wake_silence_at: float = 0.0
+    normal_connection_generation: int = 0
+    normal_dropout_generation: int = 0
+    normal_healthy_since_at: float = 0.0
+    normal_dropout_at: float = 0.0
+    normal_silence_at: float = 0.0
+    startup_missing_since: float = 0.0
 
     @property
     def identity(self) -> Tuple[Any, ...]:
@@ -206,6 +220,12 @@ class PowerCycleRequest:
             int(self.wake_started_at),
             int(self.wake_dropout_at),
             int(self.wake_silence_at),
+            self.normal_connection_generation,
+            self.normal_dropout_generation,
+            int(self.normal_healthy_since_at),
+            int(self.normal_dropout_at),
+            int(self.normal_silence_at),
+            int(self.startup_missing_since),
         )
 
     @classmethod
@@ -233,7 +253,31 @@ class PowerCycleRequest:
             wake_started_at,
             wake_dropout_at,
             wake_silence_at,
+            normal_connection_generation,
+            normal_dropout_generation,
+            normal_healthy_since_at,
+            normal_dropout_at,
+            normal_silence_at,
+            startup_missing_since,
         ) = _recovery_evidence(payload, recovery_reason)
+        session_reset_attempts = _integer(
+            payload, "session_reset_attempts", default=0, minimum=0, maximum=255
+        )
+        if (
+            recovery_reason == RECOVERY_REASON_HANDSHAKE
+            and session_reset_attempts != 1
+        ):
+            raise ValueError(
+                "HANDSHAKE_STUCK request requires exactly one session reset"
+            )
+        if (
+            recovery_reason != RECOVERY_REASON_HANDSHAKE
+            and session_reset_attempts != 0
+        ):
+            raise ValueError(
+                "%s request contains unrelated session-reset evidence"
+                % recovery_reason
+            )
         if (
             recovery_reason == RECOVERY_REASON_WAKE_DROPOUT
             and not _wake_timing_evidence_valid(
@@ -246,6 +290,28 @@ class PowerCycleRequest:
             raise ValueError(
                 "WAKE_DROPOUT request violates the 60s attribution window "
                 "or 10s dropout confirmation"
+            )
+        if (
+            recovery_reason == RECOVERY_REASON_NORMAL_DROPOUT
+            and not _normal_timing_evidence_valid(
+                normal_healthy_since_at,
+                normal_dropout_at,
+                normal_silence_at,
+                detected_at,
+            )
+        ):
+            raise ValueError(
+                "NORMAL_DROPOUT request violates the 30s healthy arm or "
+                "5s silence confirmation"
+            )
+        if (
+            recovery_reason == RECOVERY_REASON_STARTUP_MISSING
+            and not _startup_timing_evidence_valid(
+                startup_missing_since, detected_at
+            )
+        ):
+            raise ValueError(
+                "STARTUP_MISSING request violates the 30s startup grace"
             )
         if detected_at > timestamp + _EVENT_TIME_FUTURE_TOLERANCE_SECONDS:
             raise ValueError("power-cycle detection follows request timestamp")
@@ -260,6 +326,10 @@ class PowerCycleRequest:
                 "%s request has inconsistent broadcast_fresh"
                 % recovery_reason
             )
+        if recovery_reason == RECOVERY_REASON_STARTUP_MISSING and handle != 255:
+            raise ValueError("STARTUP_MISSING request must use synthetic handle 255")
+        if recovery_reason != RECOVERY_REASON_STARTUP_MISSING and handle == 255:
+            raise ValueError("only STARTUP_MISSING may use synthetic handle 255")
         recovery_state = payload.get("recovery_state")
         if (
             recovery_state is not None
@@ -291,6 +361,12 @@ class PowerCycleRequest:
             wake_started_at=wake_started_at,
             wake_dropout_at=wake_dropout_at,
             wake_silence_at=wake_silence_at,
+            normal_connection_generation=normal_connection_generation,
+            normal_dropout_generation=normal_dropout_generation,
+            normal_healthy_since_at=normal_healthy_since_at,
+            normal_dropout_at=normal_dropout_at,
+            normal_silence_at=normal_silence_at,
+            startup_missing_since=startup_missing_since,
         )
 
     @classmethod
@@ -387,16 +463,32 @@ def _recovery_reason(
         RECOVERY_REASON_NONE,
         RECOVERY_REASON_HANDSHAKE,
         RECOVERY_REASON_WAKE_DROPOUT,
+        RECOVERY_REASON_NORMAL_DROPOUT,
+        RECOVERY_REASON_STARTUP_MISSING,
     ):
         raise ValueError(
-            "recovery_reason must be NONE, HANDSHAKE_STUCK, or WAKE_DROPOUT"
+            "recovery_reason must be NONE, HANDSHAKE_STUCK, WAKE_DROPOUT, "
+            "NORMAL_DROPOUT, or STARTUP_MISSING"
         )
     return value
 
 
 def _recovery_evidence(
     payload: Mapping[str, Any], recovery_reason: str
-) -> Tuple[int, int, int, float, float, float]:
+) -> Tuple[
+    int,
+    int,
+    int,
+    float,
+    float,
+    float,
+    int,
+    int,
+    float,
+    float,
+    float,
+    float,
+]:
     """Validate cause-specific evidence carried by an active event.
 
     A wake dropout is intentionally impossible to infer from a generic
@@ -424,6 +516,39 @@ def _recovery_evidence(
     wake_silence_at = _number(
         payload, "wake_silence_at", default=0, minimum=0
     )
+    normal_connection_generation = _integer(
+        payload, "normal_connection_generation", default=0, minimum=0
+    )
+    normal_dropout_generation = _integer(
+        payload, "normal_dropout_generation", default=0, minimum=0
+    )
+    normal_healthy_since_at = _number(
+        payload, "normal_healthy_since_at", default=0, minimum=0
+    )
+    normal_dropout_at = _number(
+        payload, "normal_dropout_at", default=0, minimum=0
+    )
+    normal_silence_at = _number(
+        payload, "normal_silence_at", default=0, minimum=0
+    )
+    startup_missing_since = _number(
+        payload, "startup_missing_since", default=0, minimum=0
+    )
+    wake_present = (
+        wake_request_id != 0
+        or wake_connection_generation != 0
+        or wake_dropout_generation != 0
+        or wake_started_at != 0
+        or wake_dropout_at != 0
+        or wake_silence_at != 0
+    )
+    normal_present = (
+        normal_connection_generation != 0
+        or normal_dropout_generation != 0
+        or normal_healthy_since_at != 0
+        or normal_dropout_at != 0
+        or normal_silence_at != 0
+    )
     if recovery_reason == RECOVERY_REASON_WAKE_DROPOUT:
         if (
             wake_request_id <= 0
@@ -439,16 +564,32 @@ def _recovery_evidence(
             raise ValueError(
                 "WAKE_DROPOUT requires ordered positive wake evidence"
             )
-    elif (
-        wake_request_id != 0
-        or wake_connection_generation != 0
-        or wake_dropout_generation != 0
-        or wake_started_at != 0
-        or wake_dropout_at != 0
-        or wake_silence_at != 0
-    ):
+        if normal_present or startup_missing_since != 0:
+            raise ValueError("WAKE_DROPOUT contains unrelated recovery evidence")
+    elif recovery_reason == RECOVERY_REASON_NORMAL_DROPOUT:
+        if (
+            normal_connection_generation <= 0
+            or normal_dropout_generation <= 0
+            or normal_connection_generation != normal_dropout_generation
+            or normal_healthy_since_at <= 0
+            or normal_dropout_at <= 0
+            or normal_silence_at <= 0
+            or normal_healthy_since_at > normal_dropout_at
+            or normal_dropout_at > normal_silence_at
+        ):
+            raise ValueError(
+                "NORMAL_DROPOUT requires ordered positive normal evidence"
+            )
+        if wake_present or startup_missing_since != 0:
+            raise ValueError("NORMAL_DROPOUT contains unrelated recovery evidence")
+    elif recovery_reason == RECOVERY_REASON_STARTUP_MISSING:
+        if startup_missing_since <= 0:
+            raise ValueError("STARTUP_MISSING requires a positive startup timestamp")
+        if wake_present or normal_present:
+            raise ValueError("STARTUP_MISSING contains unrelated recovery evidence")
+    elif wake_present or normal_present or startup_missing_since != 0:
         raise ValueError(
-            "HANDSHAKE_STUCK request contains WAKE_DROPOUT evidence"
+            "HANDSHAKE_STUCK request contains unrelated recovery evidence"
         )
     return (
         wake_request_id,
@@ -457,6 +598,12 @@ def _recovery_evidence(
         wake_started_at,
         wake_dropout_at,
         wake_silence_at,
+        normal_connection_generation,
+        normal_dropout_generation,
+        normal_healthy_since_at,
+        normal_dropout_at,
+        normal_silence_at,
+        startup_missing_since,
     )
 
 
@@ -473,6 +620,31 @@ def _wake_timing_evidence_valid(
     return (
         0 <= attribution_seconds <= _WAKE_OBSERVATION_MAX_SECONDS
         and confirmation_seconds >= _WAKE_DROPOUT_CONFIRM_MIN_SECONDS
+    )
+
+
+def _normal_timing_evidence_valid(
+    normal_healthy_since_at: float,
+    normal_dropout_at: float,
+    normal_silence_at: float,
+    detected_at: float,
+) -> bool:
+    """Recheck sustained pre-fault health and current continuous silence."""
+
+    return (
+        normal_dropout_at - normal_healthy_since_at
+        >= _NORMAL_HEALTHY_ARM_MIN_SECONDS
+        and detected_at - normal_silence_at
+        >= _NORMAL_DROPOUT_CONFIRM_MIN_SECONDS
+    )
+
+
+def _startup_timing_evidence_valid(
+    startup_missing_since: float, detected_at: float
+) -> bool:
+    return (
+        detected_at - startup_missing_since
+        >= _STARTUP_MISSING_GRACE_MIN_SECONDS
     )
 
 
@@ -535,12 +707,20 @@ def _request_from_live_recovery_state(
     wake_state = payload.get("wake_state", RECOVERY_STATE_IDLE)
     if not isinstance(wake_state, str) or not wake_state:
         raise ValueError("wake_state must be a non-empty string")
+    normal_state = payload.get("normal_state", RECOVERY_STATE_IDLE)
+    if not isinstance(normal_state, str) or not normal_state:
+        raise ValueError("normal_state must be a non-empty string")
+    startup_state = payload.get("startup_state", RECOVERY_STATE_IDLE)
+    if not isinstance(startup_state, str) or not startup_state:
+        raise ValueError("startup_state must be a non-empty string")
 
     if recovery_state == RECOVERY_STATE_IDLE:
         if (
             recovery_reason != RECOVERY_REASON_NONE
             or handshake_state == REQUEST_TYPE
             or wake_state == WAKE_STATE_REQUIRED
+            or normal_state == RECOVERY_STATE_REQUIRED
+            or startup_state == RECOVERY_STATE_REQUIRED
         ):
             raise ValueError(
                 "recovery state is internally inconsistent: IDLE has an "
@@ -586,20 +766,50 @@ def _request_from_live_recovery_state(
             handshake_state != REQUEST_TYPE
             or broadcast_fresh is not True
             or wake_state != RECOVERY_STATE_IDLE
+            or normal_state != RECOVERY_STATE_IDLE
+            or startup_state != RECOVERY_STATE_IDLE
         ):
             raise ValueError(
                 "recovery state is internally inconsistent: "
                 "HANDSHAKE_STUCK requires a fresh broadcast"
             )
-    else:
+    elif recovery_reason == RECOVERY_REASON_WAKE_DROPOUT:
         if (
             handshake_state != RECOVERY_STATE_IDLE
             or wake_state != WAKE_STATE_REQUIRED
             or broadcast_fresh is not False
+            or normal_state != RECOVERY_STATE_IDLE
+            or startup_state != RECOVERY_STATE_IDLE
         ):
             raise ValueError(
                 "recovery state is internally inconsistent: WAKE_DROPOUT "
                 "requires IDLE handshake and absent broadcast"
+            )
+    elif recovery_reason == RECOVERY_REASON_NORMAL_DROPOUT:
+        if (
+            handshake_state != RECOVERY_STATE_IDLE
+            or wake_state != RECOVERY_STATE_IDLE
+            or normal_state != RECOVERY_STATE_REQUIRED
+            or startup_state != RECOVERY_STATE_IDLE
+            or broadcast_fresh is not False
+            or handle == 255
+        ):
+            raise ValueError(
+                "recovery state is internally inconsistent: NORMAL_DROPOUT "
+                "requires IDLE handshake/wake, absent broadcast, and a real handle"
+            )
+    else:
+        if (
+            handle != 255
+            or handshake_state != RECOVERY_STATE_IDLE
+            or wake_state != RECOVERY_STATE_IDLE
+            or normal_state != RECOVERY_STATE_IDLE
+            or startup_state != RECOVERY_STATE_REQUIRED
+            or broadcast_fresh is not False
+        ):
+            raise ValueError(
+                "recovery state is internally inconsistent: STARTUP_MISSING "
+                "requires synthetic handle 255 and no live link evidence"
             )
 
     (
@@ -609,6 +819,12 @@ def _request_from_live_recovery_state(
         wake_started_at,
         wake_dropout_at,
         wake_silence_at,
+        normal_connection_generation,
+        normal_dropout_generation,
+        normal_healthy_since_at,
+        normal_dropout_at,
+        normal_silence_at,
+        startup_missing_since,
     ) = _recovery_evidence(payload, recovery_reason)
     if (
         recovery_reason == RECOVERY_REASON_WAKE_DROPOUT
@@ -622,6 +838,29 @@ def _request_from_live_recovery_state(
         raise ValueError(
             "recovery state is internally inconsistent: WAKE_DROPOUT "
             "violates the 60s attribution window or 10s confirmation"
+        )
+    if (
+        recovery_reason == RECOVERY_REASON_NORMAL_DROPOUT
+        and not _normal_timing_evidence_valid(
+            normal_healthy_since_at,
+            normal_dropout_at,
+            normal_silence_at,
+            detected_at,
+        )
+    ):
+        raise ValueError(
+            "recovery state is internally inconsistent: NORMAL_DROPOUT "
+            "violates the 30s healthy arm or 5s silence confirmation"
+        )
+    if (
+        recovery_reason == RECOVERY_REASON_STARTUP_MISSING
+        and not _startup_timing_evidence_valid(
+            startup_missing_since, detected_at
+        )
+    ):
+        raise ValueError(
+            "recovery state is internally inconsistent: STARTUP_MISSING "
+            "violates the 30s startup grace"
         )
     event_id = "%s:%d:%d:%d" % (
         broadcast_code,
@@ -644,6 +883,12 @@ def _request_from_live_recovery_state(
         wake_started_at=wake_started_at,
         wake_dropout_at=wake_dropout_at,
         wake_silence_at=wake_silence_at,
+        normal_connection_generation=normal_connection_generation,
+        normal_dropout_generation=normal_dropout_generation,
+        normal_healthy_since_at=normal_healthy_since_at,
+        normal_dropout_at=normal_dropout_at,
+        normal_silence_at=normal_silence_at,
+        startup_missing_since=startup_missing_since,
     )
 
 
@@ -1113,10 +1358,10 @@ class StateStore:
                 "unexpected table(s) in dedicated state database: %s"
                 % ",".join(sorted(unknown))
             )
-        if version not in {0, 2, 3, STATE_DB_SCHEMA_VERSION}:
+        if version not in {0, 2, 3, 4, STATE_DB_SCHEMA_VERSION}:
             raise StateStoreError(
                 "unsupported state database schema version %d "
-                "(expected 2, 3, or %d)"
+                "(expected 2, 3, 4, or %d)"
                 % (version, STATE_DB_SCHEMA_VERSION)
             )
         if version == 2:
@@ -1195,14 +1440,92 @@ class StateStore:
                 )
                 if actual_previous != expected_previous:
                     raise StateStoreError(
-                        "state table %s cannot be migrated to schema 4: %s"
+                        "state table %s cannot be migrated to schema 5: %s"
                         % (table, ",".join(actual_previous))
                     )
                 db.execute(
                     "ALTER TABLE %s ADD COLUMN recovery_reason TEXT "
                     "NOT NULL DEFAULT 'HANDSHAKE_STUCK' "
                     "CHECK(recovery_reason IN "
-                    "('HANDSHAKE_STUCK','WAKE_DROPOUT'))" % table
+                    "('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',"
+                    "'STARTUP_MISSING'))" % table
+                )
+
+        if version == 4:
+            # SQLite cannot widen a column CHECK constraint with ALTER TABLE.
+            # Rebuild both reason-bearing tables inside this existing IMMEDIATE
+            # transaction so a crash leaves either the complete v4 database or
+            # the complete v5 database, never one table of each.
+            for table in ("power_events", "power_obligations"):
+                if table not in tables:
+                    continue
+                actual = tuple(
+                    str(row[1])
+                    for row in db.execute(
+                        "PRAGMA table_info(%s)" % table
+                    ).fetchall()
+                )
+                if actual != self._EXPECTED_COLUMNS[table]:
+                    raise StateStoreError(
+                        "state table %s cannot be migrated from schema 4: %s"
+                        % (table, ",".join(actual))
+                    )
+            if "power_events" in tables:
+                db.execute(
+                    """
+                    CREATE TABLE power_events_v5 (
+                      event_id TEXT PRIMARY KEY,
+                      trigger_bcode TEXT NOT NULL,
+                      group_id TEXT NOT NULL,
+                      power_key TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      attempts INTEGER NOT NULL DEFAULT 0,
+                      next_attempt REAL NOT NULL DEFAULT 0,
+                      first_seen REAL NOT NULL,
+                      last_update REAL NOT NULL,
+                      detail TEXT NOT NULL DEFAULT '',
+                      recovery_reason TEXT NOT NULL CHECK(recovery_reason IN
+                        ('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',
+                         'STARTUP_MISSING'))
+                    )
+                    """
+                )
+                db.execute(
+                    "INSERT INTO power_events_v5 SELECT * FROM power_events"
+                )
+                db.execute("DROP TABLE power_events")
+                db.execute("ALTER TABLE power_events_v5 RENAME TO power_events")
+            if "power_obligations" in tables:
+                db.execute(
+                    """
+                    CREATE TABLE power_obligations_v5 (
+                      power_key TEXT PRIMARY KEY,
+                      group_id TEXT NOT NULL,
+                      event_id TEXT NOT NULL,
+                      trigger_bcode TEXT NOT NULL,
+                      members_json TEXT NOT NULL,
+                      host TEXT NOT NULL,
+                      port INTEGER NOT NULL,
+                      channel INTEGER NOT NULL,
+                      address INTEGER NOT NULL,
+                      allow_omitted_checksum INTEGER NOT NULL,
+                      label TEXT NOT NULL,
+                      created_at REAL NOT NULL,
+                      last_attempt REAL NOT NULL DEFAULT 0,
+                      recovery_reason TEXT NOT NULL CHECK(recovery_reason IN
+                        ('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',
+                         'STARTUP_MISSING'))
+                    )
+                    """
+                )
+                db.execute(
+                    "INSERT INTO power_obligations_v5 "
+                    "SELECT * FROM power_obligations"
+                )
+                db.execute("DROP TABLE power_obligations")
+                db.execute(
+                    "ALTER TABLE power_obligations_v5 "
+                    "RENAME TO power_obligations"
                 )
 
         schema_statements = (
@@ -1219,7 +1542,9 @@ class StateStore:
               last_update REAL NOT NULL,
               detail TEXT NOT NULL DEFAULT '',
               recovery_reason TEXT NOT NULL
-                CHECK(recovery_reason IN ('HANDSHAKE_STUCK','WAKE_DROPOUT'))
+                CHECK(recovery_reason IN
+                  ('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',
+                   'STARTUP_MISSING'))
             )
             """,
             """
@@ -1263,7 +1588,9 @@ class StateStore:
               created_at REAL NOT NULL,
               last_attempt REAL NOT NULL DEFAULT 0,
               recovery_reason TEXT NOT NULL
-                CHECK(recovery_reason IN ('HANDSHAKE_STUCK','WAKE_DROPOUT'))
+                CHECK(recovery_reason IN
+                  ('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',
+                   'STARTUP_MISSING'))
             )
             """,
             """

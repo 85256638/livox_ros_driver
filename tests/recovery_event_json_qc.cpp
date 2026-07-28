@@ -28,6 +28,12 @@ int main() {
       "\"wake_request_id\":0,\"wake_connection_generation\":0,"
       "\"wake_dropout_generation\":0,\"wake_started_at\":0,"
       "\"wake_dropout_at\":0,\"wake_silence_at\":0,"
+      "\"normal_state\":\"IDLE\","
+      "\"normal_connection_generation\":0,"
+      "\"normal_dropout_generation\":0,"
+      "\"normal_healthy_since_at\":0,\"normal_dropout_at\":0,"
+      "\"normal_silence_at\":0,\"startup_state\":\"IDLE\","
+      "\"startup_missing_since\":0,"
       "\"broadcast_fresh\":true,\"publishing\":false,"
       "\"published_packets\":1234,\"power_cycle_required_count\":2,"
       "\"power_cycle_required_at\":99}";
@@ -49,6 +55,10 @@ int main() {
       "\"wake_connection_generation\":0,"
       "\"wake_dropout_generation\":0,\"wake_started_at\":0,"
       "\"wake_dropout_at\":0,\"wake_silence_at\":0,"
+      "\"normal_connection_generation\":0,"
+      "\"normal_dropout_generation\":0,"
+      "\"normal_healthy_since_at\":0,\"normal_dropout_at\":0,"
+      "\"normal_silence_at\":0,\"startup_missing_since\":0,"
       "\"session_reset_attempts\":1,"
       "\"episode_count\":2}";
   if (request != expected_request) {
@@ -85,6 +95,48 @@ int main() {
       wake_request.find("\"broadcast_fresh\":false") == std::string::npos) {
     std::cerr << "wake request JSON mismatch:\n" << wake_request << "\n";
     return 5;
+  }
+
+  const std::string normal_request = BuildPowerCycleRequestJson(
+      "normal:event", 150, 145, 202, 2, "TESTLIDAR000003",
+      "NORMAL_DROPOUT", false, 0, 0, 0, 0, 0, 0, 0, 5, 21, 21,
+      100, 130, 140, 0);
+  if (normal_request.find("\"normal_connection_generation\":21") ==
+          std::string::npos ||
+      normal_request.find("\"normal_dropout_generation\":21") ==
+          std::string::npos ||
+      normal_request.find("\"normal_healthy_since_at\":100") ==
+          std::string::npos ||
+      normal_request.find("\"normal_silence_at\":140") ==
+          std::string::npos ||
+      normal_request.find("\"startup_missing_since\":0") ==
+          std::string::npos) {
+    std::cerr << "normal request JSON mismatch:\n" << normal_request << "\n";
+    return 6;
+  }
+
+  const std::string startup_request = BuildPowerCycleRequestJson(
+      "startup:event", 200, 190, 203, 255, "TESTLIDAR000004",
+      "STARTUP_MISSING", false, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+      0, 0, 160);
+  if (startup_request.find("\"handle\":255") == std::string::npos ||
+      startup_request.find("\"startup_missing_since\":160") ==
+          std::string::npos) {
+    std::cerr << "startup request JSON mismatch:\n" << startup_request << "\n";
+    return 7;
+  }
+
+  const std::string startup_state = BuildLidarRecoveryStateJson(
+      200, 203, 255, "TESTLIDAR000004", false, "Off", "?", "IDLE",
+      "POWER_CYCLE_REQUIRED", "STARTUP_MISSING", "IDLE", 0, 0, 0, 0, 0,
+      0, false, false, 0, 1, 190, "IDLE", 0, 0, 0, 0, 0,
+      "POWER_CYCLE_REQUIRED", 160);
+  if (startup_state.find("\"startup_state\":\"POWER_CYCLE_REQUIRED\"") ==
+          std::string::npos ||
+      startup_state.find("\"startup_missing_since\":160") ==
+          std::string::npos) {
+    std::cerr << "startup state JSON mismatch:\n" << startup_state << "\n";
+    return 8;
   }
 
   std::cout << "recovery_event_json_qc: OK\n";

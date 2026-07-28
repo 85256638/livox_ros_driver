@@ -75,12 +75,25 @@ class LdsLidar : public Lds {
    *  explicit PowerSaving/StandBy -> Normal request and, when enabled, commit
    *  a reason-tagged hard-power escalation after ten quiet seconds. */
   void TickWakeDropoutRecovery(bool enable_recovery);
+  /** Called by the 1 Hz dashboard after a coherent data-plane snapshot. A
+   *  connection must publish in Normal/Sampling for 30 seconds before a later
+   *  no-broadcast disconnect is allowed to request shared hard power. */
+  void ObserveNormalPublishing(uint8_t handle, bool healthy,
+                               uint64_t connection_generation,
+                               const char *broadcast_code);
+  void TickNormalDropoutRecovery(bool enable_recovery);
   static int64_t HandshakeBroadcastFreshNs() { return 3000000000LL; }
   static uint8_t HandshakeResetMaxAttempts() { return 1; }
   static int64_t WakeObservationNs() { return 60000000000LL; }
   static int64_t WakeDropoutConfirmNs() { return 10000000000LL; }
   static int64_t WakeBroadcastHandoffNs() { return 3000000000LL; }
   static uint32_t WakeBroadcastHandoffMinFrames() { return 3; }
+  static int64_t NormalHealthyArmNs() { return 30000000000LL; }
+  static int64_t NormalDropoutConfirmNs() { return 5000000000LL; }
+  /** Fixed after InitLdsLidar; used by the Driver heartbeat to publish a
+   *  fail-closed STARTUP_MISSING row for configured devices which never
+   *  produce any connection/broadcast state. */
+  std::vector<std::string> GetWhitelistBroadcastCodes() const;
   livox_status RequestLidarReboot(uint8_t handle, uint16_t timeout_ms = 100);
   /** Watchdog variant: reject if a planned mode request won the per-handle
    *  send race. Manual reboot remains an explicit override. */
@@ -129,11 +142,22 @@ class LdsLidar : public Lds {
     kWakeRecoveryPowerCycleRequired
   };
 
+  enum NormalDropoutRecoveryState {
+    kNormalDropoutIdle = 0,
+    kNormalDropoutArmed,
+    kNormalDropoutNoBroadcast,
+    kNormalDropoutObservingReturn,
+    kNormalDropoutConfirmed,
+    kNormalDropoutPowerCycleRequired
+  };
+
   /** Current cause of the generic POWER_CYCLE_REQUIRED edge. */
   enum PowerCycleReason {
     kPowerCycleReasonNone = 0,
     kPowerCycleReasonHandshakeStuck,
-    kPowerCycleReasonWakeDropout
+    kPowerCycleReasonWakeDropout,
+    kPowerCycleReasonNormalDropout,
+    kPowerCycleReasonStartupMissing
   };
 
   struct LinkStat {
@@ -184,8 +208,9 @@ class LdsLidar : public Lds {
      *  re-entry in the same episode, so this is a transition sequence rather
      *  than an incident count. */
     uint32_t power_cycle_required_count = 0;
-    /** Number of distinct handshake or wake-dropout episodes which reached
-     *  POWER_CYCLE_REQUIRED at least once. */
+    /** Number of distinct handle-backed handshake, wake or normal-dropout
+     *  episodes which reached POWER_CYCLE_REQUIRED at least once. Startup-
+     *  missing events use synthetic handle 255 and are tracked separately. */
     uint32_t power_cycle_required_episode_count = 0;
     /** Per-episode latch preventing a cancelled/re-offered edge from being
      *  counted as another distinct failure episode. */
@@ -196,6 +221,7 @@ class LdsLidar : public Lds {
      *  history while the generic counts above retain unique event identity. */
     uint32_t handshake_power_cycle_episode_count = 0;
     uint32_t wake_power_cycle_episode_count = 0;
+    uint32_t normal_power_cycle_episode_count = 0;
     /** An explicit wake guard survives completion of ModeChangeRequest because
      *  field units can enter Normal/Config and then disappear tens of seconds
      *  later. Identity and generation are captured before the command send. */
@@ -227,6 +253,24 @@ class LdsLidar : public Lds {
     bool wake_dropout_counted_this_request = false;
     bool wake_power_cycle_counted_this_request = false;
     char wake_broadcast_code[kBroadcastCodeSize] = {0};
+    /** A normal dropout is armed only by sustained real point publication.
+     *  It is independent of explicit-wake attribution and retains the first
+     *  disconnect while residual broadcasts are tested for a stable handoff. */
+    NormalDropoutRecoveryState normal_dropout_state = kNormalDropoutIdle;
+    uint64_t normal_connection_generation = 0;
+    uint64_t normal_dropout_generation = 0;
+    int64_t normal_healthy_since_ns = 0;
+    int64_t normal_healthy_since_wall_s = 0;
+    int64_t normal_attributed_disconnect_ns = 0;
+    int64_t normal_attributed_disconnect_wall_s = 0;
+    int64_t normal_dropout_since_ns = 0;
+    int64_t normal_dropout_wall_s = 0;
+    int64_t normal_broadcast_return_since_ns = 0;
+    uint32_t normal_broadcast_return_count = 0;
+    uint32_t normal_dropout_count = 0;
+    bool normal_dropout_counted_this_episode = false;
+    bool normal_power_cycle_counted_this_episode = false;
+    char normal_broadcast_code[kBroadcastCodeSize] = {0};
     /** Exact reason from the paired SDK's handshake diagnostics. A handshake
      *  ACK is not a public kEventConnect: DeviceInfo may still be pending, so
      *  these events never clear the recovery budget. */

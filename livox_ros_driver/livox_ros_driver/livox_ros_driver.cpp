@@ -189,6 +189,8 @@ static ros::Publisher g_stats_pub;
 static ros::Publisher g_power_cycle_request_pub;
 static ros::Publisher g_recovery_state_pub;
 static uint64_t g_driver_instance_id = 0;
+static int64_t g_driver_started_ns = 0;
+static int64_t g_driver_started_wall_s = 0;
 /** When true, the stats timer auto-recovers a lidar that is connected/Normal
  *  but has produced no point cloud for a while (restart sampling, then reboot). */
 static bool g_auto_recover = false;
@@ -232,12 +234,32 @@ static const char *WakeStateStr(LdsLidar::WakeRecoveryState state) {
   }
 }
 
+static const char *NormalDropoutStateStr(
+    LdsLidar::NormalDropoutRecoveryState state) {
+  switch (state) {
+    case LdsLidar::kNormalDropoutNoBroadcast:
+      return "NORMAL_NO_BROADCAST";
+    case LdsLidar::kNormalDropoutObservingReturn:
+      return "BROADCAST_RETURNING";
+    case LdsLidar::kNormalDropoutConfirmed:
+      return "NORMAL_DROPOUT";
+    case LdsLidar::kNormalDropoutPowerCycleRequired:
+      return "POWER_CYCLE_REQUIRED";
+    default:
+      return "IDLE";
+  }
+}
+
 static const char *PowerCycleReasonStr(LdsLidar::PowerCycleReason reason) {
   switch (reason) {
     case LdsLidar::kPowerCycleReasonHandshakeStuck:
       return "HANDSHAKE_STUCK";
     case LdsLidar::kPowerCycleReasonWakeDropout:
       return "WAKE_DROPOUT";
+    case LdsLidar::kPowerCycleReasonNormalDropout:
+      return "NORMAL_DROPOUT";
+    case LdsLidar::kPowerCycleReasonStartupMissing:
+      return "STARTUP_MISSING";
     default:
       return "NONE";
   }
@@ -248,10 +270,14 @@ static bool IsPowerCycleRequired(const LdsLidar::LinkStat &link) {
               LdsLidar::kPowerCycleReasonHandshakeStuck &&
           link.handshake_state ==
               LdsLidar::kHandshakeLinkPowerCycleRequired) ||
+          (link.power_cycle_reason ==
+               LdsLidar::kPowerCycleReasonWakeDropout &&
+           link.wake_state ==
+               LdsLidar::kWakeRecoveryPowerCycleRequired) ||
          (link.power_cycle_reason ==
-              LdsLidar::kPowerCycleReasonWakeDropout &&
-          link.wake_state ==
-              LdsLidar::kWakeRecoveryPowerCycleRequired);
+              LdsLidar::kPowerCycleReasonNormalDropout &&
+          link.normal_dropout_state ==
+              LdsLidar::kNormalDropoutPowerCycleRequired);
 }
 
 static const char *RecoveryStateStr(const LdsLidar::LinkStat &link) {
@@ -317,6 +343,12 @@ static void PublishRecoveryState(
     return;
   }
   std_msgs::String msg;
+  const bool wake_reason =
+      IsPowerCycleRequired(link) &&
+      link.power_cycle_reason == LdsLidar::kPowerCycleReasonWakeDropout;
+  const bool normal_reason =
+      IsPowerCycleRequired(link) &&
+      link.power_cycle_reason == LdsLidar::kPowerCycleReasonNormalDropout;
   msg.data = BuildLidarRecoveryStateJson(
       static_cast<int64_t>(time(nullptr)), g_driver_instance_id, handle,
       broadcast_code, connected, ConnectStateStr(connect_state),
@@ -324,12 +356,20 @@ static void PublishRecoveryState(
       RecoveryStateStr(link),
       IsPowerCycleRequired(link) ? PowerCycleReasonStr(link.power_cycle_reason)
                                  : "NONE",
-      WakeStateStr(link.wake_state), link.wake_request_id,
-      link.wake_connection_generation, link.wake_dropout_generation,
-      link.wake_started_wall_s, link.wake_attributed_disconnect_wall_s,
-      link.wake_dropout_wall_s,
+      WakeStateStr(link.wake_state), wake_reason ? link.wake_request_id : 0,
+      wake_reason ? link.wake_connection_generation : 0,
+      wake_reason ? link.wake_dropout_generation : 0,
+      wake_reason ? link.wake_started_wall_s : 0,
+      wake_reason ? link.wake_attributed_disconnect_wall_s : 0,
+      wake_reason ? link.wake_dropout_wall_s : 0,
       broadcast_fresh, publishing, published_packets,
-      link.power_cycle_required_count, link.power_cycle_required_wall_s);
+      link.power_cycle_required_count, link.power_cycle_required_wall_s,
+      NormalDropoutStateStr(link.normal_dropout_state),
+      normal_reason ? link.normal_connection_generation : 0,
+      normal_reason ? link.normal_dropout_generation : 0,
+      normal_reason ? link.normal_healthy_since_wall_s : 0,
+      normal_reason ? link.normal_attributed_disconnect_wall_s : 0,
+      normal_reason ? link.normal_dropout_wall_s : 0, "IDLE", 0);
   g_recovery_state_pub.publish(msg);
 }
 
@@ -347,6 +387,10 @@ static void PublishPowerCycleRequest(uint8_t handle, const char *broadcast_code,
   const std::string event_id_text = event_id.str();
   const bool wake_reason =
       link.power_cycle_reason == LdsLidar::kPowerCycleReasonWakeDropout;
+  const bool normal_reason =
+      link.power_cycle_reason == LdsLidar::kPowerCycleReasonNormalDropout;
+  const bool handshake_reason =
+      link.power_cycle_reason == LdsLidar::kPowerCycleReasonHandshakeStuck;
   std_msgs::String msg;
   msg.data = BuildPowerCycleRequestJson(
       event_id_text.c_str(), static_cast<int64_t>(time(nullptr)), detected_at,
@@ -358,12 +402,68 @@ static void PublishPowerCycleRequest(uint8_t handle, const char *broadcast_code,
       wake_reason ? link.wake_started_wall_s : 0,
       wake_reason ? link.wake_attributed_disconnect_wall_s : 0,
       wake_reason ? link.wake_dropout_wall_s : 0,
-      wake_reason ? 0 : link.handshake_reset_attempts,
-      link.power_cycle_required_count);
+      handshake_reason ? link.handshake_reset_attempts : 0,
+      link.power_cycle_required_count,
+      normal_reason ? link.normal_connection_generation : 0,
+      normal_reason ? link.normal_dropout_generation : 0,
+      normal_reason ? link.normal_healthy_since_wall_s : 0,
+      normal_reason ? link.normal_attributed_disconnect_wall_s : 0,
+      normal_reason ? link.normal_dropout_wall_s : 0, 0);
   g_power_cycle_request_pub.publish(msg);
   ROS_ERROR("[LivoxPowerCycle] published request event_id=%s lidar[%u][%s]",
             event_id_text.c_str(), static_cast<unsigned>(handle),
-            broadcast_code);
+             broadcast_code);
+}
+
+struct StartupMissingTracker {
+  std::string broadcast_code;
+  bool ever_healthy = false;
+  int64_t absent_since_ns = 0;
+  int64_t absent_since_wall_s = 0;
+  int64_t required_at_wall_s = 0;
+  uint32_t episode_count = 0;
+  bool active = false;
+  bool request_emitted = false;
+};
+
+static void PublishStartupRecoveryState(const StartupMissingTracker &tracker,
+                                        bool power_required) {
+  if (!g_recovery_state_pub) {
+    return;
+  }
+  std_msgs::String msg;
+  msg.data = BuildLidarRecoveryStateJson(
+      static_cast<int64_t>(time(nullptr)), g_driver_instance_id, 255,
+      tracker.broadcast_code.c_str(), false, "Off", "?", "IDLE",
+      power_required ? "POWER_CYCLE_REQUIRED" : "IDLE",
+      power_required ? "STARTUP_MISSING" : "NONE", "IDLE", 0, 0, 0, 0,
+      0, 0, false, false, 0, power_required ? tracker.episode_count : 0,
+      power_required ? tracker.required_at_wall_s : 0, "IDLE", 0, 0, 0,
+      0, 0,
+      power_required ? "POWER_CYCLE_REQUIRED" : "STARTUP_MISSING",
+      tracker.absent_since_wall_s);
+  g_recovery_state_pub.publish(msg);
+}
+
+static void PublishStartupPowerCycleRequest(
+    const StartupMissingTracker &tracker) {
+  if (!g_power_cycle_request_pub || tracker.required_at_wall_s <= 0 ||
+      tracker.episode_count == 0) {
+    return;
+  }
+  std::ostringstream event_id;
+  event_id << tracker.broadcast_code << ":" << g_driver_instance_id << ":"
+           << tracker.required_at_wall_s << ":" << tracker.episode_count;
+  std_msgs::String msg;
+  msg.data = BuildPowerCycleRequestJson(
+      event_id.str().c_str(), static_cast<int64_t>(time(nullptr)),
+      tracker.required_at_wall_s, g_driver_instance_id, 255,
+      tracker.broadcast_code.c_str(), "STARTUP_MISSING", false, 0, 0, 0, 0,
+      0, 0, 0, tracker.episode_count, 0, 0, 0, 0, 0,
+      tracker.absent_since_wall_s);
+  g_power_cycle_request_pub.publish(msg);
+  ROS_ERROR("[LivoxPowerCycle] published STARTUP_MISSING request event_id=%s",
+            event_id.str().c_str());
 }
 
 static const char *TempStr(uint32_t s) {
@@ -435,6 +535,18 @@ static std::string DashboardNowState(
     }
     if (link.wake_state == LdsLidar::kWakeRecoveryNoBroadcast) {
       return "WAKE_NO_BROADCAST";
+    }
+    if (link.normal_dropout_state ==
+        LdsLidar::kNormalDropoutConfirmed) {
+      return "NORMAL_DROPOUT";
+    }
+    if (link.normal_dropout_state ==
+        LdsLidar::kNormalDropoutNoBroadcast) {
+      return "NORMAL_NO_BROADCAST";
+    }
+    if (link.normal_dropout_state ==
+        LdsLidar::kNormalDropoutObservingReturn) {
+      return "BROADCAST_RETURNING";
     }
     if (broadcast_recent &&
         link.handshake_state != LdsLidar::kHandshakeLinkIdle) {
@@ -541,6 +653,7 @@ static const uint32_t kConfigRebootMaxAttempts = 3;
  *  as "NO DATA" on the dashboard once it has lasted this long, so trivial 1-2s
  *  hiccups don't spam either. */
 static const uint32_t kNoDataLogSec = 3;
+static const int64_t kStartupMissingGraceNs = 30000000000LL;
 
 /** The Error reboot budget (kErrorRebootMaxAttempts) is cleared only after the
  *  lidar has been out of Error this long. A reboot cycles through Init/Normal
@@ -563,6 +676,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
    *  when auto recovery is enabled, perform bounded local-session resets. */
   g_read_lidar->TickHandshakeRecovery(g_auto_recover);
   g_read_lidar->TickWakeDropoutRecovery(g_auto_recover);
+  g_read_lidar->TickNormalDropoutRecovery(g_auto_recover);
   static uint64_t prev_recv[kMaxLidarCount] = {0};
   static uint64_t prev_pub[kMaxLidarCount] = {0};
   static uint64_t prev_connection_generation[kMaxLidarCount] = {0};
@@ -583,6 +697,27 @@ void StatsTimerCb(const ros::TimerEvent &) {
    *  decisions; broadcast-code isolation prevents a reused handle from
    *  inheriting another physical lidar's trend. */
   static DashboardMetrics dashboard_metrics[kMaxLidarCount];
+
+  /** Whitelist-only startup supervision gives a configured device a visible
+   *  identity even when the SDK has never assigned it a handle. */
+  static bool startup_trackers_initialized = false;
+  static std::vector<StartupMissingTracker> startup_trackers;
+  if (!startup_trackers_initialized) {
+    const std::vector<std::string> whitelist =
+        g_read_lidar->GetWhitelistBroadcastCodes();
+    startup_trackers.reserve(whitelist.size());
+    for (const std::string &code : whitelist) {
+      StartupMissingTracker tracker;
+      tracker.broadcast_code = code;
+      tracker.absent_since_ns = g_driver_started_ns;
+      tracker.absent_since_wall_s = g_driver_started_wall_s;
+      startup_trackers.push_back(tracker);
+    }
+    startup_trackers_initialized = true;
+  }
+  std::vector<bool> startup_present(startup_trackers.size(), false);
+  std::vector<bool> startup_healthy(startup_trackers.size(), false);
+  std::vector<bool> startup_dashboard_row(startup_trackers.size(), false);
 
   int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
 
@@ -715,6 +850,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
     double loss_pct_d = tot ? (100.0 * st.loss_packet_count / tot) : 0.0;
     char line[256];
     bool publishing_now = false;
+    bool transition_active = false;
     uint64_t row_recv = 0;
     const char *row_state = "?";
     if (watchdog_connected) {
@@ -740,13 +876,14 @@ void StatsTimerCb(const ros::TimerEvent &) {
        *  check is blind to. PowerSaving/Standby/Init/Error legitimately
        *  produce nothing, and a lidar inside a planned mode switch is left to
        *  the mode verify/retry machinery instead of this watchdog. */
-      bool transition = g_read_lidar->IsModeTransitionActive(h);
+      transition_active = g_read_lidar->IsModeTransitionActive(h);
       /** Config is explicitly excluded: starting/rebooting while coordinate,
        *  return-mode, IMU or extrinsic commands are still pending can publish
        *  data with only part of the requested configuration applied. On is
        *  retained because StartSampleCb uses it after a start timeout, which is
        *  the field-confirmed state the restart path must recover. */
-      bool should_stream = (info.state == kLidarStateNormal) && !transition &&
+      bool should_stream = (info.state == kLidarStateNormal) &&
+                           !transition_active &&
                            (connect_state != kConnectStateConfig);
       bool configuring = (info.state == kLidarStateNormal) &&
                           (connect_state == kConnectStateConfig);
@@ -992,6 +1129,27 @@ void StatsTimerCb(const ros::TimerEvent &) {
                          st.queue_drop_count, loss_pct_d, disc);
       }
     }
+    const bool normal_healthy =
+        watchdog_connected && info.state == kLidarStateNormal &&
+        connect_state == kConnectStateSampling && publishing_now &&
+        !transition_active;
+    g_read_lidar->ObserveNormalPublishing(
+        h, normal_healthy, connection_generation,
+        watchdog_connected ? info.broadcast_code : nullptr);
+    const char *startup_identity =
+        ls.broadcast_code[0] != '\0'
+            ? ls.broadcast_code
+            : (info.broadcast_code[0] != '\0' ? info.broadcast_code : nullptr);
+    if (startup_identity != nullptr) {
+      for (std::size_t i = 0; i < startup_trackers.size(); ++i) {
+        if (startup_trackers[i].broadcast_code == startup_identity) {
+          startup_present[i] = startup_present[i] || watchdog_connected ||
+                               broadcast_recent;
+          startup_healthy[i] = startup_healthy[i] || normal_healthy;
+          startup_dashboard_row[i] = true;
+        }
+      }
+    }
     /** Revalidate a pending request from a freshly locked handle+episode
      *  snapshot.  ROS publication happens after releasing the SDK callback
      *  lock; the relay manager performs its own final live-state precheck for
@@ -999,6 +1157,9 @@ void StatsTimerCb(const ros::TimerEvent &) {
     const int64_t expected_power_episode = ls.broadcast_only_since_ns;
     const uint64_t expected_wake_request_id = ls.wake_request_id;
     const int64_t expected_wake_dropout = ls.wake_dropout_since_ns;
+    const uint64_t expected_normal_generation =
+        ls.normal_dropout_generation;
+    const int64_t expected_normal_silence = ls.normal_dropout_since_ns;
     const LdsLidar::PowerCycleReason expected_power_reason =
         ls.power_cycle_reason;
     const uint32_t expected_power_count = ls.power_cycle_required_count;
@@ -1020,8 +1181,16 @@ void StatsTimerCb(const ros::TimerEvent &) {
           (expected_power_reason ==
                    LdsLidar::kPowerCycleReasonHandshakeStuck
                ? live.broadcast_only_since_ns == expected_power_episode
-               : live.wake_request_id == expected_wake_request_id &&
-                     live.wake_dropout_since_ns == expected_wake_dropout) &&
+               : expected_power_reason ==
+                         LdsLidar::kPowerCycleReasonWakeDropout
+                     ? live.wake_request_id == expected_wake_request_id &&
+                           live.wake_dropout_since_ns == expected_wake_dropout
+                     : expected_power_reason ==
+                               LdsLidar::kPowerCycleReasonNormalDropout &&
+                           live.normal_dropout_generation ==
+                               expected_normal_generation &&
+                           live.normal_dropout_since_ns ==
+                               expected_normal_silence) &&
           live.power_cycle_required_count == expected_power_count;
       /** Keep the later footer coherent with the state just published. */
       ls = live;
@@ -1068,8 +1237,16 @@ void StatsTimerCb(const ros::TimerEvent &) {
         dashboard_connected ? CurrentHealthTags(ls.health_code) : "-";
     const std::string health_cell =
         health_tags.size() <= 10 ? health_tags : "MULTI";
-    const std::string display_state =
+    std::string display_state =
         DashboardNowState(dashboard_connected, broadcast_recent, row_state, ls);
+    if (!dashboard_connected && !broadcast_recent) {
+      for (const StartupMissingTracker &tracker : startup_trackers) {
+        if (tracker.active && tracker.broadcast_code == dashboard_bcode) {
+          display_state = "STARTUP_MISSING";
+          break;
+        }
+      }
+    }
 
     DashboardCounters dashboard_counters;
     dashboard_counters.received_packets = st.receive_packet_count;
@@ -1087,6 +1264,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
     dashboard_counters.disconnect_episodes = ls.disconnect_count;
     dashboard_counters.handshake_stuck_episodes = ls.handshake_stuck_count;
     dashboard_counters.wake_dropout_episodes = ls.wake_dropout_count;
+    dashboard_counters.normal_dropout_episodes = ls.normal_dropout_count;
     dashboard_counters.power_reached_episodes =
         ls.power_cycle_required_episode_count;
     dashboard_counters.power_request_edges =
@@ -1105,19 +1283,29 @@ void StatsTimerCb(const ros::TimerEvent &) {
     const bool power_reason_wake =
         display_state == "POWER_CYCLE_REQUIRED" &&
         ls.power_cycle_reason == LdsLidar::kPowerCycleReasonWakeDropout;
+    const bool power_reason_normal =
+        display_state == "POWER_CYCLE_REQUIRED" &&
+        ls.power_cycle_reason == LdsLidar::kPowerCycleReasonNormalDropout;
     const bool handshake_incident =
         display_state == "HANDSHAKE_STUCK" ||
         power_reason_handshake;
     const bool wake_incident =
         display_state == "WAKE_NO_BROADCAST" ||
         display_state == "WAKE_DROPOUT" || power_reason_wake;
+    const bool normal_dropout_incident =
+        display_state == "NORMAL_NO_BROADCAST" ||
+        display_state == "NORMAL_DROPOUT" ||
+        display_state == "BROADCAST_RETURNING" || power_reason_normal;
     const bool config_exhausted =
         display_state == "CONFIG" && g_auto_recover &&
         config_reboots[h] >= kConfigRebootMaxAttempts;
     const bool current_incident =
-        display_state == "DISCONNECTED" || display_state == "NO_DATA" ||
+        display_state == "DISCONNECTED" ||
+        display_state == "STARTUP_MISSING" ||
+        display_state == "NO_DATA" ||
         display_state == "ERROR" || display_state == "?" ||
-        handshake_incident || wake_incident || config_exhausted ||
+        handshake_incident || wake_incident || normal_dropout_incident ||
+        config_exhausted ||
         (dashboard_connected && health_tags != "OK");
     live_signals.incident_active = current_incident;
     live_signals.recovery_active =
@@ -1155,13 +1343,17 @@ void StatsTimerCb(const ros::TimerEvent &) {
     if (current_incident) {
       any_active_alert = true;
       const bool critical =
-          display_state == "POWER_CYCLE_REQUIRED";
+          display_state == "POWER_CYCLE_REQUIRED" ||
+          (display_state == "STARTUP_MISSING" && g_auto_recover);
       active_alerts << "  " << (critical ? "[CRIT]" : "[ALERT]") << " L"
                     << static_cast<unsigned>(h) << " " << dashboard_bcode
                     << " " << display_state;
       if (critical) {
-        active_alerts << " reason="
-                      << PowerCycleReasonStr(ls.power_cycle_reason);
+        active_alerts
+            << " reason="
+            << (display_state == "STARTUP_MISSING"
+                    ? "STARTUP_MISSING"
+                    : PowerCycleReasonStr(ls.power_cycle_reason));
       }
       if (wake_incident && ls.wake_dropout_since_ns != 0) {
         const int64_t wake_age_ns = now_ns - ls.wake_dropout_since_ns;
@@ -1183,6 +1375,37 @@ void StatsTimerCb(const ros::TimerEvent &) {
         active_alerts << "    wake request=" << ls.wake_request_id
                       << "; observation=60s; dropout-confirm=10s; "
                          "broadcast-handoff=3s/3frames\n";
+      } else if (normal_dropout_incident &&
+                 ls.normal_attributed_disconnect_ns != 0) {
+        const int64_t normal_age_ns =
+            now_ns - ls.normal_attributed_disconnect_ns;
+        active_alerts << " age=" << FmtDur(normal_age_ns) << "\n";
+        active_alerts
+            << "    normal dropout: previously healthy Normal/Sampling "
+               "publication >=30s; control=down; broadcast="
+            << (broadcast_recent ? "returning" : "absent");
+        if (display_state == "NORMAL_NO_BROADCAST" &&
+            ls.normal_dropout_since_ns != 0) {
+          const long long silence_s =
+              (now_ns - ls.normal_dropout_since_ns) / 1000000000LL;
+          active_alerts << "; confirming "
+                        << (silence_s >= 5 ? 0 : 5 - silence_s)
+                        << "s before escalation";
+        } else if (display_state == "BROADCAST_RETURNING") {
+          active_alerts
+              << "; awaiting stable 3s/3-frame handoff to handshake recovery";
+        } else if (display_state == "NORMAL_DROPOUT" && !g_auto_recover) {
+          active_alerts << "; confirmed; detection only (auto_recover=off)";
+        } else if (power_reason_normal) {
+          active_alerts << "; shared power-cycle request published";
+        }
+        active_alerts << "\n";
+        active_alerts
+            << "    normal evidence: generation="
+            << ls.normal_dropout_generation
+            << "; healthy-since=" << FmtWall(ls.normal_healthy_since_wall_s)
+            << "; silence-since=" << FmtWall(ls.normal_dropout_wall_s)
+            << "\n";
       } else if (handshake_incident && ls.broadcast_only_since_ns != 0) {
         active_alerts << " age="
                       << FmtDur(now_ns - ls.broadcast_only_since_ns) << "\n";
@@ -1206,6 +1429,10 @@ void StatsTimerCb(const ros::TimerEvent &) {
           active_alerts << "; post-reset observation";
         }
         active_alerts << "\n";
+      } else if (display_state == "STARTUP_MISSING") {
+        active_alerts
+            << "\n    startup: configured whitelist member absent; "
+               "synthetic handle=255; shared power-cycle supervision active\n";
       } else if (display_state == "DISCONNECTED") {
         active_alerts << "\n    link: broadcast=absent; outage="
                       << outage_duration << "\n";
@@ -1252,7 +1479,10 @@ void StatsTimerCb(const ros::TimerEvent &) {
         ls.handshake_network_error_count != 0 ||
         ls.handshake_protocol_error_count != 0;
     const bool wake_history = ls.wake_dropout_count != 0 ||
-                              ls.wake_power_cycle_episode_count != 0;
+                               ls.wake_power_cycle_episode_count != 0;
+    const bool normal_dropout_history =
+        ls.normal_dropout_count != 0 ||
+        ls.normal_power_cycle_episode_count != 0;
     const bool hard_power_history =
         ls.power_cycle_required_episode_count != 0 ||
         ls.power_cycle_required_count != 0;
@@ -1260,7 +1490,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
         ls.disconnect_count != 0 || ls.temp_change_count != 0 ||
         ls.fault_count != 0 || ls.recover_reboot_count != 0 ||
         ls.mode_fail_count != 0 || handshake_history || wake_history ||
-        hard_power_history;
+        normal_dropout_history || hard_power_history;
     if (has_history) {
       any_process_history = true;
       process_history << "  L" << static_cast<unsigned>(h) << " "
@@ -1310,6 +1540,15 @@ void StatsTimerCb(const ros::TimerEvent &) {
         process_history << "      cause: explicit low-power -> Normal, then "
                            "control+broadcast absent for 10s\n";
       }
+      if (normal_dropout_history) {
+        process_history << "    normal-dropout episodes="
+                        << ls.normal_dropout_count
+                        << "; escalated-to-power="
+                        << ls.normal_power_cycle_episode_count << "\n";
+        process_history
+            << "      cause: >=30s healthy Normal/Sampling publication, then "
+               "control+broadcast absent for 5s\n";
+      }
       if (hard_power_history) {
         process_history << "    POWER_CYCLE_REQUIRED: episodes="
                         << ls.power_cycle_required_episode_count
@@ -1339,6 +1578,82 @@ void StatsTimerCb(const ros::TimerEvent &) {
                         << DashboardModeName(ls.mode_fail_mode)
                         << ", last=" << FmtWall(ls.mode_fail_wall_s) << "\n";
       }
+    }
+  }
+
+  for (std::size_t i = 0; i < startup_trackers.size(); ++i) {
+    StartupMissingTracker &tracker = startup_trackers[i];
+    if (startup_healthy[i]) {
+      tracker.ever_healthy = true;
+    }
+    if (startup_present[i]) {
+      if (tracker.active) {
+        ROS_INFO("[LivoxRecover] configured lidar[%s] appeared; cancelling "
+                 "STARTUP_MISSING",
+                 tracker.broadcast_code.c_str());
+      }
+      tracker.absent_since_ns = 0;
+      tracker.absent_since_wall_s = 0;
+      tracker.required_at_wall_s = 0;
+      tracker.active = false;
+      tracker.request_emitted = false;
+      continue;
+    }
+    /** Once a device has published healthily, its later failure belongs to the
+     *  generation-bound NORMAL_DROPOUT path, never to synthetic handle 255. */
+    if (tracker.ever_healthy) {
+      continue;
+    }
+    if (tracker.absent_since_ns == 0) {
+      tracker.absent_since_ns = now_ns;
+      tracker.absent_since_wall_s = static_cast<int64_t>(time(nullptr));
+    }
+    if (now_ns < tracker.absent_since_ns ||
+        now_ns - tracker.absent_since_ns < kStartupMissingGraceNs) {
+      continue;
+    }
+    if (!tracker.active) {
+      tracker.active = true;
+      tracker.request_emitted = false;
+      ++tracker.episode_count;
+      tracker.required_at_wall_s = static_cast<int64_t>(time(nullptr));
+      ROS_ERROR("[LivoxRecover] configured lidar[%s] STARTUP_MISSING after "
+                "30s startup grace%s",
+                tracker.broadcast_code.c_str(),
+                g_auto_recover ? "; shared power cycle required"
+                               : "; detection only");
+      HealthLogger::Get().LogEvent(
+          255, tracker.broadcast_code.c_str(), "STARTUP_MISSING",
+          g_auto_recover ? "configured member absent for 30s"
+                         : "configured member absent for 30s; detection only");
+    }
+    PublishStartupRecoveryState(tracker, g_auto_recover);
+    if (g_auto_recover && !tracker.request_emitted) {
+      PublishStartupPowerCycleRequest(tracker);
+      tracker.request_emitted = true;
+    }
+    if (!startup_dashboard_row[i]) {
+      char startup_line[256];
+      snprintf(startup_line, sizeof(startup_line), kDashboardRowFormat, "S",
+               tracker.broadcast_code.c_str(), "STARTUP_MISSING", "ACTIVE",
+               "-", "--", "-", "-", "--", "-");
+      table << startup_line;
+      ++known_count;
+      ++trend_count[kDashboardTrendActive];
+      any_active_alert = true;
+      active_alerts << "  " << (g_auto_recover ? "[CRIT]" : "[ALERT]")
+                    << " L255 " << tracker.broadcast_code
+                    << " STARTUP_MISSING";
+      if (g_auto_recover) {
+        active_alerts << " reason=STARTUP_MISSING";
+      }
+      active_alerts
+          << " age=" << FmtDur(now_ns - tracker.absent_since_ns) << "\n"
+          << "    startup: configured whitelist member has no connection or "
+             "fresh broadcast; grace=30s; synthetic handle=255; auto-recover="
+          << (g_auto_recover ? "on; shared power-cycle request published"
+                             : "off; detection only")
+          << "\n";
     }
   }
 
@@ -1385,6 +1700,9 @@ int main(int argc, char **argv) {
   ros::init(argc, argv, "livox_lidar_publisher");
   ros::NodeHandle livox_node;
   g_driver_instance_id = ros::WallTime::now().toNSec();
+  g_driver_started_ns =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  g_driver_started_wall_s = static_cast<int64_t>(time(nullptr));
 
   ROS_INFO("Livox Ros Driver Version: %s", LIVOX_ROS_DRIVER_VERSION_STRING);
   /** Check sdk version */

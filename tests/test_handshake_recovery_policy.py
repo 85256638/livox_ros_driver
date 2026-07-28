@@ -145,7 +145,7 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         self.assertIn('display_state == "POWER_CYCLE_REQUIRED"', alerts)
         self.assertIn("[CRIT]", alerts)
         self.assertIn("[ALERT]", alerts)
-        self.assertIn('active_alerts << " reason="', alerts)
+        self.assertIn('<< " reason="', alerts)
         self.assertIn("PowerCycleReasonStr(ls.power_cycle_reason)", alerts)
         self.assertRegex(
             alerts,
@@ -292,7 +292,8 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
             stats.index("const DashboardTrend trend")
         ]
         self.assertIn(
-            "handshake_incident || wake_incident || config_exhausted", current
+            "handshake_incident || wake_incident || normal_dropout_incident",
+            current,
         )
         self.assertIn('display_state == "CONFIG" && !config_exhausted', current)
 
@@ -327,10 +328,8 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
             stats.index("if (current_incident)") :
             stats.index("const bool handshake_history")
         ]
-        self.assertIn(
-            'const bool critical =\n          display_state == "POWER_CYCLE_REQUIRED";',
-            alerts,
-        )
+        self.assertIn('display_state == "POWER_CYCLE_REQUIRED" ||', alerts)
+        self.assertIn('display_state == "STARTUP_MISSING"', alerts)
         self.assertNotIn("kDeviceHandshakeNetworkError", alerts)
         self.assertIn("last SDK event:", alerts)
 
@@ -578,6 +577,87 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         self.assertIn('<< "    wake-dropout episodes="', DRIVER)
         self.assertIn('<< "    handshake failure episodes: stuck="', DRIVER)
         self.assertIn("ls.handshake_power_cycle_episode_count", DRIVER)
+
+    def test_normal_dropout_has_sustained_health_and_silence_boundaries(self):
+        self.assertRegex(
+            HEADER,
+            re.compile(r"NormalHealthyArmNs\(\)\s*\{\s*return 30000000000LL;"),
+        )
+        self.assertRegex(
+            HEADER,
+            re.compile(r"NormalDropoutConfirmNs\(\)\s*\{\s*return 5000000000LL;"),
+        )
+        tick = CPP[
+            CPP.index("void LdsLidar::TickNormalDropoutRecovery") :
+            CPP.index("void LdsLidar::TickWakeDropoutRecovery")
+        ]
+        self.assertGreaterEqual(tick.count("NormalDropoutEscalationReady"), 2)
+        self.assertIn("expected_generation", tick)
+        self.assertIn("expected_dropout_since", tick)
+        self.assertIn("kPowerCycleReasonNormalDropout", tick)
+        self.assertIn("normal_power_cycle_episode_count", tick)
+
+    def test_normal_dropout_is_cancelled_by_connect_and_planned_actions(self):
+        connect = CPP[
+            CPP.index("void LdsLidar::OnLidarConnectEvent") :
+            CPP.index("void LdsLidar::OnLidarDisconnectEvent")
+        ]
+        self.assertIn("ClearNormalDropoutState(&s)", connect)
+        disconnect = CPP[
+            CPP.index("void LdsLidar::OnLidarDisconnectEvent") :
+            CPP.index("void LdsLidar::OnLidarBroadcastEvent")
+        ]
+        planned = disconnect[
+            disconnect.index("if (planned_reboot_disconnect)") :
+            disconnect.index("else if (s.wake_state")
+        ]
+        self.assertIn("ClearNormalDropoutState(&s)", planned)
+        send = CPP[
+            CPP.index("livox_status LdsLidar::SendModeChangeRequest") :
+            CPP.index("void LdsLidar::MaybeRetryPendingModeRequest")
+        ]
+        self.assertIn("ObserveNormalPublishing(handle, false, 0, nullptr)", send)
+
+    def test_normal_dropout_transient_broadcast_requires_stable_handoff(self):
+        broadcast = CPP[
+            CPP.index("void LdsLidar::OnLidarBroadcastEvent") :
+            CPP.index("void LdsLidar::ArmWakeObservation")
+        ]
+        self.assertIn("normal_broadcast_return_count", broadcast)
+        self.assertIn("kWakeBroadcastHandoffMinFrames", broadcast)
+        self.assertIn("kWakeBroadcastHandoffNs", broadcast)
+        self.assertIn("NORMAL_BROADCAST_STABLE", broadcast)
+        tick = CPP[
+            CPP.index("void LdsLidar::TickNormalDropoutRecovery") :
+            CPP.index("void LdsLidar::TickWakeDropoutRecovery")
+        ]
+        self.assertIn("broadcast return was transient", tick)
+        self.assertIn("s.last_broadcast_ns != 0 ? s.last_broadcast_ns : now", tick)
+
+    def test_normal_power_edge_revalidates_generation_and_silence(self):
+        stats = DRIVER[DRIVER.index("void StatsTimerCb(") : DRIVER.index("int main(")]
+        publish = stats[
+            stats.index("const int64_t expected_power_episode") :
+            stats.index("/** Build every user-visible status")
+        ]
+        self.assertIn("expected_normal_generation", publish)
+        self.assertIn("expected_normal_silence", publish)
+        self.assertIn("live.normal_dropout_generation", publish)
+        self.assertIn("live.normal_dropout_since_ns", publish)
+
+    def test_startup_missing_uses_whitelist_grace_and_synthetic_live_state(self):
+        stats = DRIVER[DRIVER.index("void StatsTimerCb(") : DRIVER.index("int main(")]
+        self.assertIn("GetWhitelistBroadcastCodes()", stats)
+        self.assertIn("kStartupMissingGraceNs = 30000000000LL", DRIVER)
+        self.assertIn("PublishStartupRecoveryState", stats)
+        self.assertIn("PublishStartupPowerCycleRequest", stats)
+        self.assertIn('"STARTUP_MISSING"', stats)
+        startup_publish = DRIVER[
+            DRIVER.index("static void PublishStartupRecoveryState") :
+            DRIVER.index("static const char *TempStr")
+        ]
+        self.assertIn("g_driver_instance_id, 255", startup_publish)
+        self.assertIn('"STARTUP_MISSING"', startup_publish)
 
 
 if __name__ == "__main__":

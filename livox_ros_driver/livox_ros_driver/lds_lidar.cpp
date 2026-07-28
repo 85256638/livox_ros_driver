@@ -33,6 +33,7 @@
 #include <thread>
 
 #include "health_logger.h"
+#include "normal_dropout_policy.h"
 #include "rapidjson/document.h"
 #include "rapidjson/filereadstream.h"
 #include "rapidjson/stringbuffer.h"
@@ -65,6 +66,9 @@ const int64_t kWakeBroadcastHandoffNs =
     LdsLidar::WakeBroadcastHandoffNs();
 const uint32_t kWakeBroadcastHandoffMinFrames =
     LdsLidar::WakeBroadcastHandoffMinFrames();
+const int64_t kNormalHealthyArmNs = LdsLidar::NormalHealthyArmNs();
+const int64_t kNormalDropoutConfirmNs =
+    LdsLidar::NormalDropoutConfirmNs();
 
 /** Clear only live wake attribution. Process-lifetime episode/action counters
  *  remain available to the dashboard after recovery. */
@@ -91,6 +95,51 @@ void ClearWakeRecoveryState(LdsLidar::LinkStat *s) {
   s->wake_dropout_counted_this_request = false;
   s->wake_power_cycle_counted_this_request = false;
   memset(s->wake_broadcast_code, 0, sizeof(s->wake_broadcast_code));
+}
+
+/** Clear only live normal-dropout evidence; retain process history. */
+void ClearNormalDropoutState(LdsLidar::LinkStat *s) {
+  if (s == nullptr) {
+    return;
+  }
+  if (s->power_cycle_reason == LdsLidar::kPowerCycleReasonNormalDropout) {
+    s->power_cycle_reason = LdsLidar::kPowerCycleReasonNone;
+  }
+  s->normal_dropout_state = LdsLidar::kNormalDropoutIdle;
+  s->normal_connection_generation = 0;
+  s->normal_dropout_generation = 0;
+  s->normal_healthy_since_ns = 0;
+  s->normal_healthy_since_wall_s = 0;
+  s->normal_attributed_disconnect_ns = 0;
+  s->normal_attributed_disconnect_wall_s = 0;
+  s->normal_dropout_since_ns = 0;
+  s->normal_dropout_wall_s = 0;
+  s->normal_broadcast_return_since_ns = 0;
+  s->normal_broadcast_return_count = 0;
+  s->normal_dropout_counted_this_episode = false;
+  s->normal_power_cycle_counted_this_episode = false;
+  memset(s->normal_broadcast_code, 0, sizeof(s->normal_broadcast_code));
+}
+
+NormalDropoutPolicyInput BuildNormalDropoutPolicyInput(
+    const LdsLidar::LinkStat &s, int64_t now_ns) {
+  NormalDropoutPolicyInput input;
+  input.armed = s.normal_dropout_state != LdsLidar::kNormalDropoutIdle;
+  input.identity_matches =
+      s.broadcast_code[0] != '\0' && s.normal_broadcast_code[0] != '\0' &&
+      strncmp(s.broadcast_code, s.normal_broadcast_code,
+              sizeof(s.broadcast_code)) == 0;
+  input.generation_matches = s.normal_connection_generation != 0 &&
+                             s.normal_connection_generation ==
+                                 s.normal_dropout_generation;
+  input.connected = s.connect_since_ns != 0;
+  input.broadcast_fresh =
+      s.last_broadcast_ns != 0 &&
+      now_ns - s.last_broadcast_ns <= kBroadcastEpisodeGapNs;
+  input.healthy_since_ns = s.normal_healthy_since_ns;
+  input.attributed_disconnect_ns = s.normal_attributed_disconnect_ns;
+  input.silence_since_ns = s.normal_dropout_since_ns;
+  return input;
 }
 
 WakeDropoutPolicyInput BuildWakePolicyInput(
@@ -208,6 +257,8 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
   int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
   HandshakeLinkState previous_handshake_state = s.handshake_state;
   WakeRecoveryState previous_wake_state = s.wake_state;
+  NormalDropoutRecoveryState previous_normal_dropout_state =
+      s.normal_dropout_state;
   uint8_t reset_attempts = s.handshake_reset_attempts;
   int64_t handshake_since_ns = s.broadcast_only_since_ns;
   s.connect_since_ns = now;
@@ -227,6 +278,7 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
    *  after relay ON so the pre-cycle Normal request cannot create a second
    *  dropout episode on the new connection. */
   ClearWakeRecoveryState(&s);
+  ClearNormalDropoutState(&s);
   s.planned_reboot_generation = 0;
   if (s.last_disconnect_ns != 0) {
     long long down_s = (now - s.last_disconnect_ns) / 1000000000LL;
@@ -256,6 +308,11 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
     HealthLogger::Get().LogEvent(handle, broadcast_code,
                                  "WAKE_LINK_RECOVERED", "Connect returned");
   }
+  if (previous_normal_dropout_state >= kNormalDropoutNoBroadcast) {
+    PrintLidarEvent(handle, broadcast_code, "NORMAL_LINK_RECOVERED");
+    HealthLogger::Get().LogEvent(handle, broadcast_code,
+                                 "NORMAL_LINK_RECOVERED", "Connect returned");
+  }
 }
 
 void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
@@ -276,6 +333,7 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
   s.disconnect_count++;
   s.last_disconnect_ns = now;
   bool wake_no_broadcast = false;
+  bool normal_no_broadcast = false;
   const uint64_t current_generation =
       connection_generation_[handle].load(std::memory_order_acquire);
   const bool callback_identity_matches =
@@ -290,6 +348,7 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
     /** This disconnect belongs to an explicit software reboot, not to the
      *  earlier wake command. It must never grant shared-relay permission. */
     ClearWakeRecoveryState(&s);
+    ClearNormalDropoutState(&s);
     s.planned_reboot_generation = 0;
   } else if (s.wake_state == kWakeRecoveryObserving) {
     const bool same_identity =
@@ -308,10 +367,38 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
       s.wake_broadcast_return_since_ns = 0;
       s.wake_broadcast_return_count = 0;
       s.wake_state = kWakeRecoveryNoBroadcast;
+      ClearNormalDropoutState(&s);
       wake_no_broadcast = true;
     } else {
       ClearWakeRecoveryState(&s);
     }
+  } else if (s.normal_dropout_state == kNormalDropoutArmed) {
+    NormalDropoutPolicyInput normal_input;
+    normal_input.armed = true;
+    normal_input.identity_matches =
+        callback_identity_matches && s.normal_broadcast_code[0] != '\0' &&
+        strncmp(s.normal_broadcast_code, s.broadcast_code,
+                sizeof(s.broadcast_code)) == 0;
+    normal_input.generation_matches =
+        s.normal_connection_generation != 0 &&
+        s.normal_connection_generation == current_generation;
+    normal_input.healthy_since_ns = s.normal_healthy_since_ns;
+    if (NormalDropoutArmMature(normal_input, now, kNormalHealthyArmNs)) {
+      s.normal_dropout_generation = current_generation;
+      s.normal_attributed_disconnect_ns = now;
+      s.normal_attributed_disconnect_wall_s =
+          static_cast<int64_t>(time(nullptr));
+      s.normal_dropout_since_ns = now;
+      s.normal_dropout_wall_s = s.normal_attributed_disconnect_wall_s;
+      s.normal_broadcast_return_since_ns = 0;
+      s.normal_broadcast_return_count = 0;
+      s.normal_dropout_state = kNormalDropoutNoBroadcast;
+      normal_no_broadcast = true;
+    } else {
+      ClearNormalDropoutState(&s);
+    }
+  } else {
+    ClearNormalDropoutState(&s);
   }
   s.connect_since_ns = 0;
   s.health_code = 0;  /** stale once disconnected */
@@ -337,6 +424,12 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
         handle, broadcast_code, "WAKE_NO_BROADCAST",
         "explicit low-power wake lost control link; confirming 10s silence");
   }
+  if (normal_no_broadcast) {
+    PrintLidarEvent(handle, broadcast_code, "NORMAL_NO_BROADCAST");
+    HealthLogger::Get().LogEvent(
+        handle, broadcast_code, "NORMAL_NO_BROADCAST",
+        "previously healthy Normal stream disconnected; confirming 5s silence");
+  }
 }
 
 void LdsLidar::OnLidarBroadcastEvent(uint8_t handle,
@@ -349,6 +442,8 @@ void LdsLidar::OnLidarBroadcastEvent(uint8_t handle,
   bool new_episode = false;
   bool wake_broadcast_returned = false;
   bool wake_handoff_completed = false;
+  bool normal_broadcast_returned = false;
+  bool normal_handoff_completed = false;
   {
     lock_guard<mutex> lock(link_stat_lock_[handle]);
     LinkStat &s = link_stat_[handle];
@@ -397,6 +492,33 @@ void LdsLidar::OnLidarBroadcastEvent(uint8_t handle,
               kWakeBroadcastHandoffNs) {
         ClearWakeRecoveryState(&s);
         wake_handoff_completed = true;
+      }
+    } else if (s.connect_since_ns == 0 &&
+               s.normal_attributed_disconnect_ns != 0 &&
+               s.normal_dropout_state != kNormalDropoutIdle) {
+      if (s.normal_broadcast_return_since_ns == 0 ||
+          previous_broadcast_ns == 0 || broadcast_gap) {
+        s.normal_broadcast_return_since_ns = now;
+        s.normal_broadcast_return_count = 1;
+        normal_broadcast_returned = true;
+      } else {
+        ++s.normal_broadcast_return_count;
+      }
+      if (s.power_cycle_reason == kPowerCycleReasonNormalDropout) {
+        s.power_cycle_reason = kPowerCycleReasonNone;
+      }
+      s.normal_dropout_state = kNormalDropoutObservingReturn;
+      s.normal_dropout_since_ns = 0;
+      /** Keep the last returned frame as the start of any subsequent silence.
+       *  If frames stop again, the five-second confirmation is measured from
+       *  this frame, not from the later 3-second freshness timeout. */
+      s.normal_dropout_wall_s = static_cast<int64_t>(time(nullptr));
+      if (s.normal_broadcast_return_count >=
+              kWakeBroadcastHandoffMinFrames &&
+          now - s.normal_broadcast_return_since_ns >=
+              kWakeBroadcastHandoffNs) {
+        ClearNormalDropoutState(&s);
+        normal_handoff_completed = true;
       }
     }
     if (s.connect_since_ns == 0 && s.broadcast_only_since_ns == 0) {
@@ -447,6 +569,18 @@ void LdsLidar::OnLidarBroadcastEvent(uint8_t handle,
         handle, broadcast_code, "WAKE_BROADCAST_STABLE",
         "stable broadcasts returned; handshake recovery owns episode");
   }
+  if (normal_broadcast_returned) {
+    PrintLidarEvent(handle, broadcast_code, "NORMAL_BROADCAST_RETURNED");
+    HealthLogger::Get().LogEvent(
+        handle, broadcast_code, "NORMAL_BROADCAST_RETURNED",
+        "normal-dropout hard-power path paused; awaiting stable broadcasts");
+  }
+  if (normal_handoff_completed) {
+    PrintLidarEvent(handle, broadcast_code, "NORMAL_BROADCAST_STABLE");
+    HealthLogger::Get().LogEvent(
+        handle, broadcast_code, "NORMAL_BROADCAST_STABLE",
+        "stable broadcasts returned; handshake recovery owns episode");
+  }
 }
 
 void LdsLidar::ArmWakeObservation(uint8_t handle, const char *broadcast_code,
@@ -472,6 +606,7 @@ void LdsLidar::ArmWakeObservation(uint8_t handle, const char *broadcast_code,
       return;  /** a retry must never extend the attribution window */
     }
     ClearWakeRecoveryState(&s);
+    ClearNormalDropoutState(&s);
     s.wake_state = kWakeRecoveryObserving;
     s.wake_request_id = request_id;
     s.wake_connection_generation = connection_generation;
@@ -503,6 +638,190 @@ void LdsLidar::CancelWakeObservation(uint8_t handle,
     return;
   }
   ClearWakeRecoveryState(&s);
+}
+
+void LdsLidar::ObserveNormalPublishing(uint8_t handle, bool healthy,
+                                       uint64_t expected_generation,
+                                       const char *expected_broadcast_code) {
+  if (handle >= kMaxLidarCount) {
+    return;
+  }
+  const int64_t now =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  lock_guard<mutex> lock(link_stat_lock_[handle]);
+  LinkStat &s = link_stat_[handle];
+  if (!healthy) {
+    /** Do not erase an already-attributed outage merely because the 1 Hz
+     *  publisher now sees the disconnected row. Only the pre-fault arm is
+     *  withdrawn when the live stream ceases to be continuously healthy. */
+    if (s.normal_dropout_state == kNormalDropoutArmed) {
+      ClearNormalDropoutState(&s);
+    }
+    return;
+  }
+  const uint64_t live_generation =
+      connection_generation_[handle].load(std::memory_order_acquire);
+  /** The data-plane snapshot and LinkStat are copied under different locks.
+   *  Reject an old healthy sample if a disconnect/reconnect callback won in
+   *  between.  Never erase an already-attributed outage from such a sample. */
+  if (s.connect_since_ns == 0 || s.broadcast_code[0] == '\0' ||
+      expected_broadcast_code == nullptr ||
+      expected_broadcast_code[0] == '\0' || expected_generation == 0 ||
+      live_generation != expected_generation ||
+      strncmp(s.broadcast_code, expected_broadcast_code,
+              sizeof(s.broadcast_code)) != 0) {
+    if (s.normal_dropout_state == kNormalDropoutArmed) {
+      ClearNormalDropoutState(&s);
+    }
+    return;
+  }
+  const bool same_arm =
+      s.normal_dropout_state == kNormalDropoutArmed &&
+      s.normal_connection_generation == live_generation &&
+      s.normal_broadcast_code[0] != '\0' &&
+      strncmp(s.normal_broadcast_code, s.broadcast_code,
+              sizeof(s.broadcast_code)) == 0;
+  if (same_arm) {
+    return;
+  }
+  ClearNormalDropoutState(&s);
+  s.normal_dropout_state = kNormalDropoutArmed;
+  s.normal_connection_generation = live_generation;
+  s.normal_healthy_since_ns = now;
+  s.normal_healthy_since_wall_s = static_cast<int64_t>(time(nullptr));
+  strncpy(s.normal_broadcast_code, s.broadcast_code,
+          sizeof(s.normal_broadcast_code) - 1);
+  s.normal_broadcast_code[sizeof(s.normal_broadcast_code) - 1] = '\0';
+}
+
+std::vector<std::string> LdsLidar::GetWhitelistBroadcastCodes() const {
+  std::vector<std::string> result;
+  result.reserve(whitelist_count_);
+  for (uint32_t i = 0; i < whitelist_count_; ++i) {
+    if (broadcast_code_whitelist_[i][0] != '\0') {
+      result.emplace_back(broadcast_code_whitelist_[i]);
+    }
+  }
+  return result;
+}
+
+void LdsLidar::TickNormalDropoutRecovery(bool enable_recovery) {
+  const int64_t now =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  for (uint8_t handle = 0; handle < kMaxLidarCount; ++handle) {
+    bool became_no_broadcast = false;
+    bool became_dropout = false;
+    bool power_candidate = false;
+    uint64_t expected_generation = 0;
+    int64_t expected_dropout_since = 0;
+    char broadcast_code[kBroadcastCodeSize] = {0};
+    {
+      lock_guard<mutex> lock(link_stat_lock_[handle]);
+      LinkStat &s = link_stat_[handle];
+      if (s.normal_dropout_state == kNormalDropoutIdle ||
+          s.normal_dropout_state == kNormalDropoutArmed ||
+          s.normal_dropout_state == kNormalDropoutPowerCycleRequired) {
+        continue;
+      }
+      NormalDropoutPolicyInput input =
+          BuildNormalDropoutPolicyInput(s, now);
+      if (s.normal_dropout_state == kNormalDropoutObservingReturn) {
+        if (!NormalDropoutAttributionValid(input)) {
+          ClearNormalDropoutState(&s);
+        } else if (!input.broadcast_fresh) {
+          s.normal_dropout_state = kNormalDropoutNoBroadcast;
+          s.normal_dropout_since_ns =
+              s.last_broadcast_ns != 0 ? s.last_broadcast_ns : now;
+          if (s.normal_dropout_wall_s == 0) {
+            s.normal_dropout_wall_s = static_cast<int64_t>(time(nullptr));
+          }
+          s.normal_broadcast_return_since_ns = 0;
+          s.normal_broadcast_return_count = 0;
+          became_no_broadcast = true;
+          strncpy(broadcast_code, s.broadcast_code,
+                  sizeof(broadcast_code) - 1);
+        }
+      } else {
+        if (!NormalDropoutEscalationReady(input, now,
+                                          kNormalDropoutConfirmNs)) {
+          continue;
+        }
+        if (s.normal_dropout_state == kNormalDropoutNoBroadcast) {
+          s.normal_dropout_state = kNormalDropoutConfirmed;
+          if (!s.normal_dropout_counted_this_episode) {
+            s.normal_dropout_count++;
+            s.normal_dropout_counted_this_episode = true;
+          }
+          became_dropout = true;
+        }
+        strncpy(broadcast_code, s.broadcast_code,
+                sizeof(broadcast_code) - 1);
+        expected_generation = s.normal_dropout_generation;
+        expected_dropout_since = s.normal_dropout_since_ns;
+        power_candidate =
+            enable_recovery &&
+            s.normal_dropout_state == kNormalDropoutConfirmed;
+      }
+    }
+
+    if (became_no_broadcast) {
+      PrintLidarEvent(handle, broadcast_code, "NORMAL_NO_BROADCAST");
+      HealthLogger::Get().LogEvent(
+          handle, broadcast_code, "NORMAL_NO_BROADCAST",
+          "broadcast return was transient; confirming 5s silence");
+    }
+    if (became_dropout) {
+      PrintLidarEvent(handle, broadcast_code, "NORMAL_DROPOUT");
+      HealthLogger::Get().LogEvent(
+          handle, broadcast_code, "NORMAL_DROPOUT",
+          enable_recovery
+              ? "previously healthy Normal stream absent for 5s"
+              : "previously healthy Normal stream absent for 5s; detection only");
+    }
+    if (!power_candidate) {
+      continue;
+    }
+
+    bool committed = false;
+    const int64_t commit_now =
+        std::chrono::steady_clock::now().time_since_epoch().count();
+    {
+      lock_guard<mutex> lock(link_stat_lock_[handle]);
+      LinkStat &s = link_stat_[handle];
+      const NormalDropoutPolicyInput input =
+          BuildNormalDropoutPolicyInput(s, commit_now);
+      if (s.normal_dropout_state == kNormalDropoutConfirmed &&
+          s.normal_dropout_generation == expected_generation &&
+          s.normal_dropout_since_ns == expected_dropout_since &&
+          NormalDropoutEscalationReady(input, commit_now,
+                                       kNormalDropoutConfirmNs)) {
+        ClearWakeRecoveryState(&s);
+        s.normal_dropout_state = kNormalDropoutPowerCycleRequired;
+        s.power_cycle_reason = kPowerCycleReasonNormalDropout;
+        s.power_cycle_required_count++;
+        if (!s.normal_power_cycle_counted_this_episode) {
+          s.power_cycle_required_episode_count++;
+          s.normal_power_cycle_episode_count++;
+          s.normal_power_cycle_counted_this_episode = true;
+        }
+        s.power_cycle_required_wall_s = static_cast<int64_t>(time(nullptr));
+        committed = true;
+        strncpy(broadcast_code, s.broadcast_code,
+                sizeof(broadcast_code) - 1);
+        broadcast_code[sizeof(broadcast_code) - 1] = '\0';
+      }
+    }
+    if (!committed) {
+      continue;
+    }
+    PrintLidarEvent(handle, broadcast_code, "POWER_CYCLE_REQUIRED");
+    HealthLogger::Get().LogEvent(
+        handle, broadcast_code, "POWER_CYCLE_REQUIRED",
+        "reason=NORMAL_DROPOUT; previously healthy stream absent for 5s");
+    printf("[LivoxRecover] Lidar[%d][%s] NORMAL_DROPOUT confirmed; "
+           "physical group power cycle required\n",
+           handle, broadcast_code);
+  }
 }
 
 void LdsLidar::TickWakeDropoutRecovery(bool enable_recovery) {
@@ -722,6 +1041,7 @@ void LdsLidar::TickHandshakeRecovery(bool enable_recovery) {
          *  token so the live relay-manager frame cannot carry evidence from
          *  two different recovery reasons. */
         ClearWakeRecoveryState(&s);
+        ClearNormalDropoutState(&s);
         s.handshake_state = kHandshakeLinkPowerCycleRequired;
         s.power_cycle_reason = kPowerCycleReasonHandshakeStuck;
         s.power_cycle_required_count++;
@@ -952,6 +1272,7 @@ livox_status LdsLidar::RequestLidarRebootImpl(
       s.planned_reboot_generation = 0;
       if (status == kStatusSuccess) {
         ClearWakeRecoveryState(&s);
+        ClearNormalDropoutState(&s);
       }
     }
   }
@@ -1742,6 +2063,7 @@ livox_status LdsLidar::SendModeChangeRequest(
 
   if (cancel_wake_observation) {
     CancelWakeObservation(handle);
+    ObserveNormalPublishing(handle, false, 0, nullptr);
   }
 
   if (!connected) {
