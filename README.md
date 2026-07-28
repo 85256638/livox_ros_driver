@@ -31,9 +31,9 @@
 
 仓库根目录提供 `update_livox_geph.sh`。脚本把“最新版本”定义为 GitHub 定制分支的最新 commit SHA，而不是一直不变的 SDK `2.3.0` 字符串。所有远程 Git 操作都显式使用 `socks5h://127.0.0.1:9909`，不会修改全局 Git 配置；开始前必须先启动 Geph。
 
-#### 旧工位首次迁移
+#### 旧工位首次迁移（当前 SDK 和 Driver 都是旧版本）
 
-脚本默认同时跟踪 SDK 与 Driver 的 `network-relay-added` 分支。迁移前先分别检查已有的 SDK 和 Driver 工作树，不要跳过；如果 `$HOME/Livox-SDK/.git` 不存在，则跳过第一条 SDK 检查，更新脚本会通过 Geph 自动 clone：
+这正是“机器仍运行旧 SDK、旧 Driver，但必须保留现有工位广播码和 launch 参数”的入口。不要提前删除 SDK/Driver，也不要先 checkout 新分支。脚本默认同时跟踪 SDK 与 Driver 的 `network-relay-added` 分支；迁移前先分别检查已有的 SDK 和 Driver 工作树，不要跳过。如果 `$HOME/Livox-SDK/.git` 不存在，则跳过第一条 SDK 检查，更新脚本会通过 Geph 自动 clone：
 
 ```bash
 git -C "$HOME/Livox-SDK" status --short
@@ -66,6 +66,25 @@ git -C "$HOME/catkin_ws/src/livox_ros_driver" restore --staged -- livox_ros_driv
 
 ```bash
 if [ -d "$HOME/Livox-SDK/.git" ]; then git -C "$HOME/Livox-SDK" remote set-url origin https://github.com/85256638/Livox-SDK.git || exit 1; fi && git -C "$HOME/catkin_ws/src/livox_ros_driver" remote set-url origin https://github.com/85256638/livox_ros_driver.git && git -c http.proxy=socks5h://127.0.0.1:9909 -c https.proxy=socks5h://127.0.0.1:9909 -C "$HOME/catkin_ws/src/livox_ros_driver" fetch origin "refs/heads/network-relay-added:refs/remotes/origin/network-relay-added" && git -C "$HOME/catkin_ws/src/livox_ros_driver" show "origin/network-relay-added:update_livox_geph.sh" > /tmp/update_livox_geph.sh && LIVOX_JOBS=2 bash /tmp/update_livox_geph.sh --preserve-site-config && bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" && LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --restart-service
+```
+
+##### 迁移后必须人工核对的现场配置
+
+代码更新不能推断本工位雷达身份、ROS 话题命名和继电器物理接线。旧工位原本正确的前两份文件会由 `--preserve-site-config` 自动恢复或安全合并，**不要用仓库示例覆盖它们**；迁移成功后仍必须逐项核对：
+
+| 文件 | 必须人工核对/修改的内容 | 更新脚本的处理 |
+|---|---|---|
+| `~/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_lidar_config_multi.json` | `lidar_config` 只保留本工位实际使用的 4 个完整 `broadcast_code`，均设置正确的 `enable_connect`；同时核对 `return_mode`、坐标系、IMU 频率和外参来源 | 检测到本地修改时字节级原样恢复，不会替换广播码 |
+| `~/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_lidar_multi.launch` | 核对4台雷达的 lidar/IMU/status `remap`（广播码必须与 JSON 一致）、`config_file` 和 `max_distance`；生产恢复策略应使 `auto_recover=true`、`health_log=true`，无桌面/systemd 环境应使 `monitor=false`（也可由 `ExecStart` 参数覆盖）。不要手工复制或重复添加继电器 marker/include | 保留现场参数，并安全合入新版唯一继电器入口；无法明确合并时停止而不重启 |
+| `~/.config/livox/power_cycle.json` | 若启用自动硬恢复，填写与 Driver 白名单完全相同的4个 `members`、真实继电器 `host`/`port`/`channel`/`address`，并核对 `off_seconds`；模板地址和广播码不能使用 | 安装脚本仅在缺失时生成；以后更新永不覆盖。不要修改 `state_db` 和 ROS topics，除非同步审阅全部 service 参数 |
+| `/etc/systemd/system/livox-ros-driver.service` | 仅当现有 unit 的用户名、`HOME`、catkin workspace 或 launch 命令本来就不正确时才人工修改；正在正常启动该工位旧 Driver 的 unit 通常无需改 | 安装脚本只安装安全 drop-in 并验证主 unit，不会猜测或重写现场 `ExecStart` |
+
+如果暂不启用继电器自动硬恢复，只需核对前两份 Driver 配置，并让第三份配置和 launch 继电器开关保持 `false`；systemd 主 unit 正常时也不用修改。继电器验收前保持 `power_cycle.json` 中该组 `enabled: false`，并保持 launch 中 `<arg name="relay_power_cycle_enable" default="false"/>`。完成广播码、继电器地址/通道及“该通道只给本组4台雷达供电”的人工验收后，再把这两个开关同时改为 `true`。SDK 源码、CMake 文件、`livox_power_cycle.example.json` 和 SQLite 状态库都不是现场配置，不要手改或用示例文件覆盖生产文件。
+
+修改完成后先运行这一条一致性校验；只有输出 `Site identity valid` 才允许重启服务：
+
+```bash
+python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/validate_livox_power_cycle_site.py" --relay-config "$HOME/.config/livox/power_cycle.json" --driver-config "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_lidar_config_multi.json" --launch "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_lidar_multi.launch"
 ```
 
 迁移命令全部成功后，用下面这一条核对 SDK commit、Driver commit 和服务状态；最后一项应输出 `active`：
