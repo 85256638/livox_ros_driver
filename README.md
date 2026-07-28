@@ -31,13 +31,50 @@
 
 仓库根目录提供 `update_livox_geph.sh`。脚本把“最新版本”定义为 GitHub 定制分支的最新 commit SHA，而不是一直不变的 SDK `2.3.0` 字符串。所有远程 Git 操作都显式使用 `socks5h://127.0.0.1:9909`，不会修改全局 Git 配置；开始前必须先启动 Geph。
 
-#### 常用命令
+#### 旧工位首次迁移
 
-脚本默认同时跟踪 SDK 与 Driver 的 `network-relay-added` 分支。尚未取得集成版脚本、当前仍在旧分支或旧独立 manager unit 的工位，运行下面这一条迁移命令；它先通过代理 fetch 新脚本并完成保配置更新/编译，再安装或迁移 Driver 安全钩子，最后复查并重启，不会先 checkout 覆盖现场文件：
+脚本默认同时跟踪 SDK 与 Driver 的 `network-relay-added` 分支。迁移前先分别检查已有的 SDK 和 Driver 工作树，不要跳过；如果 `$HOME/Livox-SDK/.git` 不存在，则跳过第一条 SDK 检查，更新脚本会通过 Geph 自动 clone：
+
+```bash
+git -C "$HOME/Livox-SDK" status --short
+```
+
+```bash
+git -C "$HOME/catkin_ws/src/livox_ros_driver" status --short
+```
+
+如果 SDK 显示已经确认来源、可以暂时移出的 tracked 本地修改，先用下面这一条命令同时保存二进制 patch 和 Git stash，再确认最后的状态输出为空。该命令不处理 untracked 文件、本地 commit 或分支分叉。迁移完成后不要直接执行 `git stash pop`，因为旧 SDK 修改可能重新引入已修复问题或破坏 Driver/SDK 的配套契约；需要恢复时应对照备份 patch 逐项审阅：
+
+```bash
+mkdir -p "$HOME/livox-migration-backup" && ts=$(date +%Y%m%d-%H%M%S) && git -C "$HOME/Livox-SDK" diff --binary HEAD > "$HOME/livox-migration-backup/Livox-SDK-$ts.patch" && git -C "$HOME/Livox-SDK" stash push -m "pre-network-relay-added-$ts" && git -C "$HOME/Livox-SDK" status --short
+```
+
+Driver 只允许以下两个现场文件保留**未暂存**修改，不要手工 stash；迁移命令中的 `--preserve-site-config` 会负责持久备份、更新和恢复：
+
+- `livox_ros_driver/config/livox_lidar_config_multi.json`
+- `livox_ros_driver/launch/livox_lidar_multi.launch`
+
+如果这两个文件已经 staged，只取消暂存，不撤销文件内容：
+
+```bash
+git -C "$HOME/catkin_ws/src/livox_ros_driver" restore --staged -- livox_ros_driver/config/livox_lidar_config_multi.json livox_ros_driver/launch/livox_lidar_multi.launch
+```
+
+如果 SDK 或 Driver 还有其他 tracked 修改、本地未推送 commit、分支分叉，或者来源不明的 untracked 源码/CMake 文件，必须停止迁移并先审阅；不要用 `git reset --hard`、不要删除仓库，也不要为了绕过检查而 stash Driver 现场配置。
+
+尚未取得集成版脚本、当前仍在旧分支或旧独立 manager unit 的工位，运行下面这一条迁移命令；它先通过代理 fetch 新脚本并完成保配置更新/编译，再安装或迁移 Driver 安全钩子，最后复查并重启，不会先 checkout 覆盖现场文件：
 
 ```bash
 if [ -d "$HOME/Livox-SDK/.git" ]; then git -C "$HOME/Livox-SDK" remote set-url origin https://github.com/85256638/Livox-SDK.git || exit 1; fi && git -C "$HOME/catkin_ws/src/livox_ros_driver" remote set-url origin https://github.com/85256638/livox_ros_driver.git && git -c http.proxy=socks5h://127.0.0.1:9909 -c https.proxy=socks5h://127.0.0.1:9909 -C "$HOME/catkin_ws/src/livox_ros_driver" fetch origin "refs/heads/network-relay-added:refs/remotes/origin/network-relay-added" && git -C "$HOME/catkin_ws/src/livox_ros_driver" show "origin/network-relay-added:update_livox_geph.sh" > /tmp/update_livox_geph.sh && LIVOX_JOBS=2 bash /tmp/update_livox_geph.sh --preserve-site-config && bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" && LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --restart-service
 ```
+
+迁移命令全部成功后，用下面这一条核对 SDK commit、Driver commit 和服务状态；最后一项应输出 `active`：
+
+```bash
+git -C "$HOME/Livox-SDK" rev-parse --short HEAD && git -C "$HOME/catkin_ws/src/livox_ros_driver" rev-parse --short HEAD && systemctl is-active livox-ros-driver
+```
+
+#### 新工位与日常更新
 
 全新工位尚无 Driver 仓库时，使用这一条完成代理 clone 和首次配套构建；首次部署服务前不自动重启：
 
