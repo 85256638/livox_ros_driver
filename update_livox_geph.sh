@@ -38,6 +38,7 @@ SITE_CONFIG_CHANGED_PATHS=()
 SITE_JSON_PATH="livox_ros_driver/config/livox_lidar_config_multi.json"
 SITE_LAUNCH_PATH="livox_ros_driver/launch/livox_lidar_multi.launch"
 RELAY_CHILD_PATH="livox_ros_driver/launch/livox_power_cycle.launch"
+SITE_LAUNCH_MERGER_PATH="livox_ros_driver/livox_ros_driver/scripts/merge_livox_relay_launch.py"
 SITE_LAUNCH_MARKER="LIVOX_RELAY_LAUNCH_INTEGRATION"
 DRIVER_SAFETY_DROPIN="/etc/systemd/system/livox-ros-driver.service.d/20-livox-power-cycle-safety.conf"
 MANAGER_RUNTIME_DIR="${HOME}/.local/libexec/livox-power-cycle-manager"
@@ -438,6 +439,19 @@ launch_has_relay_marker() {
   [[ "${contents}" == *"${SITE_LAUNCH_MARKER}"* ]]
 }
 
+structural_merge_relay_launch() {
+  local local_launch="$1"
+  local candidate="$2"
+  local merger="${DRIVER_DIR}/${SITE_LAUNCH_MERGER_PATH}"
+
+  [[ -f "${merger}" && ! -L "${merger}" ]] || {
+    log "ERROR: 缺少普通结构化 launch 合并器：${merger}"
+    return 1
+  }
+  "${PYTHON_EXECUTABLE}" "${merger}" \
+    --local "${local_launch}" --output "${candidate}"
+}
+
 validate_relay_launch_integration() {
   local path="$1"
 
@@ -681,13 +695,31 @@ restore_site_config() {
               desired_source="${candidate_source}"
               launch_merge_applied=1
             else
-              log "ERROR: launch 三方合并候选未通过 XML/继电器集成校验：${candidate_source}"
-              launch_merge_failure=1
+              log "launch 三方合并候选未通过 XML/继电器集成校验；正在尝试严格结构化后备合并（文本候选：${candidate_source}）"
+              if structural_merge_relay_launch \
+                  "${SITE_CONFIG_BACKUP_DIR}/original/${path}" \
+                  "${candidate_source}" &&
+                  validate_relay_launch_integration "${candidate_source}"; then
+                desired_source="${candidate_source}"
+                launch_merge_applied=1
+                log "文本三方合并结果无效；已改用严格结构化合并，仅向现场 launch 注入固定继电器参数/include。"
+              else
+                launch_merge_failure=1
+              fi
             fi
           else
             merge_status=$?
-            log "ERROR: launch 三方合并存在冲突或执行失败（rc=${merge_status}）；候选已保留：${candidate_source}"
-            launch_merge_failure=1
+            log "launch 三方合并存在冲突或执行失败（rc=${merge_status}）；正在尝试严格结构化后备合并（文本候选：${candidate_source}）"
+            if structural_merge_relay_launch \
+                "${SITE_CONFIG_BACKUP_DIR}/original/${path}" \
+                "${candidate_source}" &&
+                validate_relay_launch_integration "${candidate_source}"; then
+              desired_source="${candidate_source}"
+              launch_merge_applied=1
+              log "已使用严格结构化后备合并：现场 launch 保持主体，仅注入固定继电器参数/include。"
+            else
+              launch_merge_failure=1
+            fi
           fi
         fi
       else

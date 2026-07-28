@@ -97,9 +97,11 @@ def _launch(monitor="true", relay=False, marker=True, valid_xml=True):
                 '  <include file="$(find livox_ros_driver)/launch/livox_power_cycle.launch">',
                 '    <arg name="enable" value="$(arg relay_power_cycle_enable)"/>',
                 '  </include>',
-                '  <node name="livox_driver" pkg="livox_ros_driver" type="livox_ros_driver_node"/>',
             ]
         )
+    lines.append(
+        '  <node name="livox_driver" pkg="livox_ros_driver" type="livox_ros_driver_node"/>'
+    )
     if valid_xml:
         lines.append("</launch>")
     return ("\n".join(lines) + "\n").encode("utf-8")
@@ -119,6 +121,7 @@ class UpdaterSiteTransactionTests(unittest.TestCase):
                 "clear_site_config_pending",
                 "atomic_copy_file",
                 "launch_has_relay_marker",
+                "structural_merge_relay_launch",
                 "validate_relay_launch_integration",
                 "restore_site_config",
             )
@@ -149,6 +152,14 @@ class UpdaterSiteTransactionTests(unittest.TestCase):
         base_launch = _launch()
         json_path.write_bytes(base_json)
         launch_path.write_bytes(base_launch)
+        merger = repo / "livox_ros_driver/livox_ros_driver/scripts/merge_livox_relay_launch.py"
+        merger.parent.mkdir(parents=True, exist_ok=True)
+        merger.write_bytes(
+            (
+                ROOT
+                / "livox_ros_driver/livox_ros_driver/scripts/merge_livox_relay_launch.py"
+            ).read_bytes()
+        )
         self._git(repo.parent, "init", str(repo))
         self._git(repo, "config", "user.name", "Updater Test")
         self._git(repo, "config", "user.email", "updater@example.invalid")
@@ -176,6 +187,10 @@ class UpdaterSiteTransactionTests(unittest.TestCase):
     def _fake_python_function():
         return r'''
 python_validator() {
+  if [[ "${1:-}" == *merge_livox_relay_launch.py ]]; then
+    "${REAL_PYTHON}" "$@"
+    return
+  fi
   cat >/dev/null
   local path="$2"
   local marker="${3:-}"
@@ -199,6 +214,7 @@ python_validator() {
             "#!/usr/bin/env bash\n"
             "set -Eeuo pipefail\n"
             "export PATH=/usr/bin:/mingw64/bin:$PATH\n"
+            + "REAL_PYTHON=%s\n" % q(sys.executable)
             + self._fake_python_function()
             + "PYTHON_EXECUTABLE=python_validator\n"
             + "DRIVER_DIR=%s\n" % q(repo)
@@ -208,6 +224,10 @@ python_validator() {
             + "SITE_CONFIG_STASH_SHA=\"\"\n"
             + "SITE_JSON_PATH=%s\n" % shlex.quote(SITE_JSON)
             + "SITE_LAUNCH_PATH=%s\n" % shlex.quote(SITE_LAUNCH)
+            + "SITE_LAUNCH_MERGER_PATH=%s\n"
+            % shlex.quote(
+                "livox_ros_driver/livox_ros_driver/scripts/merge_livox_relay_launch.py"
+            )
             + "SITE_LAUNCH_MARKER=%s\n" % shlex.quote(MARKER)
             + "SITE_CONFIG_CHANGED_PATHS=(\"$SITE_JSON_PATH\" \"$SITE_LAUNCH_PATH\")\n"
             + self.restore_functions
@@ -245,7 +265,7 @@ python_validator() {
             self.assertEqual(merged.count("livox_power_cycle.launch"), 1)
             self.assertFalse(pending.exists())
 
-    def test_merge_conflict_restores_original_and_does_not_continue(self):
+    def test_merge_conflict_uses_strict_structural_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, backup, pending, local_json, local_launch = (
@@ -256,14 +276,37 @@ python_validator() {
                 )
             )
             result, sentinel = self._run_restore(root, repo, backup, pending)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(sentinel.is_file())
+            self.assertEqual((repo / SITE_JSON).read_bytes(), local_json)
+            merged = (repo / SITE_LAUNCH).read_text(encoding="utf-8")
+            self.assertIn('name="monitor" default="local"', merged)
+            self.assertEqual(merged.count(MARKER), 1)
+            self.assertEqual(merged.count("livox_power_cycle.launch"), 1)
+            self.assertNotIn("<<<<<<<", merged)
+            candidate = backup / "candidate" / SITE_LAUNCH
+            self.assertTrue(candidate.is_file())
+            self.assertIn("严格结构化后备合并", result.stderr)
+
+    def test_structural_fallback_rejects_existing_inline_manager(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            unsafe = _launch(monitor="local").replace(
+                b"</launch>",
+                b'  <node name="livox_power_cycle_manager" pkg="livox_ros_driver" '
+                b'type="livox_power_cycle_manager.py"/>\n</launch>',
+            )
+            repo, backup, pending, local_json, _ = self._prepare_transaction(
+                root,
+                _launch(monitor="upstream", relay=True),
+                local_launch=unsafe,
+            )
+            result, sentinel = self._run_restore(root, repo, backup, pending)
             self.assertEqual(result.returncode, 42, result.stderr)
             self.assertFalse(sentinel.exists())
             self.assertEqual((repo / SITE_JSON).read_bytes(), local_json)
-            self.assertEqual((repo / SITE_LAUNCH).read_bytes(), local_launch)
-            candidate = backup / "candidate" / SITE_LAUNCH
-            self.assertTrue(candidate.is_file())
-            self.assertIn("<<<<<<<", candidate.read_text(encoding="utf-8"))
-            self.assertIn("禁止编译和重启服务", result.stderr)
+            self.assertEqual((repo / SITE_LAUNCH).read_bytes(), unsafe)
+            self.assertIn("already contains a relay manager node", result.stderr)
 
     def test_invalid_upstream_marker_or_xml_restores_original_and_stops(self):
         cases = {

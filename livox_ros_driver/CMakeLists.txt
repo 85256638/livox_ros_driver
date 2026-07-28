@@ -78,6 +78,7 @@ catkin_install_python(PROGRAMS
 	livox_ros_driver/scripts/livox_stats_monitor.py
 	livox_ros_driver/scripts/livox_power_cycle_manager.py
 	livox_ros_driver/scripts/validate_livox_power_cycle_site.py
+	livox_ros_driver/scripts/merge_livox_relay_launch.py
 	DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
@@ -197,6 +198,7 @@ if(CATKIN_ENABLE_TESTING)
     test_handshake_recovery_policy
     test_livox_power_cycle_manager
     test_livox_stats_monitor
+    test_merge_livox_relay_launch
     test_power_cycle_installer
     test_update_livox_geph
   )
