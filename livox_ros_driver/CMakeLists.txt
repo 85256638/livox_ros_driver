@@ -201,6 +201,7 @@ if(CATKIN_ENABLE_TESTING)
     test_merge_livox_relay_launch
     test_power_cycle_installer
     test_update_livox_geph
+    test_validate_livox_site_script
   )
   foreach(py_test IN LISTS LIVOX_RECOVERY_PY_TESTS)
     add_test(
