@@ -175,10 +175,10 @@ source "$HOME/catkin_ws/devel/setup.bash" && rosrun livox_ros_driver livox_stats
 
 #### 已完成继电器版部署后的日常升级（以后使用这里）
 
-只要工位已经完成前述七阶段迁移、`validate_livox_site.sh --check-relays` 已通过，以后升级 **不需要重新执行七阶段迁移，也不需要重新填写三份现场配置**。先开启 Geph，然后在维护窗口运行下面这一条推荐命令：它保留两份仓库内现场配置，更新并配套编译SDK/Driver，刷新幂等的systemd安全helper，全部成功后才重启服务；`~/.config/livox/power_cycle.json` 位于仓库外，始终不会被更新覆盖：
+只要工位已经完成前述七阶段迁移、`validate_livox_site.sh --check-relays` 已通过，以后升级 **不需要重新执行七阶段迁移，也不需要重新填写三份现场配置**。先开启 Geph，然后在维护窗口运行下面这一条推荐命令：下载和编译期间旧Driver继续运行；构建成功后才停止整个服务，释放集成manager持有的SQLite/继电器端点锁，刷新systemd安全helper并重新启动。`~/.config/livox/power_cycle.json` 位于仓库外，始终不会被更新覆盖：
 
 ```bash
-LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config && bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" && LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --restart-service
+LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config && sudo systemctl stop livox-ros-driver && bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" && sudo systemctl start livox-ros-driver && systemctl is-active livox-ros-driver
 ```
 
 如果只想先下载、更新和编译，暂时让内存中的旧Driver继续运行，使用这一条：
@@ -187,13 +187,13 @@ LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --
 LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config
 ```
 
-上述准备命令成功后，决定应用磁盘上的新版时再运行这一条；它先刷新安全helper，再复核版本、配置和systemd门禁，最后重启：
+上述准备命令成功后，决定应用磁盘上的新版时再运行这一条；必须先停止Driver及其集成manager释放安全锁，再刷新helper并启动：
 
 ```bash
-bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" && LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --restart-service
+sudo systemctl stop livox-ros-driver && bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" && sudo systemctl start livox-ros-driver && systemctl is-active livox-ros-driver
 ```
 
-重复运行日常升级命令是安全的：远端版本没有变化时跳过重复构建；安装脚本是幂等操作；只有最后带 `--restart-service` 的步骤会造成一次短暂断流。若任一步失败，后续 `&&` 步骤不会执行，当前旧进程不会被更新脚本主动重启。升级完成后以看板 `SOFTWARE` 中运行二进制内嵌的Driver/SDK版本为最终依据。
+重复运行日常升级命令是安全的：远端版本没有变化时跳过重复构建，安装脚本是幂等操作。只有构建全部成功后才进入一次短暂的stop/start断流窗口；若停止前任一步失败，旧进程继续运行；停止后安装失败则服务保持停止而不会绕过安全门禁启动。升级完成后以看板 `SOFTWARE` 中运行二进制内嵌的Driver/SDK版本为最终依据。
 
 #### 全新工位（尚无Driver仓库）
 
@@ -215,7 +215,7 @@ mkdir -p "$HOME/catkin_ws/src" && git -c http.proxy=socks5h://127.0.0.1:9909 -c 
 已经用“不重启”命令准备成功后，立即应用新二进制：
 
 ```bash
-bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" && LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --restart-service
+sudo systemctl stop livox-ros-driver && bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" && sudo systemctl start livox-ros-driver && systemctl is-active livox-ros-driver
 ```
 
 `--restart-service` 不是另一种启动方式；它只是在全部更新和编译成功后重启 `livox-ros-driver`。集成版 manager 由同一个 launch 管理，不再单独启动或重启。不带该参数时，只有在集成版安全钩子已经安装并通过检查后，才可手动重启：

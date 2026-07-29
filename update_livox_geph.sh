@@ -1177,6 +1177,6 @@ fi
 
 log "全部完成：SDK $(short_sha "${CURRENT_SDK_SHA}")，Driver $(short_sha "${DRIVER_REMOTE_HEAD}")"
 if ((!RESTART_SERVICE)); then
-  log "若尚未安装集成版安全钩子，请先运行：bash ${DRIVER_DIR}/install_livox_power_cycle_service.sh"
-  log "确认安全钩子已安装后再执行：sudo systemctl restart livox-ros-driver"
+  log "应用新版的安全顺序：先停止Driver/集成manager释放锁，再刷新安全钩子并启动。"
+  log "执行：sudo systemctl stop livox-ros-driver && bash ${DRIVER_DIR}/install_livox_power_cycle_service.sh && sudo systemctl start livox-ros-driver && systemctl is-active livox-ros-driver"
 fi

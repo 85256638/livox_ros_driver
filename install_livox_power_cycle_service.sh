@@ -349,7 +349,7 @@ fi
 
 log "独立执行一次与 JSON/ROS 无关的 must-be-ON 修复。"
 repair_obligations ||
-  die "独立补上电失败；旧 unit 尚未删除，已安装的 Driver drop-in 不会自行启动 manager。若集成 manager 正在运行，请先安全停止 ${DRIVER_UNIT_NAME} 后重试。"
+  die "独立补上电失败；旧 unit 尚未删除，已安装的 Driver drop-in 不会自行启动 manager。若集成 manager 正在运行，请执行：sudo systemctl stop livox-ros-driver && bash ${SCRIPT_DIR}/install_livox_power_cycle_service.sh && sudo systemctl start livox-ros-driver"
 
 if [[ "${LEGACY_LOAD_STATE}" != "not-found" ||
       "${LEGACY_INITIAL_ACTIVE_STATE}" != "inactive" ||
