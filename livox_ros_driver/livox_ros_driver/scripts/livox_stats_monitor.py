@@ -226,7 +226,7 @@ def _compose_dashboard(stats_text, stats_received_mono, rows, now_mono):
         driver_severity = "INFO"
 
     lines = [
-        "SOURCE HEALTH:",
+        "==================== SOURCE HEALTH ==================",
         "  DRIVER   NOW=%s  severity=%s  driver_age=%s  expected=1Hz stale>5s"
         % (
             driver_state,
@@ -267,7 +267,11 @@ def _compose_dashboard(stats_text, stats_received_mono, rows, now_mono):
 
     if rows:
         lines.extend(
-            ["", "POWER RECOVERY (shared relay; separate manager process):"]
+            [
+                "",
+                "==================== POWER RECOVERY ================",
+                "  (shared relay; separate manager process)",
+            ]
         )
         sorted_rows = sorted(
             rows,

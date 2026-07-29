@@ -102,6 +102,8 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
             DRIVER.index("int main(")
         ]
         self.assertIn("RECENT 60 SECONDS", stats)
+        self.assertIn("==================== CURRENT DEVICES", stats)
+        self.assertIn("==================== ASSESSMENT GUIDE", stats)
         self.assertIn("handshake_timeouts", stats)
         self.assertIn("not independent fault", stats)
         self.assertIn(
@@ -110,7 +112,7 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         self.assertIn("ls.handshake_timeout_count", stats)
         self.assertIn("handshake attempts (SDK): ACK=", stats)
         self.assertIn(
-            "PROCESS HISTORY (Driver process; resets on restart; not current alarms)",
+            "==================== PROCESS HISTORY",
             stats,
         )
 
@@ -124,7 +126,8 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         self.assertIn("LIVOX_DRIVER_GIT_COMMIT", CMAKE)
         self.assertIn("LIVOX_SDK_GIT_COMMIT", CMAKE)
         self.assertIn("target_compile_definitions", CMAKE)
-        self.assertIn("SOFTWARE (embedded in this running binary)", DRIVER)
+        self.assertIn("==================== SOFTWARE", DRIVER)
+        self.assertIn("versions embedded in this running binary", DRIVER)
         self.assertIn("paired SDK commit=", DRIVER)
         self.assertNotIn("git -C", DRIVER)
 

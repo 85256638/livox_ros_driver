@@ -191,6 +191,7 @@ class MonitorStateTest(unittest.TestCase):
     def test_driver_stale_and_age_are_based_on_local_monotonic_receive_time(self):
         live = MONITOR._compose_dashboard("driver\n", 100.0, [], 104.9)
         stale = MONITOR._compose_dashboard("driver\n", 100.0, [], 106.0)
+        self.assertIn("==================== SOURCE HEALTH", live)
         self.assertIn("NOW=LIVE", live)
         self.assertIn("driver_age=4s", live)
         self.assertIn("NOW=DRIVER_STALE", stale)
@@ -203,6 +204,7 @@ class MonitorStateTest(unittest.TestCase):
         )
         fresh = MONITOR._compose_dashboard("driver\n", 229.9, [row], 229.9)
         stale = MONITOR._compose_dashboard("driver\n", 200.0, [row], 231.0)
+        self.assertIn("==================== POWER RECOVERY", fresh)
         self.assertIn("NOW=MANAGER_HEARTBEAT", fresh)
         self.assertIn("POWER-MGR NOW=MANAGER_HEARTBEAT", fresh)
         self.assertIn("manager_age=29s", fresh)

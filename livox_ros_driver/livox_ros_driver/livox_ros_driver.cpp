@@ -823,7 +823,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
   std::ostringstream active_alerts;
   std::ostringstream process_history;
   static const char kCurrentRowFormat[] =
-      "%-2.2s  %-15.15s  %-20.20s  %-10.10s  %7.7s  %-10.10s  %11.11s\n";
+      "%-2.2s  %-15.15s  %-20.20s  %-10.10s  %8.8s  %-10.10s  %11.11s\n";
   static const char kRecentRowFormat[] =
       "%-2.2s  %-15.15s  %12.12s  %11.11s  %18.18s\n";
   char current_header[128];
@@ -1764,7 +1764,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
 
   std::ostringstream ss;
   ss << "===== Livox LiDAR Status (1 Hz) =====\n";
-  ss << "SOFTWARE (embedded in this running binary):\n"
+  ss << "==================== SOFTWARE ====================\n"
+     << "  (versions embedded in this running binary)\n"
      << "  Driver commit=" << ShortBuildCommit(LIVOX_DRIVER_GIT_COMMIT)
      << " ROS=" << LIVOX_ROS_DRIVER_VERSION_STRING
      << " | paired SDK commit=" << ShortBuildCommit(LIVOX_SDK_GIT_COMMIT)
@@ -1775,7 +1776,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
       trend_count[kDashboardTrendObserve] +
       trend_count[kDashboardTrendWatch] +
       trend_count[kDashboardTrendUnstable];
-  ss << "FLEET:\n"
+  ss << "==================== FLEET =======================\n"
      << "  configured=" << startup_trackers.size()
      << " shown=" << known_count
      << " (configured=JSON whitelist; shown=rows below)\n"
@@ -1788,26 +1789,32 @@ void StatsTimerCb(const ros::TimerEvent &) {
      << " observe=" << trend_count[kDashboardTrendObserve]
      << " stable=" << trend_count[kDashboardTrendStable] << "\n";
   if (any_active_alert) {
-    ss << "CURRENT ALERTS:\n" << active_alerts.str();
+    ss << "==================== CURRENT ALERTS ==============\n"
+       << active_alerts.str();
   } else {
-    ss << "CURRENT ALERTS: none\n";
+    ss << "==================== CURRENT ALERTS ==============\n"
+       << "  none\n";
   }
-  ss << "CURRENT DEVICES:\n" << current_table.str();
+  ss << "==================== CURRENT DEVICES =============\n"
+     << current_table.str();
   if (known_count == 0) {
     ss << "(no lidar seen yet)\n";
   }
-  ss << "RECENT 60 SECONDS (rolling window; samples expire after 60s):\n"
+  ss << "==================== RECENT 60 SECONDS ===========\n"
+     << "  (rolling window; samples expire after 60s)\n"
      << recent_table.str()
      << "  packet_loss=network point-packet loss; queue_drops=packets received "
         "but dropped by Driver queue\n"
      << "  handshake_timeouts=SDK handshake attempts, not independent fault "
         "episodes\n"
-     << "ASSESSMENT GUIDE: ACTIVE=current fault; RECOVERING=automatic recovery "
-        "in progress; IDLE=intentional low-power\n"
+     << "==================== ASSESSMENT GUIDE ============\n"
+     << "  ACTIVE=current fault; RECOVERING=automatic recovery in progress; "
+        "IDLE=intentional low-power\n"
      << "  STABLE/OBSERVE/WATCH/UNSTABLE combine the rolling 60s metrics with "
         "repeated events/actions in the last 10m\n";
   if (any_process_history) {
-    ss << "PROCESS HISTORY (Driver process; resets on restart; not current alarms):\n"
+    ss << "==================== PROCESS HISTORY =============\n"
+       << "  (Driver process; resets on restart; not current alarms)\n"
        << process_history.str();
   }
 

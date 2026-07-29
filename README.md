@@ -167,30 +167,40 @@ bash "$HOME/catkin_ws/src/livox_ros_driver/validate_livox_site.sh"
 git -C "$HOME/Livox-SDK" rev-parse --short=12 HEAD && git -C "$HOME/catkin_ws/src/livox_ros_driver" rev-parse --short=12 HEAD && systemctl is-active livox-ros-driver
 ```
 
-随后打开看板，以顶部 `SOFTWARE (embedded in this running binary)` 为最终生效依据：`Driver commit` 必须等于上一步 Driver 源码 commit，`paired SDK commit` 是该 Driver 编译时固定配套的 SDK。这里读取的是运行二进制内嵌版本，不会把“磁盘源码已更新但服务仍运行旧二进制”误报为新版：
+随后打开看板，以顶部 `==================== SOFTWARE ====================` 板块为最终生效依据：`Driver commit` 必须等于上一步 Driver 源码 commit，`paired SDK commit` 是该 Driver 编译时固定配套的 SDK。这里读取的是运行二进制内嵌版本，不会把“磁盘源码已更新但服务仍运行旧二进制”误报为新版：
 
 ```bash
 source "$HOME/catkin_ws/devel/setup.bash" && rosrun livox_ros_driver livox_stats_monitor.py
 ```
 
-#### 新工位与日常更新
+#### 已完成继电器版部署后的日常升级（以后使用这里）
 
-全新工位尚无 Driver 仓库时，使用这一条完成代理 clone 和首次配套构建；首次部署服务前不自动重启：
+只要工位已经完成前述七阶段迁移、`validate_livox_site.sh --check-relays` 已通过，以后升级 **不需要重新执行七阶段迁移，也不需要重新填写三份现场配置**。先开启 Geph，然后在维护窗口运行下面这一条推荐命令：它保留两份仓库内现场配置，更新并配套编译SDK/Driver，刷新幂等的systemd安全helper，全部成功后才重启服务；`~/.config/livox/power_cycle.json` 位于仓库外，始终不会被更新覆盖：
+
+```bash
+LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config && bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" && LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --restart-service
+```
+
+如果只想先下载、更新和编译，暂时让内存中的旧Driver继续运行，使用这一条：
+
+```bash
+LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config
+```
+
+上述准备命令成功后，决定应用磁盘上的新版时再运行这一条；它先刷新安全helper，再复核版本、配置和systemd门禁，最后重启：
+
+```bash
+bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" && LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --restart-service
+```
+
+重复运行日常升级命令是安全的：远端版本没有变化时跳过重复构建；安装脚本是幂等操作；只有最后带 `--restart-service` 的步骤会造成一次短暂断流。若任一步失败，后续 `&&` 步骤不会执行，当前旧进程不会被更新脚本主动重启。升级完成后以看板 `SOFTWARE` 中运行二进制内嵌的Driver/SDK版本为最终依据。
+
+#### 全新工位（尚无Driver仓库）
+
+全新工位尚无 Driver 仓库时，使用这一条完成代理 clone 和首次配套构建；首次部署服务前不自动重启。之后仍需执行前面的七阶段现场配置与验收，不能直接武装继电器：
 
 ```bash
 mkdir -p "$HOME/catkin_ws/src" && git -c http.proxy=socks5h://127.0.0.1:9909 -c https.proxy=socks5h://127.0.0.1:9909 clone --branch network-relay-added --single-branch https://github.com/85256638/livox_ros_driver.git "$HOME/catkin_ws/src/livox_ros_driver" && LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config
-```
-
-检查并更新 SDK，成功后再检查、更新和编译 Driver；默认不重启正在运行的服务：
-
-```bash
-bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh"
-```
-
-工位已经手工修改多雷达 JSON/launch 时，使用下面的一键命令保留配置、更新编译并在成功后重启：
-
-```bash
-LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --restart-service
 ```
 
 `--preserve-site-config` 只允许自动处理以下两个现场文件：
@@ -202,10 +212,10 @@ LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --
 
 如果旧 SDK 或 Driver 最初使用 `--single-branch` 克隆，脚本会只为当前目标分支补充缺失的 `origin` fetch refspec；如果上一次迁移恰好停在“本地目标分支已创建、但 upstream 尚未设置”，再次运行也会自动修复跟踪关系后继续 fast-forward，不需要删除仓库、分支或现场配置。
 
-编译成功后立即应用新二进制：
+已经用“不重启”命令准备成功后，立即应用新二进制：
 
 ```bash
-bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --restart-service
+bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" && LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --restart-service
 ```
 
 `--restart-service` 不是另一种启动方式；它只是在全部更新和编译成功后重启 `livox-ros-driver`。集成版 manager 由同一个 launch 管理，不再单独启动或重启。不带该参数时，只有在集成版安全钩子已经安装并通过检查后，才可手动重启：
@@ -219,13 +229,13 @@ sudo systemctl restart livox-ros-driver
 版本未变化时脚本会跳过重复构建；需要强制重编译时执行：
 
 ```bash
-bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --force
+LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --force
 ```
 
 生产运行期间建议降低并行数，减少编译对点云接收的影响：
 
 ```bash
-LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh"
+LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config
 ```
 
 #### Driver 正在运行时会发生什么
@@ -563,28 +573,30 @@ rosrun livox_ros_driver livox_stats_monitor.py
 
 看板按固定层次显示：数据源存活、运行二进制版本、整组摘要、当前告警、当前逐台状态、最近60秒滚动指标、判定说明和进程历史。普通瞬时掉线标 `DISCONNECTED`，已归因的运行期掉线标 `NORMAL_NO_BROADCAST / NORMAL_DROPOUT`，启动缺失标 `STARTUP_MISSING`，显式唤醒归因则标 `WAKE_NO_BROADCAST / WAKE_DROPOUT`。白名单成员即使从未取得 SDK handle，也会以合成 `L255` 行出现：
 ```
-SOURCE HEALTH:
+==================== SOURCE HEALTH ==================
   DRIVER   NOW=LIVE  severity=INFO  driver_age=0s  expected=1Hz stale>5s
   POWER-MGR NOW=MANAGER_HEARTBEAT  severity=INFO  manager_age=2s  heartbeat=10s stale>30s
 
 ===== Livox LiDAR Status (1 Hz) =====
-SOFTWARE (embedded in this running binary):
+==================== SOFTWARE ====================
+  (versions embedded in this running binary)
   Driver commit=<12-char SHA> ROS=2.6.0 | paired SDK commit=e45774c5d4f2 SDK=2.3.0 | compatibility=PINNED
-FLEET:
+==================== FLEET =======================
   configured=4 shown=4 (configured=JSON whitelist; shown=rows below)
   CURRENT: fault=1 recovering=0 intentional_idle=1 operating=2
   ASSESSMENT: unstable=1 watch=0 observe=0 stable=1
-CURRENT ALERTS:
+==================== CURRENT ALERTS ==============
   [CRIT] L1 3WEDH5900100671 POWER_CYCLE_REQUIRED reason=HANDSHAKE_STUCK age=12s
     handshake: broadcast=alive; reset=completed; power-cycle request published; see POWER RECOVERY manager
     last SDK event: TIMEOUT; detail=500
-CURRENT DEVICES:
+==================== CURRENT DEVICES =============
 ID  broadcast_code   CURRENT               ASSESS     points/s  HW            connected
 0   3WEDH7600111191  NORMAL                STABLE         2496  OK                2h13m
 1   3WEDH5900100671  POWER_CYCLE_REQUIRED  ACTIVE            -  -                    --
 2   3WEDJA700100021  NORMAL                UNSTABLE       2498  OK                8m05s
 3   3WEDH7600103661  POWER_SAVING          IDLE               0  OK                2h13m
-RECENT 60 SECONDS (rolling window; samples expire after 60s):
+==================== RECENT 60 SECONDS ===========
+  (rolling window; samples expire after 60s)
 ID  broadcast_code     packet_loss  queue_drops  handshake_timeouts
 0   3WEDH7600111191           0.00%            0                   0
 1   3WEDH5900100671           0.00%            0                   7
@@ -592,9 +604,11 @@ ID  broadcast_code     packet_loss  queue_drops  handshake_timeouts
 3   3WEDH7600103661              --            0                   0
   packet_loss=network point-packet loss; queue_drops=packets received but dropped by Driver queue
   handshake_timeouts=SDK handshake attempts, not independent fault episodes
-ASSESSMENT GUIDE: ACTIVE=current fault; RECOVERING=automatic recovery in progress; IDLE=intentional low-power
+==================== ASSESSMENT GUIDE ============
+  ACTIVE=current fault; RECOVERING=automatic recovery in progress; IDLE=intentional low-power
   STABLE/OBSERVE/WATCH/UNSTABLE combine the rolling 60s metrics with repeated events/actions in the last 10m
-PROCESS HISTORY (Driver process; resets on restart; not current alarms):
+==================== PROCESS HISTORY =============
+  (Driver process; resets on restart; not current alarms)
   L1 3WEDH5900100671:
     link: disconnect episodes=3; outage duration=12s; current link up=--
     handshake attempts (SDK): ACK=42 timeout=498 rejected=0
@@ -604,7 +618,8 @@ PROCESS HISTORY (Driver process; resets on restart; not current alarms):
     session reset actions: accepted=20; rejected=3
     last SDK event: TIMEOUT detail=500 ip=192.168.31.72 at=2026-07-22 11:04:32
 
-POWER RECOVERY (shared relay; separate manager process):
+==================== POWER RECOVERY ================
+  (shared relay; separate manager process)
   MANAGER   NOW=MANAGER_HEARTBEAT  severity=INFO  manager_age=2s
     detail: mode=auto worker=alive
 
@@ -1071,7 +1086,7 @@ sudo systemctl restart livox-ros-driver && systemctl is-active livox-ros-driver
 
 查看自动硬恢复的最近状态可继续使用同一看板。看板最上方 `SOURCE HEALTH` 用本机单调时钟显示 Driver topic 的接收年龄：超过 5 秒没有新 `/livox/lidar_stats` 会明确显示 `NOW=DRIVER_STALE severity=CRITICAL`，不会用旧表和新的渲染时间伪装成实时数据。脚本自身每秒刷新，因此 Driver 和 manager 同时停发时 stale 年龄仍会继续增长。
 
-`livox_stats_monitor.py` 在收到至少一条通过校验的manager消息后，会同时在顶部 `SOURCE HEALTH` 增加 `POWER-MGR` 摘要，并在Driver看板之后追加独立的 `POWER RECOVERY (shared relay; separate manager process)` 详情区域；若manager从未成功发布首帧，尚无可缓存身份，因此不会凭空显示manager行。详情中的 `MANAGER` 行显示manager的 `NOW/severity/manager_age`，每个 `GROUP <power_group>` 再分行显示该共享组的 `NOW/severity/rx_age/trigger/members/relay` 和完整 `detail`；`relay=1,2,3,4` 可直接确认本次状态对应四路集合，结构化status同时保留 `relay_channels` 和四种 `recovery_reason`。白名单外事件显示为 `UNMAPPED trigger=...`，绝不会伪装成manager行。这部分来自独立manager进程，不计入Driver的 `FLEET/ASSESSMENT/PROCESS HISTORY`；收到首帧后若manager心跳超过30秒未接收，顶部摘要和底部详情都会明确改显 `MANAGER_STALE/CRITICAL`。所有stale判定都用本机接收时刻，不信任消息内wall-clock。
+`livox_stats_monitor.py` 在收到至少一条通过校验的manager消息后，会同时在顶部 `SOURCE HEALTH` 板块增加 `POWER-MGR` 摘要，并在Driver看板之后追加独立的 `POWER RECOVERY` 板块；若manager从未成功发布首帧，尚无可缓存身份，因此不会凭空显示manager行。详情中的 `MANAGER` 行显示manager的 `NOW/severity/manager_age`，每个 `GROUP <power_group>` 再分行显示该共享组的 `NOW/severity/rx_age/trigger/members/relay` 和完整 `detail`；`relay=1,2,3,4` 可直接确认本次状态对应四路集合，结构化status同时保留 `relay_channels` 和四种 `recovery_reason`。白名单外事件显示为 `UNMAPPED trigger=...`，绝不会伪装成manager行。这部分来自独立manager进程，不计入Driver的 `FLEET/ASSESSMENT/PROCESS HISTORY`；收到首帧后若manager心跳超过30秒未接收，顶部摘要和底部详情都会明确改显 `MANAGER_STALE/CRITICAL`。所有stale判定都用本机接收时刻，不信任消息内wall-clock。
 
 ```bash
 rostopic echo /livox/power_cycle_status
