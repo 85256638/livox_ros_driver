@@ -111,7 +111,7 @@ nano "$HOME/.config/livox/power_cycle.json"
 bash "$HOME/catkin_ws/src/livox_ros_driver/validate_livox_site.sh"
 ```
 
-**阶段5：只读查询真实继电器。** 仍保持 `relay_power_cycle_enable=false`。下面的命令会先重复离线校验，再仅对每个enabled电源组发送一次B0状态查询；它不会发送OFF/ON。必须确认IP/端口可达、返回4路状态，实机固件出现 `fixed AA tail` 兼容警告是已知正常行为：
+**阶段5：只读查询真实继电器。** 仍保持 `relay_power_cycle_enable=false`。下面的命令会先重复离线校验，再仅对每个enabled电源组执行B0状态查询；它不会发送OFF/ON。必须确认IP/端口可达、返回4路状态。1号工位CX-5104E-L已实测每个新TCP连接的第一次命令只返回ASCII `v1.0`，同一连接重发一次后才返回正式帧，而且9字节B0可能拆成8+1字节；manager会精确处理该握手和TCP分片。输出中的 `v1.0 handshake` 与 `fixed AA tail` 兼容警告都是已确认的正常行为：
 
 ```bash
 bash "$HOME/catkin_ws/src/livox_ros_driver/validate_livox_site.sh" --check-relays
@@ -961,6 +961,8 @@ flowchart TD
 5. 发送OFF前已按物理供电端点把“所选通道集合必须全部恢复ON”、通道掩码及4个成员快照提交到SQLite；OFF、ON都通过独立B0查询确认所有选中位。Driver的systemd安全钩子使用 `~/.local/libexec/livox-power-cycle-manager/` 中的稳定原子更新副本，在每次启动前和停止后执行与源码checkout、现场JSON、ROS无关的紧急补上电；仍有任何补上电义务时，全局禁止新的OFF。计划维护标签最多保持180秒；仍未重连时当前状态回到 `DISCONNECTED`，不会永久用维护标签掩盖恢复失败。
 6. 上电后必须等待该组 **4 个 members 全部**重新连接、完成配置、握手为 `IDLE`，并在 `Normal + Sampling + publishing` 状态连续健康 10 秒，才记为 `RECOVERY_VERIFIED`。`PowerSaving/StandBy/Init/Config/Error/Off` 均不算本次硬恢复完成；只恢复触发故障的那台或只收到继电器 `OK!` 也不算整组恢复成功。
 
+每次B0/A1交换都允许一次已由实机确认的连接级兼容流程：收到精确ASCII `v1.0` 后在**同一个TCP连接**重发原命令一次。B0是只读命令；A1携带明确的目标状态和enable mask，重复同一帧不会反转输出。客户端随后持续累计TCP字节直到取得完整9字节B0、`OK!`或超时；现场捕获的“前8字节后补最后1字节”属于正常TCP分片。第二次 `v1.0`、未知版本文本或超时仍严格失败，并在错误中附带已接收的partial十六进制，禁止凭不完整响应继续断电。
+
 自动控制需要这些条件同时成立：Driver安全钩子已安装、launch的 `relay_power_cycle_enable=true`、JSON中目标电源组 `enabled=true`、本次事件的reason-specific状态复核通过，并且没有触发同一物理通道集合 **30分钟冷却**、**24小时3次上限**或继电器安全检查。它不订阅PLC/上位机许可topic；通过全部门禁后按有效 `off_seconds` 对整个选中集合执行OFF/恢复ON，再验收4台点云。
 
 launch 开关是日常唯一总开关：
@@ -1026,7 +1028,7 @@ sudo systemctl restart livox-ros-driver && systemctl is-active livox-ros-driver
 | 计划断电ACK | OFF前manager先等待Driver精确ACK，再占用预算；Driver先标记4台再ACK。每次等待3秒、间隔0.5秒换新token，最多3次；超时token逐一CANCEL，明确拒绝不重试。3次均超时、拒绝、实例/成员不一致或ACK后原因恢复均不创建断电循环。伴生断线单记maintenance，不进入单机故障趋势 |
 | 当前状态复核 | Driver 先完成原因归因；manager 再复核时间戳、离线/未发布真值和互斥证据。handshake 要广播新鲜，wake 要同 generation + 60 秒窗 + 10 秒静默，normal 要同 generation + 30 秒健康 + 5 秒静默，startup 要合成 handle 255 + 30 秒缺失。流程有四个 OFF 决策点：初始缓存、B0 预检后强制收到的新状态、Driver ACK 后、obligation 持久化后；任一点恢复/身份变化都取消 OFF。不以其余 3 台健康作为 OFF 前置条件，多台同时异常也只执行一次共享恢复 |
 | 测量联锁边界 | 上位机/PLC在任一雷达异常时已负责中断测量；已确认继电器1～4路全部只给这4台雷达供电，因此manager不再要求或等待额外的 `SAFE_TO_CYCLE` 许可 |
-| 协议确认 | 私有 TCP `B0` 状态查询接受完整 `CH/CL`；同时兼容 CX-5104E-L 实机确认的“正确 `CH` + 固定 `AA` 尾字节”（例如全开状态 `... 0D CD AA`），并保留 WARN。该兼容仍严格校验首校验字节、地址、`0D` 结束位和四路状态范围；错误 `CH`、未知非 `AA` 尾字节及越界状态一律拒绝。只有固件精确返回 `00 00` 时，才需对单个电源组显式设置 `allow_omitted_status_checksum=true` |
+| 协议确认 | 私有TCP `B0`状态查询接受完整 `CH/CL`；同时兼容CX-5104E-L实机确认的“正确 `CH` + 固定 `AA` 尾字节”（例如全开状态 `... 0D CD AA`），并保留WARN。1号工位还确认新TCP连接首次命令返回精确ASCII `v1.0`；manager只对白名单化的这个版本帧在同一连接幂等重发一次，重复版本帧或未知前缀仍失败关闭。接收端累计TCP分片，不能把现场8+1字节拆包误判成8字节坏帧。该兼容仍严格校验首校验字节、地址、`0D`结束位和四路状态范围；错误 `CH`、未知非 `AA`尾字节及越界状态一律拒绝。只有固件精确返回 `00 00` 时，才需对单个电源组显式设置 `allow_omitted_status_checksum=true` |
 | 通道集合与旁路保护 | A1只写配置 `channels` 对应的位掩码；OFF前记录4路状态，所选位OFF和恢复ON后都再次查询。未选择通道如发生变化立即中止并报 `NON_TARGET_STATE_CHANGED`；本现场选择全部1～4路，因此没有旁路输出 |
 | 影响范围 | 任一成员触发后，`channels: [1,2,3,4]` 对应的4台雷达都会短暂断流；不会尝试伪装成“只重启一台” |
 | 断电时间 | 所选通道全部确认OFF后按有效 `off_seconds` 保持，再将全部选中位恢复ON；新模板和完成上述迁移的配置为5秒，旧配置省略该字段或显式写10时仍为10秒；配置下限是5秒，不能设得更短 |

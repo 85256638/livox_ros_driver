@@ -56,9 +56,19 @@ GROUP_ID = "pit-4-shared"
 
 
 class _RelayState:
-    def __init__(self, mask=0x0F, status_checksum=None):
+    def __init__(
+        self,
+        mask=0x0F,
+        status_checksum=None,
+        version_handshake=False,
+        repeat_version_handshake=False,
+        fragment_status_tail=False,
+    ):
         self.mask = mask
         self.status_checksum = status_checksum
+        self.version_handshake = version_handshake
+        self.repeat_version_handshake = repeat_version_handshake
+        self.fragment_status_tail = fragment_status_tail
         self.lock = threading.Lock()
 
 
@@ -68,6 +78,14 @@ class _RelayHandler(socketserver.BaseRequestHandler):
         if len(data) < 3 or data[:2] != b"\xCC\xDD":
             return
         state = self.server.relay_state
+        if state.version_handshake:
+            self.request.sendall(b"v1.0")
+            data = self.request.recv(64)
+            if len(data) < 3 or data[:2] != b"\xCC\xDD":
+                return
+            if state.repeat_version_handshake:
+                self.request.sendall(b"v1.0")
+                return
         if data[2] == 0xB0:
             with state.lock:
                 mask = state.mask
@@ -78,7 +96,13 @@ class _RelayHandler(socketserver.BaseRequestHandler):
                 checksum = status_checksum(body)
             elif status_checksum is not None:
                 checksum = status_checksum
-            self.request.sendall(b"\xAA\xBB" + body + checksum)
+            response = b"\xAA\xBB" + body + checksum
+            if state.fragment_status_tail:
+                self.request.sendall(response[:-1])
+                time.sleep(0.01)
+                self.request.sendall(response[-1:])
+            else:
+                self.request.sendall(response)
         elif data[2] == 0xA1 and len(data) >= 10:
             control = int.from_bytes(data[4:6], "big")
             enabled = int.from_bytes(data[6:8], "big")
@@ -97,8 +121,21 @@ class _RelayServer(socketserver.ThreadingTCPServer):
 
 
 class _RunningRelay:
-    def __init__(self, mask=0x0F, status_checksum=None):
-        self.state = _RelayState(mask, status_checksum)
+    def __init__(
+        self,
+        mask=0x0F,
+        status_checksum=None,
+        version_handshake=False,
+        repeat_version_handshake=False,
+        fragment_status_tail=False,
+    ):
+        self.state = _RelayState(
+            mask,
+            status_checksum,
+            version_handshake,
+            repeat_version_handshake,
+            fragment_status_tail,
+        )
         self.server = _RelayServer(self.state)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
@@ -1292,6 +1329,49 @@ class LegacyRelayClientTests(unittest.TestCase):
             self.assertEqual(client.query()[0], (False, False, False, False))
             client.ensure_state(True)
             self.assertEqual(client.query()[0], (True, True, True, True))
+
+    def test_v1_handshake_resends_once_and_accumulates_8_plus_1_status(self):
+        def field_checksum(body):
+            return bytes((sum(body) & 0xFF, 0xAA))
+
+        with _RunningRelay(
+            status_checksum=field_checksum,
+            version_handshake=True,
+            fragment_status_tail=True,
+        ) as relay:
+            target = _group(relay.port, channels=(1, 2, 3, 4))
+            client = manager.CorxLegacyTcpClient(
+                target,
+                _policy(
+                    connect_timeout_seconds=1,
+                    command_timeout_seconds=1,
+                    command_retries=2,
+                ),
+            )
+            states, warning = client.query()
+            self.assertEqual(states, (True, True, True, True))
+            self.assertIn("v1.0 handshake", warning)
+            self.assertIn("fixed AA tail", warning)
+
+            transition_warning = client.ensure_state(False)
+            self.assertEqual(client.query()[0], (False, False, False, False))
+            self.assertIn("v1.0 handshake", transition_warning)
+            client.ensure_state(True)
+            self.assertEqual(client.query()[0], (True, True, True, True))
+
+    def test_repeated_v1_handshake_fails_closed_without_third_command(self):
+        with _RunningRelay(
+            version_handshake=True,
+            repeat_version_handshake=True,
+        ) as relay:
+            client = manager.CorxLegacyTcpClient(
+                _group(relay.port),
+                _policy(connect_timeout_seconds=1, command_timeout_seconds=1),
+            )
+            with self.assertRaisesRegex(
+                manager.RelayProtocolError, "repeated v1.0 handshake"
+            ):
+                client.query()
 
     def test_multi_channel_mask_does_not_change_unselected_outputs(self):
         with _RunningRelay() as relay:
