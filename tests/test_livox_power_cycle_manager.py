@@ -63,12 +63,14 @@ class _RelayState:
         version_handshake=False,
         repeat_version_handshake=False,
         fragment_status_tail=False,
+        omit_status_tail=False,
     ):
         self.mask = mask
         self.status_checksum = status_checksum
         self.version_handshake = version_handshake
         self.repeat_version_handshake = repeat_version_handshake
         self.fragment_status_tail = fragment_status_tail
+        self.omit_status_tail = omit_status_tail
         self.lock = threading.Lock()
 
 
@@ -101,6 +103,8 @@ class _RelayHandler(socketserver.BaseRequestHandler):
                 self.request.sendall(response[:-1])
                 time.sleep(0.01)
                 self.request.sendall(response[-1:])
+            elif state.omit_status_tail:
+                self.request.sendall(response[:-1])
             else:
                 self.request.sendall(response)
         elif data[2] == 0xA1 and len(data) >= 10:
@@ -128,6 +132,7 @@ class _RunningRelay:
         version_handshake=False,
         repeat_version_handshake=False,
         fragment_status_tail=False,
+        omit_status_tail=False,
     ):
         self.state = _RelayState(
             mask,
@@ -135,6 +140,7 @@ class _RunningRelay:
             version_handshake,
             repeat_version_handshake,
             fragment_status_tail,
+            omit_status_tail,
         )
         self.server = _RelayServer(self.state)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -1358,6 +1364,39 @@ class LegacyRelayClientTests(unittest.TestCase):
             self.assertIn("v1.0 handshake", transition_warning)
             client.ensure_state(True)
             self.assertEqual(client.query()[0], (True, True, True, True))
+
+    def test_v1_handshake_accepts_verified_eight_byte_status_without_tail(self):
+        def field_checksum(body):
+            return bytes((sum(body) & 0xFF, 0xAA))
+
+        with _RunningRelay(
+            status_checksum=field_checksum,
+            version_handshake=True,
+            omit_status_tail=True,
+        ) as relay:
+            client = manager.CorxLegacyTcpClient(
+                _group(relay.port, channels=(1, 2, 3, 4)),
+                _policy(connect_timeout_seconds=1, command_timeout_seconds=1),
+            )
+            states, warning = client.query()
+            self.assertEqual(states, (True, True, True, True))
+            self.assertIn("v1.0 handshake", warning)
+            self.assertIn("single-checksum", warning)
+            self.assertIn("omitted second checksum byte", warning)
+
+    def test_eight_byte_status_still_requires_valid_first_checksum(self):
+        client = manager.CorxLegacyTcpClient(_group(), manager.Policy())
+        invalid_frames = (
+            bytes.fromhex("AA BB B0 01 00 0F 0D CC"),
+            bytes.fromhex("AA BB B0 02 00 0F 0D CE"),
+            bytes.fromhex("AA BB B0 01 00 10 0D CE"),
+            bytes.fromhex("AA BB B0 01 00 0F 0E CE"),
+        )
+        for frame in invalid_frames:
+            with self.subTest(frame=frame.hex()), mock.patch.object(
+                client, "_exchange", return_value=frame
+            ), self.assertRaises(manager.RelayProtocolError):
+                client.query()
 
     def test_repeated_v1_handshake_fails_closed_without_third_command(self):
         with _RunningRelay(

@@ -103,6 +103,11 @@ _POWER_GROUP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _LEGACY_COMMAND_HEADER = b"\xCC\xDD"
 _LEGACY_STATUS_HEADER = b"\xAA\xBB\xB0"
 _LEGACY_VERSION_BANNER = b"v1.0"
+# A field CX-5104E-L either appends the ninth B0 checksum byte shortly after
+# the first eight bytes or omits it completely.  Briefly wait for a genuine
+# TCP tail fragment before treating a strictly verified eight-byte prefix as
+# the complete single-checksum firmware variant.
+_LEGACY_STATUS_TAIL_GRACE_SECONDS = 0.1
 _DEFAULT_OFF_SECONDS = 10.0
 _MINIMUM_OFF_SECONDS = 5.0
 _WAKE_OBSERVATION_MAX_SECONDS = 60.0
@@ -2502,6 +2507,16 @@ class CorxLegacyTcpClient:
         body += enable_mask.to_bytes(2, "big")
         return _LEGACY_COMMAND_HEADER + body + _double_checksum(body)
 
+    def _verified_single_checksum_status(self, frame: bytes) -> bool:
+        if len(frame) != 8 or not frame.startswith(_LEGACY_STATUS_HEADER):
+            return False
+        if frame[3] != self.target.address or frame[6] != 0x0D:
+            return False
+        mask = int.from_bytes(frame[4:6], "big")
+        if mask & ~0x0F:
+            return False
+        return frame[7] == _double_checksum(frame[2:7])[0]
+
     def _exchange(self, payload: bytes, expect: str) -> bytes:
         deadline = time.monotonic() + self.policy.command_timeout_seconds
         with socket.create_connection(
@@ -2513,14 +2528,25 @@ class CorxLegacyTcpClient:
             buffer = bytearray()
             version_seen = False
             resent_after_version = False
+            status_tail_deadline: Optional[float] = None
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
+                if status_tail_deadline is not None:
+                    remaining = min(
+                        remaining,
+                        max(0.0, status_tail_deadline - time.monotonic()),
+                    )
                 if remaining <= 0:
                     break
                 sock.settimeout(remaining)
                 try:
                     chunk = sock.recv(4096)
                 except socket.timeout:
+                    start = buffer.find(_LEGACY_STATUS_HEADER)
+                    if start >= 0 and self._verified_single_checksum_status(
+                        bytes(buffer[start : start + 8])
+                    ):
+                        return bytes(buffer[start : start + 8])
                     break
                 if not chunk:
                     break
@@ -2546,12 +2572,29 @@ class CorxLegacyTcpClient:
                 start = buffer.find(_LEGACY_STATUS_HEADER)
                 if start >= 0 and len(buffer) >= start + 9:
                     return bytes(buffer[start : start + 9])
+                if (
+                    start >= 0
+                    and len(buffer) == start + 8
+                    and self._verified_single_checksum_status(
+                        bytes(buffer[start : start + 8])
+                    )
+                    and status_tail_deadline is None
+                ):
+                    status_tail_deadline = min(
+                        deadline,
+                        time.monotonic() + _LEGACY_STATUS_TAIL_GRACE_SECONDS,
+                    )
                 if version_seen and not resent_after_version and not buffer:
                     sock.sendall(payload)
                     resent_after_version = True
                 if len(buffer) > 8192:
                     raise RelayProtocolError("relay response exceeded 8192 bytes")
         partial = bytes(buffer)
+        start = partial.find(_LEGACY_STATUS_HEADER)
+        if start >= 0 and self._verified_single_checksum_status(
+            partial[start : start + 8]
+        ):
+            return partial[start : start + 8]
         raise TimeoutError(
             "relay did not return a complete %s response; partial=%s"
             % (expect, partial.hex(" ") if partial else "<empty>")
@@ -2560,12 +2603,19 @@ class CorxLegacyTcpClient:
     def query(self) -> Tuple[Tuple[bool, bool, bool, bool], Optional[str]]:
         frame = self._exchange(self._query_frame(), "status")
         warnings = self._take_protocol_warnings()
-        if len(frame) != 9 or not frame.startswith(_LEGACY_STATUS_HEADER):
+        if len(frame) not in (8, 9) or not frame.startswith(_LEGACY_STATUS_HEADER):
             raise RelayProtocolError("invalid CORX B0 status frame")
         if frame[3] != self.target.address or frame[6] != 0x0D:
             raise RelayProtocolError("CORX B0 status address/end marker mismatch")
         expected = _double_checksum(frame[2:7])
-        if frame[7:9] != expected:
+        if len(frame) == 8:
+            if frame[7] != expected[0]:
+                raise RelayProtocolError("CORX B0 status checksum mismatch")
+            warnings.append(
+                "accepted verified single-checksum B0 response with omitted "
+                "second checksum byte"
+            )
+        elif frame[7:9] != expected:
             if frame[7] == expected[0] and frame[8] == 0xAA:
                 # Field-captured CX-5104E-L firmware verifies the B0 payload
                 # with the correct first checksum byte, but uses a fixed AA
