@@ -110,6 +110,7 @@ def _decode_power_payload(data, received_mono, source):
     label = _required_text(payload, "label", 256)
     detail = _required_text(payload, "detail", 4096)
     members = payload.get("members")
+    relay_channels = payload.get("relay_channels", [])
     if (
         state is None
         or _STATE_RE.fullmatch(state) is None
@@ -121,6 +122,8 @@ def _decode_power_payload(data, received_mono, source):
         or detail is None
         or not isinstance(members, list)
         or len(members) > 64
+        or not isinstance(relay_channels, list)
+        or len(relay_channels) > 4
     ):
         return None
     if broadcast_code and _BROADCAST_CODE_RE.fullmatch(broadcast_code) is None:
@@ -132,6 +135,14 @@ def _decode_power_payload(data, received_mono, source):
         or _BROADCAST_CODE_RE.fullmatch(member) is None
         for member in members
     ):
+        return None
+    if any(
+        isinstance(channel, bool)
+        or not isinstance(channel, int)
+        or channel < 1
+        or channel > 4
+        for channel in relay_channels
+    ) or len(relay_channels) != len(set(relay_channels)):
         return None
     # A true manager row has neither a group nor a trigger. An empty group
     # with a trigger is deliberately retained as an UNMAPPED device event.
@@ -149,6 +160,7 @@ def _decode_power_payload(data, received_mono, source):
         "broadcast_code": broadcast_code,
         "power_group": power_group,
         "members": list(members),
+        "relay_channels": sorted(relay_channels),
         "label": label,
         "detail": detail,
         "_received_mono": received,
@@ -291,13 +303,18 @@ def _compose_dashboard(stats_text, stats_received_mono, rows, now_mono):
             else:
                 lines.append("  GROUP %s" % power_group)
                 lines.append(
-                    "    NOW=%s  severity=%s  rx_age=%s  trigger=%s  members=%d"
+                    "    NOW=%s  severity=%s  rx_age=%s  trigger=%s  members=%d  "
+                    "relay=%s"
                     % (
                         state,
                         severity,
                         age_text,
                         trigger,
                         len(row["members"]),
+                        ",".join(
+                            str(channel) for channel in row["relay_channels"]
+                        )
+                        or "-",
                     )
                 )
             _append_detail(lines, detail)

@@ -31,6 +31,7 @@ def valid_payload(**changes):
         "broadcast_code": "",
         "power_group": "",
         "members": [],
+        "relay_channels": [],
         "label": "",
         "detail": "mode=auto worker=alive",
     }
@@ -83,6 +84,10 @@ class MonitorStateTest(unittest.TestCase):
             message(valid_payload(power_group=[])).data,
             message(valid_payload(members="not-an-array")).data,
             message(valid_payload(members=[7])).data,
+            message(valid_payload(relay_channels="1,2,3,4")).data,
+            message(valid_payload(relay_channels=[1, 1])).data,
+            message(valid_payload(relay_channels=[0, 1])).data,
+            message(valid_payload(relay_channels=[True])).data,
             message(valid_payload(detail={"bad": "type"})).data,
             "[" * 2000 + "]" * 2000,
             message(
@@ -165,6 +170,23 @@ class MonitorStateTest(unittest.TestCase):
         self.assertIn("UNMAPPED  trigger=1WEDH5900100001", rendered)
         self.assertNotIn("  MANAGER   NOW=UNMAPPED", rendered)
         self.assertIn("NOW=UNMAPPED", rendered)
+
+    def test_group_row_shows_normalized_relay_channel_set(self):
+        payload = valid_payload(
+            state="POWER_OFF_CONFIRMED",
+            severity="WARN",
+            event_id="event-1",
+            broadcast_code="1WEDH5900100001",
+            power_group="pit1",
+            members=["1WEDH5900100001"],
+            relay_channels=[4, 2, 1, 3],
+        )
+        row = MONITOR._decode_power_payload(
+            message(payload).data, 100.0, "power_status"
+        )
+        self.assertIsNotNone(row)
+        rendered = MONITOR._compose_dashboard("driver\n", 100.0, [row], 101.0)
+        self.assertIn("relay=1,2,3,4", rendered)
 
     def test_driver_stale_and_age_are_based_on_local_monotonic_receive_time(self):
         live = MONITOR._compose_dashboard("driver\n", 100.0, [], 104.9)

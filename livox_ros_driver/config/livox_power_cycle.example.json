@@ -32,7 +32,7 @@
   },
   "power_groups": {
     "pit-x-four-lidars": {
-      "label": "4台雷达共享供电-请替换广播码、继电器IP与通道",
+      "label": "4台雷达共享供电-请替换广播码和继电器IP并核对通道集合",
       "enabled": false,
       "members": [
         "EXAMPLE00000001",
@@ -44,7 +44,7 @@
         "protocol": "legacy_tcp",
         "host": "192.0.2.55",
         "port": 50000,
-        "channel": 1,
+        "channels": [1, 2, 3, 4],
         "address": 1,
         "allow_omitted_status_checksum": false
       }

@@ -126,6 +126,7 @@ def _group(
     port=50000,
     enabled=True,
     channel=1,
+    channels=None,
     allow_omitted=False,
     group_id=GROUP_ID,
     members=MEMBERS,
@@ -137,7 +138,7 @@ def _group(
         members=tuple(members),
         host="127.0.0.1",
         port=port,
-        channel=channel,
+        channels=tuple(channels) if channels is not None else (channel,),
         address=1,
         allow_omitted_status_checksum=allow_omitted,
     )
@@ -419,6 +420,119 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(len(configured_members), len(set(configured_members)))
         for code in configured_members:
             self.assertIsNotNone(config.group_for(code))
+        self.assertEqual(
+            next(iter(config.power_groups.values())).channels,
+            (1, 2, 3, 4),
+        )
+
+    def test_legacy_channel_and_multi_channels_are_both_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for relay, expected in (
+                ({"channel": 3}, (3,)),
+                ({"channels": [4, 2, 1, 3]}, (1, 2, 3, 4)),
+            ):
+                with self.subTest(relay=relay):
+                    path = Path(tmp) / ("config-%d.json" % len(expected))
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 2,
+                                "mode": "observe",
+                                "power_groups": {
+                                    "group": {
+                                        "members": list(MEMBERS),
+                                        "relay": dict(
+                                            relay,
+                                            protocol="legacy_tcp",
+                                            host="192.0.2.55",
+                                            port=50000,
+                                        ),
+                                    }
+                                },
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    target = manager.load_config(str(path)).power_groups["group"]
+                    self.assertEqual(target.channels, expected)
+
+    def test_channel_selection_rejects_ambiguous_or_unsafe_values(self):
+        invalid_relays = (
+            {},
+            {"channel": 1, "channels": [1, 2]},
+            {"channels": []},
+            {"channels": [1, 1]},
+            {"channels": [0, 1]},
+            {"channels": [1, 5]},
+            {"channels": [True]},
+            {"channels": "1,2,3,4"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, relay in enumerate(invalid_relays):
+                with self.subTest(relay=relay):
+                    path = Path(tmp) / ("invalid-%d.json" % index)
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 2,
+                                "mode": "observe",
+                                "power_groups": {
+                                    "group": {
+                                        "members": list(MEMBERS),
+                                        "relay": dict(
+                                            relay,
+                                            protocol="legacy_tcp",
+                                            host="192.0.2.55",
+                                            port=50000,
+                                        ),
+                                    }
+                                },
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(manager.ConfigurationError):
+                        manager.load_config(str(path))
+
+    def test_partially_overlapping_enabled_channel_sets_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "mode": "armed",
+                        "power_groups": {
+                            "group-one": {
+                                "enabled": True,
+                                "members": list(MEMBERS),
+                                "relay": {
+                                    "protocol": "legacy_tcp",
+                                    "host": "192.0.2.55",
+                                    "channels": [1, 2],
+                                },
+                            },
+                            "group-two": {
+                                "enabled": True,
+                                "members": [
+                                    "OTHERLIDAR00001",
+                                    "OTHERLIDAR00002",
+                                    "OTHERLIDAR00003",
+                                    "OTHERLIDAR00004",
+                                ],
+                                "relay": {
+                                    "protocol": "legacy_tcp",
+                                    "host": "192.0.2.55",
+                                    "channels": [2, 3],
+                                },
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(manager.ConfigurationError, "share relay"):
+                manager.load_config(str(path))
 
     def test_duplicate_enabled_channel_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -984,6 +1098,16 @@ class DeploymentTests(unittest.TestCase):
             self.assertEqual(first, expected)
             self.assertEqual(second, expected)
 
+    def test_endpoint_lock_identity_serializes_all_sets_on_same_relay(self):
+        single = _group(channel=2)
+        all_channels = _group(channels=(1, 2, 3, 4))
+        another_port = _group(port=50001, channels=(1, 2, 3, 4))
+        self.assertEqual(single.relay_endpoint_key, all_channels.relay_endpoint_key)
+        self.assertNotEqual(
+            single.relay_endpoint_key, another_port.relay_endpoint_key
+        )
+        self.assertNotEqual(single.power_key, all_channels.power_key)
+
     def test_driver_dropin_and_installer_migrate_legacy_unit_safely(self):
         template = (
             ROOT / "systemd" / "livox-ros-driver-power-cycle.conf.in"
@@ -1139,6 +1263,51 @@ class LegacyRelayClientTests(unittest.TestCase):
             client._set_frame(False),
             bytes.fromhex("CC DD A1 01 00 00 00 01 A3 46"),
         )
+
+    def test_four_channel_frames_use_one_atomic_mask(self):
+        target = _group(channels=(1, 2, 3, 4))
+        client = manager.CorxLegacyTcpClient(target, manager.Policy())
+        self.assertEqual(target.channel_mask, 0x0F)
+        self.assertEqual(
+            client._set_frame(True),
+            bytes.fromhex("CC DD A1 01 00 0F 00 0F C0 80"),
+        )
+        self.assertEqual(
+            client._set_frame(False),
+            bytes.fromhex("CC DD A1 01 00 00 00 0F B1 62"),
+        )
+
+    def test_four_channel_state_transition_is_confirmed_as_one_group(self):
+        with _RunningRelay() as relay:
+            target = _group(relay.port, channels=(1, 2, 3, 4))
+            client = manager.CorxLegacyTcpClient(
+                target,
+                _policy(
+                    connect_timeout_seconds=1,
+                    command_timeout_seconds=1,
+                    command_retries=2,
+                ),
+            )
+            client.ensure_state(False)
+            self.assertEqual(client.query()[0], (False, False, False, False))
+            client.ensure_state(True)
+            self.assertEqual(client.query()[0], (True, True, True, True))
+
+    def test_multi_channel_mask_does_not_change_unselected_outputs(self):
+        with _RunningRelay() as relay:
+            target = _group(relay.port, channels=(1, 3))
+            client = manager.CorxLegacyTcpClient(
+                target,
+                _policy(
+                    connect_timeout_seconds=1,
+                    command_timeout_seconds=1,
+                    command_retries=2,
+                ),
+            )
+            client.ensure_state(False)
+            self.assertEqual(client.query()[0], (False, True, False, True))
+            client.ensure_state(True)
+            self.assertEqual(client.query()[0], (True, True, True, True))
 
     def test_query_and_confirm_each_state_transition(self):
         with _RunningRelay() as relay:
@@ -1674,7 +1843,7 @@ class StoreTests(unittest.TestCase):
             reopened = manager.StateStore(str(path))
             obligations = reopened.obligations()
             self.assertEqual(len(obligations), 1)
-            self.assertEqual(obligations[0][0].channel, target.channel)
+            self.assertEqual(obligations[0][0].channels, target.channels)
             self.assertEqual(obligations[0][0].group_id, target.group_id)
             self.assertEqual(obligations[0][1], request.event_id)
             self.assertEqual(obligations[0][2], MEMBERS[2])
@@ -1687,6 +1856,37 @@ class StoreTests(unittest.TestCase):
             )
             self.assertFalse(allowed)
             self.assertEqual(reason, "cooldown")
+
+    def test_four_channel_obligation_survives_reopen_without_identity_loss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite3"
+            store = manager.StateStore(str(path))
+            request = manager.PowerCycleRequest.from_state(_required_state())
+            target = _group(channels=(1, 2, 3, 4))
+            ready, _, _ = store.start_event(
+                request, target.group_id, target.power_key, 60
+            )
+            self.assertTrue(ready)
+            cycle_id, reason, _ = store.reserve_cycle(
+                request, target, manager.Policy()
+            )
+            self.assertIsNotNone(cycle_id)
+            self.assertEqual(reason, "ok")
+            store.set_obligation(request, target)
+
+            restored = manager.StateStore(str(path)).obligations()[0][0]
+            self.assertEqual(restored.channels, (1, 2, 3, 4))
+            self.assertEqual(restored.channel_mask, 0x0F)
+            self.assertEqual(restored.power_key, target.power_key)
+            self.assertIn("|channels=1,2,3,4", restored.power_key)
+
+    def test_single_channel_power_identity_remains_backward_compatible(self):
+        target = _group(channel=3)
+        self.assertEqual(
+            target.power_key,
+            "legacy_tcp|127.0.0.1|50000|1|3",
+        )
+        self.assertEqual(target.persisted_channel, 3)
 
     def test_cooldown_and_daily_limit_are_shared_by_all_group_members(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2055,6 +2255,7 @@ class StoreTests(unittest.TestCase):
 class _FakeRelay:
     states = [True, True, True, True]
     transitions = []
+    snapshots = []
     lock = threading.Lock()
 
     def __init__(self, target, policy):
@@ -2065,6 +2266,7 @@ class _FakeRelay:
         with cls.lock:
             cls.states = [on, True, True, True]
             cls.transitions = []
+            cls.snapshots = []
 
     def query(self):
         with self.lock:
@@ -2072,8 +2274,10 @@ class _FakeRelay:
 
     def ensure_state(self, state, retries=None, deadline_seconds=None):
         with self.lock:
-            self.states[self.target.channel - 1] = state
+            for channel in self.target.channels:
+                self.states[channel - 1] = state
             self.transitions.append(state)
+            self.snapshots.append(tuple(self.states))
         return None
 
 
@@ -2107,7 +2311,8 @@ class _DropTargetAfterEnsureOnRelay(_FakeRelay):
     def query(self):
         with self.lock:
             if type(self).drop_on_next_query:
-                self.states[self.target.channel - 1] = False
+                for channel in self.target.channels:
+                    self.states[channel - 1] = False
                 type(self).drop_on_next_query = False
         return super().query()
 
@@ -2944,6 +3149,58 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(row["broadcast_code"], trigger)
             self.assertEqual(row["power_group"], GROUP_ID)
             self.assertEqual(tuple(row["members"]), MEMBERS)
+
+    def test_four_channel_group_cycles_all_outputs_and_recovers_all_members(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            statuses = []
+            verified = threading.Event()
+
+            def emit(row):
+                statuses.append(dict(row))
+                if row["state"] == "RECOVERY_VERIFIED":
+                    verified.set()
+
+            _FakeRelay.reset(on=True)
+            policy = _policy(
+                off_seconds=0.01,
+                boot_timeout_seconds=2,
+                healthy_seconds=0.05,
+                status_stale_seconds=1,
+                minimum_cycle_interval_seconds=60,
+            )
+            target = _group(channels=(1, 2, 3, 4))
+            config = _config(Path(tmp) / "state.sqlite3", target, policy=policy)
+            core = manager.PowerCycleManagerCore(
+                config,
+                manager.StateStore(config.state_db),
+                emit,
+                relay_factory=_FakeRelay,
+            )
+            core.start()
+            _trigger_group(core, _required_state(MEMBERS[1]))
+
+            def publish_recovery():
+                _wait_until(
+                    lambda: any(
+                        row["state"] == "POWER_ON_CONFIRMED"
+                        for row in statuses
+                    ),
+                    timeout=1,
+                )
+                time.sleep(0.02)
+                _publish_health(core, repeats=6)
+
+            feeder = threading.Thread(target=publish_recovery)
+            feeder.start()
+            self.assertTrue(verified.wait(3), statuses)
+            feeder.join(timeout=2)
+            core.stop()
+            self.assertEqual(_FakeRelay.transitions, [False, True])
+            self.assertEqual(
+                _FakeRelay.snapshots,
+                [(False, False, False, False), (True, True, True, True)],
+            )
+            self.assertFalse(manager.StateStore(config.state_db).obligations())
 
     def test_wake_dropout_triggers_one_shared_cycle_and_group_recovery(self):
         with tempfile.TemporaryDirectory() as tmp:

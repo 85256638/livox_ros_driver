@@ -6,7 +6,7 @@ soft-recovery/attribution path reaches one of four strict causes: a live-
 broadcast handshake stall, an explicit low-power wake dropout, a sustained
 dropout after healthy Normal publication, or a configured member missing at
 startup.  This independent ROS node validates cause-specific live evidence and an explicit power-group
-whitelist (one or more broadcast codes sharing one relay channel), applies
+whitelist (one or more broadcast codes sharing a configured relay-channel set), applies
 persistent group-level rate limits, confirms every relay state transition, and
 verifies that every group member resumes point-cloud publication after power is
 restored.
@@ -153,20 +153,115 @@ class PowerGroup:
     members: Tuple[str, ...]
     host: str
     port: int
-    channel: int
+    channels: Tuple[int, ...]
     address: int = 1
     allow_omitted_status_checksum: bool = False
 
+    def __post_init__(self) -> None:
+        if (
+            not self.channels
+            or len(self.channels) > 4
+            or any(
+                isinstance(channel, bool)
+                or not isinstance(channel, int)
+                or channel < 1
+                or channel > 4
+                for channel in self.channels
+            )
+            or tuple(sorted(set(self.channels))) != self.channels
+        ):
+            raise ValueError(
+                "relay channels must be unique ascending integers from 1 to 4"
+            )
+
     @property
     def power_key(self) -> str:
-        """Stable physical identity used for rate limits and endpoint locks."""
+        """Stable selected-output identity used for rate limits and bindings."""
 
-        return "legacy_tcp|%s|%d|%d|%d" % (
+        if len(self.channels) == 1:
+            # Preserve the deployed single-channel identity exactly so an
+            # upgrade cannot reset its cooldown, daily budget, or must-be-ON
+            # obligation merely because multi-channel support was added.
+            channel_identity = str(self.channels[0])
+        else:
+            channel_identity = "channels=" + ",".join(
+                str(channel) for channel in self.channels
+            )
+        return "legacy_tcp|%s|%d|%d|%s" % (
             self.host,
             self.port,
             self.address,
-            self.channel,
+            channel_identity,
         )
+
+    @property
+    def channel_mask(self) -> int:
+        return sum(1 << (channel - 1) for channel in self.channels)
+
+    @property
+    def persisted_channel(self) -> int:
+        """Backward-compatible SQLite field; multi-channel rows store a mask."""
+
+        return self.channels[0] if len(self.channels) == 1 else self.channel_mask
+
+    @property
+    def channels_text(self) -> str:
+        return ",".join(str(channel) for channel in self.channels)
+
+    @property
+    def relay_endpoint_key(self) -> str:
+        """Physical controller identity used to serialize every A1 writer."""
+
+        return "legacy_tcp|%s|%d|%d" % (
+            self.host,
+            self.port,
+            self.address,
+        )
+
+
+def _channels_from_persisted(power_key: str, stored: int) -> Tuple[int, ...]:
+    """Decode the v5 SQLite channel field without changing old identities."""
+
+    marker = "|channels="
+    if marker not in power_key:
+        if stored < 1 or stored > 4:
+            raise StateStoreError("persisted single relay channel is invalid")
+        return (stored,)
+    if stored < 1 or stored > 0x0F:
+        raise StateStoreError("persisted relay channel mask is invalid")
+    channels = tuple(
+        channel for channel in range(1, 5) if stored & (1 << (channel - 1))
+    )
+    encoded = power_key.split(marker, 1)[1]
+    if encoded != ",".join(str(channel) for channel in channels):
+        raise StateStoreError(
+            "persisted relay channel mask does not match its power identity"
+        )
+    return channels
+
+
+def _unexpected_selected_channels(
+    target: PowerGroup, states: Sequence[bool], expected: bool
+) -> List[int]:
+    return [
+        channel
+        for channel in target.channels
+        if bool(states[channel - 1]) is not expected
+    ]
+
+
+def _changed_non_target_channels(
+    target: PowerGroup,
+    baseline: Sequence[bool],
+    current: Sequence[bool],
+) -> List[int]:
+    selected = set(target.channels)
+    return [
+        index + 1
+        for index in range(4)
+        if index + 1 not in selected
+        and bool(current[index]) != bool(baseline[index])
+    ]
 
 
 @dataclass(frozen=True)
@@ -1105,7 +1200,7 @@ def load_config(path: str) -> ManagerConfig:
         raise ConfigurationError("power_groups must be an object keyed by group id")
     power_groups: Dict[str, PowerGroup] = {}
     member_to_group: Dict[str, str] = {}
-    occupied: Dict[Tuple[str, int, int], str] = {}
+    occupied: Dict[Tuple[str, int, int, int], str] = {}
     for key, row in group_rows.items():
         group_id = _power_group_id(key)
         if not isinstance(row, Mapping):
@@ -1153,6 +1248,7 @@ def load_config(path: str) -> ManagerConfig:
                 "host",
                 "port",
                 "channel",
+                "channels",
                 "address",
                 "allow_omitted_status_checksum",
             ),
@@ -1176,7 +1272,41 @@ def load_config(path: str) -> ManagerConfig:
                 "power_groups.%s.relay.host is unsafe" % group_id
             )
         port = _integer(relay, "port", default=50000, minimum=1, maximum=65535)
-        channel = _integer(relay, "channel", minimum=1, maximum=4)
+        has_channel = "channel" in relay
+        has_channels = "channels" in relay
+        if has_channel == has_channels:
+            raise ConfigurationError(
+                "power_groups.%s.relay must define exactly one of channel or "
+                "channels" % group_id
+            )
+        if has_channel:
+            channels = (_integer(relay, "channel", minimum=1, maximum=4),)
+        else:
+            raw_channels = relay.get("channels")
+            if not isinstance(raw_channels, list) or not raw_channels:
+                raise ConfigurationError(
+                    "power_groups.%s.relay.channels must be a non-empty list"
+                    % group_id
+                )
+            parsed_channels: List[int] = []
+            for index, raw_channel in enumerate(raw_channels):
+                if isinstance(raw_channel, bool) or not isinstance(raw_channel, int):
+                    raise ConfigurationError(
+                        "power_groups.%s.relay.channels[%d] must be an integer"
+                        % (group_id, index)
+                    )
+                if raw_channel < 1 or raw_channel > 4:
+                    raise ConfigurationError(
+                        "power_groups.%s.relay.channels[%d] must be between 1 and 4"
+                        % (group_id, index)
+                    )
+                if raw_channel in parsed_channels:
+                    raise ConfigurationError(
+                        "power_groups.%s.relay.channels contains duplicate %d"
+                        % (group_id, raw_channel)
+                    )
+                parsed_channels.append(raw_channel)
+            channels = tuple(sorted(parsed_channels))
         address = _integer(relay, "address", default=1, minimum=0, maximum=255)
         allow_omitted = _boolean(
             relay, "allow_omitted_status_checksum", False
@@ -1188,25 +1318,28 @@ def load_config(path: str) -> ManagerConfig:
             members=tuple(members),
             host=str(ip),
             port=port,
-            channel=channel,
+            channels=channels,
             address=address,
             allow_omitted_status_checksum=allow_omitted,
         )
         if enabled:
-            endpoint = (target.host, target.port, target.channel)
-            previous = occupied.get(endpoint)
-            if previous is not None:
-                raise ConfigurationError(
-                    "enabled power groups %s and %s share relay %s:%d channel %d"
-                    % (
-                        previous,
-                        group_id,
-                        target.host,
-                        target.port,
-                        target.channel,
+            for channel in target.channels:
+                endpoint = (target.host, target.port, target.address, channel)
+                previous = occupied.get(endpoint)
+                if previous is not None:
+                    raise ConfigurationError(
+                        "enabled power groups %s and %s share relay %s:%d "
+                        "address %d channel %d"
+                        % (
+                            previous,
+                            group_id,
+                            target.host,
+                            target.port,
+                            target.address,
+                            channel,
+                        )
                     )
-                )
-            occupied[endpoint] = group_id
+                occupied[endpoint] = group_id
         power_groups[group_id] = target
     if mode == "armed" and not any(
         group.enabled for group in power_groups.values()
@@ -2047,7 +2180,7 @@ class StateStore:
     ) -> None:
         """Atomically archive proven ON and release an unused reservation.
 
-        The caller must first confirm the physical target channel ON via B0.
+        The caller must first confirm every selected physical channel ON via B0.
         If either the cycle update or obligation delete fails, SQLite rolls
         both changes back: the must-ON obligation remains and the safety budget
         stays conservatively charged.
@@ -2109,7 +2242,7 @@ class StateStore:
                     json.dumps(list(target.members), separators=(",", ":")),
                     target.host,
                     target.port,
-                    target.channel,
+                    target.persisted_channel,
                     target.address,
                     1 if target.allow_omitted_status_checksum else 0,
                     target.label,
@@ -2153,15 +2286,15 @@ class StateStore:
     ) -> List[Tuple[PowerGroup, str, str, str, float]]:
         with self._db() as db:
             rows = db.execute(
-                "SELECT group_id,event_id,trigger_bcode,members_json,host,port,"
-                "channel,address,allow_omitted_checksum,label,recovery_reason,"
-                "last_attempt "
+                "SELECT power_key,group_id,event_id,trigger_bcode,members_json,"
+                "host,port,channel,address,allow_omitted_checksum,label,"
+                "recovery_reason,last_attempt "
                 "FROM power_obligations"
             ).fetchall()
         result: List[Tuple[PowerGroup, str, str, str, float]] = []
         for row in rows:
             try:
-                raw_members = json.loads(str(row[3]))
+                raw_members = json.loads(str(row[4]))
                 if not isinstance(raw_members, list) or len(raw_members) != 4:
                     raise ValueError("members snapshot must contain exactly four")
                 members = tuple(_broadcast_code(item) for item in raw_members)
@@ -2169,25 +2302,30 @@ class StateStore:
                 raise StateStoreError(
                     "invalid members snapshot in persisted ON obligation: %s" % exc
                 ) from exc
+            power_key = str(row[0])
             target = PowerGroup(
-                group_id=str(row[0]),
-                label=str(row[9]),
+                group_id=str(row[1]),
+                label=str(row[10]),
                 enabled=True,
                 members=members,
-                host=str(row[4]),
-                port=int(row[5]),
-                channel=int(row[6]),
-                address=int(row[7]),
-                allow_omitted_status_checksum=bool(row[8]),
+                host=str(row[5]),
+                port=int(row[6]),
+                channels=_channels_from_persisted(power_key, int(row[7])),
+                address=int(row[8]),
+                allow_omitted_status_checksum=bool(row[9]),
             )
-            reason = str(row[10])
+            if target.power_key != power_key:
+                raise StateStoreError(
+                    "persisted ON obligation relay identity is inconsistent"
+                )
+            reason = str(row[11])
             if reason not in RECOVERY_REASONS:
                 raise StateStoreError(
                     "invalid recovery reason in persisted ON obligation: %s"
                     % reason
                 )
             result.append(
-                (target, str(row[1]), str(row[2]), reason, float(row[11]))
+                (target, str(row[2]), str(row[3]), reason, float(row[12]))
             )
         return result
 
@@ -2213,7 +2351,7 @@ class StateStore:
     ) -> Tuple[Optional[str], str]:
         now = time.time()
         reported_status: Optional[str] = None
-        reported_detail = "startup/watchdog confirmed relay channel ON"
+        reported_detail = "startup/watchdog confirmed selected relay channels ON"
         with self._db() as db:
             cycle = db.execute(
                 "SELECT id,off_confirmed_at FROM power_cycles WHERE event_id=?",
@@ -2285,7 +2423,7 @@ class StateStore:
                             target.power_key,
                             target.host,
                             target.port,
-                            target.channel,
+                            target.persisted_channel,
                             target.address,
                             now,
                             now,
@@ -2335,7 +2473,7 @@ def _double_checksum(body: bytes) -> bytes:
 
 
 class CorxLegacyTcpClient:
-    """Minimal verified single-channel client; never exposes an all-off call."""
+    """Verified whitelisted-channel client; never exposes an unscoped all-off."""
 
     def __init__(self, target: PowerGroup, policy: Policy) -> None:
         self.target = target
@@ -2346,7 +2484,7 @@ class CorxLegacyTcpClient:
         return _LEGACY_COMMAND_HEADER + body + _double_checksum(body)
 
     def _set_frame(self, state: bool) -> bytes:
-        enable_mask = 1 << (self.target.channel - 1)
+        enable_mask = self.target.channel_mask
         control_mask = enable_mask if state else 0
         body = bytes((0xA1, self.target.address))
         body += control_mask.to_bytes(2, "big")
@@ -2444,16 +2582,29 @@ class CorxLegacyTcpClient:
             attempts_done = attempt
             try:
                 states, warning = self.query()
-                if states[self.target.channel - 1] is state:
+                unexpected = [
+                    channel
+                    for channel in self.target.channels
+                    if states[channel - 1] is not state
+                ]
+                if not unexpected:
                     return warning
                 self._send_set(state)
                 time.sleep(0.2)
                 states, warning = self.query()
-                if states[self.target.channel - 1] is state:
+                unexpected = [
+                    channel
+                    for channel in self.target.channels
+                    if states[channel - 1] is not state
+                ]
+                if not unexpected:
                     return warning
                 last_error = RelayProtocolError(
-                    "relay channel %d remained %s"
-                    % (self.target.channel, "ON" if not state else "OFF")
+                    "relay channel(s) %s remained %s"
+                    % (
+                        ",".join(str(channel) for channel in unexpected),
+                        "ON" if not state else "OFF",
+                    )
                 )
             except (OSError, TimeoutError, RelayProtocolError) as exc:
                 last_error = exc
@@ -2467,9 +2618,9 @@ class CorxLegacyTcpClient:
                 time.sleep(delay)
         assert last_error is not None
         raise RelayProtocolError(
-            "cannot confirm channel %d %s after %d attempt(s): %s"
+            "cannot confirm channel(s) %s %s after %d attempt(s): %s"
             % (
-                self.target.channel,
+                self.target.channels_text,
                 "ON" if state else "OFF",
                 attempts_done,
                 last_error,
@@ -2922,26 +3073,30 @@ class PowerCycleManagerCore:
                 self._emit(
                     "RELAY_PROTOCOL_WARNING", request, "WARN", restored_warning
                 )
-            if not restored_states[target.channel - 1]:
+            unexpected = _unexpected_selected_channels(
+                target, restored_states, True
+            )
+            if unexpected:
                 raise RelayProtocolError(
-                    "latest B0 query no longer confirms target channel ON"
+                    "latest B0 query does not confirm channel(s) %s ON"
+                    % ",".join(str(channel) for channel in unexpected)
                 )
-            changed = [
-                index + 1
-                for index in range(4)
-                if index != target.channel - 1
-                and bool(restored_states[index]) != bool(baseline_states[index])
-            ]
+            changed = _changed_non_target_channels(
+                target, baseline_states, restored_states
+            )
             if changed:
                 detail = (
-                    "%s; non-target relay channel(s) changed: %s; target "
-                    "remains ON"
+                    "%s; non-target relay channel(s) changed: %s; selected "
+                    "channels remain ON"
                     % (reason, ",".join(str(item) for item in changed))
                 )
                 state = "NON_TARGET_STATE_CHANGED"
                 severity = "CRITICAL"
             else:
-                detail = "%s; no OFF was sent and target channel is confirmed ON" % reason
+                detail = (
+                    "%s; no OFF was sent and selected channel(s) %s are "
+                    "confirmed ON" % (reason, target.channels_text)
+                )
             self.store.confirm_on_and_cancel_before_off(
                 cycle_id,
                 target.power_key,
@@ -3012,14 +3167,17 @@ class PowerCycleManagerCore:
             return
         if warning:
             self._emit("RELAY_PROTOCOL_WARNING", request, "WARN", warning)
-        if not states[target.channel - 1]:
+        unexpected = _unexpected_selected_channels(target, states, True)
+        if unexpected:
             self._terminal(
                 request,
                 "MAPPING_MISMATCH",
                 "CRITICAL",
-                "shared channel is already OFF while the triggering recovery "
+                "selected channel(s) %s are already OFF while the triggering "
+                "recovery "
                 "condition is still live; refusing to energize an unverified "
-                "power group",
+                "power group"
+                % ",".join(str(channel) for channel in unexpected),
             )
             return
 
@@ -3180,12 +3338,7 @@ class PowerCycleManagerCore:
                 )
             return
         def changed_non_target_channels(current_states: Sequence[bool]) -> List[int]:
-            return [
-                index + 1
-                for index in range(4)
-                if index != target.channel - 1
-                and bool(current_states[index]) != bool(states[index])
-            ]
+            return _changed_non_target_channels(target, states, current_states)
 
         # Commit the must-be-ON obligation before the first OFF command.  A
         # crash at any later instruction is repaired on process restart.
@@ -3246,8 +3399,8 @@ class PowerCycleManagerCore:
                 "POWER_OFF_COMMAND",
                 request,
                 "WARN",
-                "%s %s:%d channel %d"
-                % (target.label, target.host, target.port, target.channel)
+                "%s %s:%d channel(s) %s"
+                % (target.label, target.host, target.port, target.channels_text)
                 + " powers %d LiDARs" % len(target.members),
             )
             warning = relay.ensure_state(False)
@@ -3260,9 +3413,11 @@ class PowerCycleManagerCore:
                 self._emit(
                     "RELAY_PROTOCOL_WARNING", request, "WARN", off_warning
                 )
-            if off_states[target.channel - 1]:
+            unexpected = _unexpected_selected_channels(target, off_states, False)
+            if unexpected:
                 raise RelayProtocolError(
-                    "latest B0 query no longer confirms target channel OFF"
+                    "latest B0 query does not confirm channel(s) %s OFF"
+                    % ",".join(str(channel) for channel in unexpected)
                 )
             changed = changed_non_target_channels(off_states)
             if changed:
@@ -3275,7 +3430,8 @@ class PowerCycleManagerCore:
                 "POWER_OFF_CONFIRMED",
                 request,
                 "WARN",
-                "channel OFF confirmed; holding %.1fs" % policy.off_seconds,
+                "channel(s) %s OFF confirmed; holding %.1fs"
+                % (target.channels_text, policy.off_seconds),
             )
             if self.stop_event.wait(policy.off_seconds):
                 raise RelayProtocolError(
@@ -3302,9 +3458,11 @@ class PowerCycleManagerCore:
                     self._emit(
                         "RELAY_PROTOCOL_WARNING", request, "WARN", on_warning
                     )
-                if not on_states[target.channel - 1]:
+                unexpected = _unexpected_selected_channels(target, on_states, True)
+                if unexpected:
                     raise RelayProtocolError(
-                        "latest B0 query no longer confirms target channel ON"
+                        "latest B0 query does not confirm channel(s) %s ON"
+                        % ",".join(str(channel) for channel in unexpected)
                     )
                 changed = changed_non_target_channels(on_states)
                 if changed:
@@ -3320,8 +3478,8 @@ class PowerCycleManagerCore:
                     "POWER_ON_CONFIRMED",
                     request,
                     "INFO",
-                    "shared channel ON confirmed; waiting for all %d members"
-                    % len(target.members),
+                    "shared channel(s) %s ON confirmed; waiting for all %d "
+                    "members" % (target.channels_text, len(target.members)),
                 )
             except Exception as exc:
                 self._emit(
@@ -3345,7 +3503,11 @@ class PowerCycleManagerCore:
             )
             return
         if non_target_error:
-            detail = non_target_error + "; target channel is confirmed ON"
+            detail = (
+                non_target_error
+                + "; selected channel(s) %s are confirmed ON"
+                % target.channels_text
+            )
             self.store.finish_cycle(
                 cycle_id, "NON_TARGET_STATE_CHANGED", detail
             )
@@ -3355,8 +3517,11 @@ class PowerCycleManagerCore:
             return
         if not off_confirmed or not off_phase_ok:
             detail = (
-                "%s; target channel is confirmed ON"
-                % (phase_error or "OFF phase did not complete")
+                "%s; selected channel(s) %s are confirmed ON"
+                % (
+                    phase_error or "OFF phase did not complete",
+                    target.channels_text,
+                )
             )
             self.store.finish_cycle(cycle_id, "POWER_CYCLE_FAILED", detail)
             self._terminal(request, "POWER_CYCLE_FAILED", "ERROR", detail)
@@ -3617,6 +3782,7 @@ class PowerCycleManagerCore:
             "recovery_reason": recovery_reason or request.recovery_reason,
             "power_group": target.group_id if target else "",
             "members": list(target.members) if target else [],
+            "relay_channels": list(target.channels) if target else [],
             "label": target.label if target else request.broadcast_code,
             "detail": detail,
         }
@@ -3644,14 +3810,14 @@ def check_relays(config: ManagerConfig) -> int:
             states, warning = CorxLegacyTcpClient(target, config.policy).query()
             suffix = " WARNING=%s" % warning if warning else ""
             print(
-                "OK group=%s (%s) members=%d %s:%d channel=%d states=%s%s"
+                "OK group=%s (%s) members=%d %s:%d channels=%s states=%s%s"
                 % (
                     group_id,
                     target.label,
                     len(target.members),
                     target.host,
                     target.port,
-                    target.channel,
+                    target.channels_text,
                     ",".join("ON" if value else "OFF" for value in states),
                     suffix,
                 )
@@ -3713,13 +3879,16 @@ def _acquire_endpoint_locks(
     """Lock canonical physical endpoints, independent of config/DB filename."""
 
     lock_root = _endpoint_lock_root()
-    unique = {target.power_key: target for target in targets}
+    # Serialize the whole TCP controller, not merely one configured channel
+    # set. A1 is a read/modify-mask protocol, so two independent managers for
+    # overlapping or disjoint sets on the same relay must never race.
+    endpoint_keys = {target.relay_endpoint_key for target in targets}
     streams: List[Any] = []
     try:
-        for power_key in sorted(unique):
-            digest = hashlib.sha256(power_key.encode("utf-8")).hexdigest()
+        for endpoint_key in sorted(endpoint_keys):
+            digest = hashlib.sha256(endpoint_key.encode("utf-8")).hexdigest()
             path = os.path.join(lock_root, "endpoint-%s.lock" % digest)
-            streams.append(_acquire_file_lock(path, power_key))
+            streams.append(_acquire_file_lock(path, endpoint_key))
         return streams
     except BaseException:
         for stream in reversed(streams):
@@ -3921,6 +4090,7 @@ def run_ros(config: ManagerConfig) -> int:
             "broadcast_code": "",
             "power_group": "",
             "members": [],
+            "relay_channels": [],
             "label": "",
             "detail": "mode=%s worker=alive queue=%d obligations=%d"
             % (config.mode, core.queue_size(), store.obligation_count()),
@@ -3959,6 +4129,7 @@ def run_ros(config: ManagerConfig) -> int:
             "broadcast_code": "",
             "power_group": "",
             "members": [],
+            "relay_channels": [],
             "label": "",
             "detail": "mode=%s enabled_groups=%d enabled_members=%d "
             "obligations=%d state_db=%s"
