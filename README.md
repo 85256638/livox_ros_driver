@@ -62,10 +62,30 @@ git -C "$HOME/catkin_ws/src/livox_ros_driver" restore --staged -- livox_ros_driv
 
 如果 SDK 或 Driver 还有其他 tracked 修改、本地未推送 commit、分支分叉，或者来源不明的 untracked 源码/CMake 文件，必须停止迁移并先审阅；不要用 `git reset --hard`、不要删除仓库，也不要为了绕过检查而 stash Driver 现场配置。
 
-尚未取得集成版脚本、当前仍在旧分支或旧独立 manager unit 的工位，运行下面这一条迁移命令；它先通过代理 fetch 新脚本并完成保配置更新/编译，再安装或迁移 Driver 安全钩子，最后复查并重启，不会先 checkout 覆盖现场文件：
+尚未取得集成版脚本、当前仍在旧分支或旧独立 manager unit 的工位，如果已有现场配置已经完整，或者接受新版第一次启动时继电器仍保持默认关闭，可以运行下面这一条完整迁移命令。它先通过代理 fetch 新脚本并完成保配置更新/编译，再安装或迁移 Driver 安全钩子，最后复查并重启，不会先 checkout 覆盖现场文件：
 
 ```bash
 if [ -d "$HOME/Livox-SDK/.git" ]; then git -C "$HOME/Livox-SDK" remote set-url origin https://github.com/85256638/Livox-SDK.git || exit 1; fi && git -C "$HOME/catkin_ws/src/livox_ros_driver" remote set-url origin https://github.com/85256638/livox_ros_driver.git && git -c http.proxy=socks5h://127.0.0.1:9909 -c https.proxy=socks5h://127.0.0.1:9909 -C "$HOME/catkin_ws/src/livox_ros_driver" fetch origin "refs/heads/network-relay-added:refs/remotes/origin/network-relay-added" && git -C "$HOME/catkin_ws/src/livox_ros_driver" show "origin/network-relay-added:update_livox_geph.sh" > /tmp/update_livox_geph.sh && LIVOX_JOBS=2 bash /tmp/update_livox_geph.sh --preserve-site-config && bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" && LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --restart-service
+```
+
+旧版没有 `relay_power_cycle_enable` 或 `~/.config/livox/power_cycle.json`，并且要求**新版第一次启动就使用人工确认后的参数**时，不要执行上一条到底；按下面三阶段操作。
+
+**阶段1：只准备新版，不切换正在运行的旧进程。** 下面这一条会更新/安装 SDK、更新并编译 Driver、把继电器入口安全合入现场 launch、生成缺失的外部继电器 JSON，并安装 systemd 安全钩子；由于没有 `--restart-service`，内存中的旧 Driver 继续运行：
+
+```bash
+if [ -d "$HOME/Livox-SDK/.git" ]; then git -C "$HOME/Livox-SDK" remote set-url origin https://github.com/85256638/Livox-SDK.git || exit 1; fi && git -C "$HOME/catkin_ws/src/livox_ros_driver" remote set-url origin https://github.com/85256638/livox_ros_driver.git && git -c http.proxy=socks5h://127.0.0.1:9909 -c https.proxy=socks5h://127.0.0.1:9909 -C "$HOME/catkin_ws/src/livox_ros_driver" fetch origin "refs/heads/network-relay-added:refs/remotes/origin/network-relay-added" && git -C "$HOME/catkin_ws/src/livox_ros_driver" show "origin/network-relay-added:update_livox_geph.sh" > /tmp/update_livox_geph.sh && LIVOX_JOBS=2 bash /tmp/update_livox_geph.sh --preserve-site-config && bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh"
+```
+
+**阶段2：人工修改并校验磁盘上的新版配置。** 此时新参数和新文件已经存在，但尚未被正在运行的旧进程读取。按下一节清单修改 Driver JSON、multi launch 和外部继电器 JSON；如果要在新版第一次启动时启用自动硬恢复，应在人工接线验收后同时设置 `power_groups.<组>.enabled=true` 和 `relay_power_cycle_enable=true`。先运行下面这一条离线校验；只有两项都成功且最后输出 `Site identity valid` 才进入阶段3：
+
+```bash
+python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py" --config "$HOME/.config/livox/power_cycle.json" --validate-config && python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/validate_livox_power_cycle_site.py" --relay-config "$HOME/.config/livox/power_cycle.json" --driver-config "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_lidar_config_multi.json" --launch "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_lidar_multi.launch"
+```
+
+**阶段3：切换到已配置好的新版。** 保持 Geph 开启并执行下面这一条；版本未变化时会跳过重复编译，但仍会安全暂存/恢复现场 JSON 和 launch、再次校验继电器身份与安全钩子，全部成功后才重启服务。新 Driver 第一次启动就会读取阶段2保存的参数：
+
+```bash
+LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --preserve-site-config --restart-service
 ```
 
 ##### 迁移后必须人工核对的现场配置
