@@ -46,6 +46,13 @@
 #include "livox_ros_driver/LidarMode.h"
 #include "livox_ros_driver/LidarReboot.h"
 
+#ifndef LIVOX_DRIVER_GIT_COMMIT
+#define LIVOX_DRIVER_GIT_COMMIT "unknown"
+#endif
+#ifndef LIVOX_SDK_GIT_COMMIT
+#define LIVOX_SDK_GIT_COMMIT "unknown"
+#endif
+
 using namespace livox_ros;
 
 const int32_t kSdkVersionMajorLimit = 2;
@@ -56,6 +63,23 @@ static LdsLidar *g_read_lidar = nullptr;
  *  the field. Broadcast Normal remains one logical service request, but its
  *  per-device sends are queued 0/2/4/6 seconds apart by the 1 Hz mode tick. */
 static const uint32_t kBroadcastNormalStaggerMs = 2000;
+
+/** Keep build identifiers readable while retaining enough SHA to identify the
+ * exact immutable source.  These strings are embedded by CMake, so updating a
+ * checkout without restarting the service cannot falsify the dashboard. */
+static std::string ShortBuildCommit(const char *commit) {
+  const std::string value = commit == nullptr ? "unknown" : commit;
+  return value.size() > 12 ? value.substr(0, 12) : value;
+}
+
+static std::string LinkedSdkVersion() {
+  LivoxSdkVersion version;
+  GetLivoxSdkVersion(&version);
+  char text[32];
+  snprintf(text, sizeof(text), "%d.%d.%d", version.major, version.minor,
+           version.patch);
+  return text;
+}
 
 /** A broadcast service request must only target a live SDK handle.  ResetLidar
  *  deliberately sets LidarDevice::handle to kMaxSourceLidar, so checking both
@@ -794,17 +818,24 @@ void StatsTimerCb(const ros::TimerEvent &) {
     do_snapshot = true;
   }
 
-  std::ostringstream table;
+  std::ostringstream current_table;
+  std::ostringstream recent_table;
   std::ostringstream active_alerts;
   std::ostringstream process_history;
-  static const char kDashboardRowFormat[] =
-      "%-2.2s  %-15.15s  %-20.20s  %-10.10s  %6.6s  %7.7s  %7.7s  "
-      "%-10.10s  %11.11s  %5.5s\n";
-  char table_header[160];
-  snprintf(table_header, sizeof(table_header), kDashboardRowFormat, "ID",
-           "broadcast_code", "NOW", "TREND", "recv/s", "loss60",
-           "qdrop60", "HW", "link_up", "HS60");
-  table << table_header;
+  static const char kCurrentRowFormat[] =
+      "%-2.2s  %-15.15s  %-20.20s  %-10.10s  %7.7s  %-10.10s  %11.11s\n";
+  static const char kRecentRowFormat[] =
+      "%-2.2s  %-15.15s  %12.12s  %11.11s  %18.18s\n";
+  char current_header[128];
+  char recent_header[128];
+  snprintf(current_header, sizeof(current_header), kCurrentRowFormat, "ID",
+           "broadcast_code", "CURRENT", "ASSESS", "points/s", "HW",
+           "connected");
+  snprintf(recent_header, sizeof(recent_header), kRecentRowFormat, "ID",
+           "broadcast_code", "packet_loss", "queue_drops",
+           "handshake_timeouts");
+  current_table << current_header;
+  recent_table << recent_header;
   bool any_active_alert = false;
   bool any_process_history = false;
   uint32_t known_count = 0;
@@ -932,7 +963,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
 
       /** Watch "should be DELIVERING points but is not" -- keyed on published
        *  packets, not received ones. A lidar stuck mid-configure keeps
-       *  receiving into a full queue that nobody consumes (recv/s normal,
+       *  receiving into a full queue that nobody consumes (points/s normal,
        *  drop 100%, zero ROS output; field-confirmed), which a recv-based
        *  check is blind to. PowerSaving/Standby/Init/Error legitimately
        *  produce nothing, and a lidar inside a planned mode switch is left to
@@ -1264,7 +1295,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
         strncmp(info.broadcast_code, dashboard_bcode.c_str(), kBdCodeSize) == 0;
     /** Connect/disconnect callbacks update LinkStat before LidarDevice.  Require
      *  both snapshots (and their identities) to agree, so the dashboard and
-     *  recovery-state topic never emit an impossible NORMAL + link_up=-- frame. */
+     *  recovery-state topic never emit an impossible NORMAL + connected=-- frame. */
     const bool dashboard_connected =
         sdk_connected && ls.connect_since_ns != 0 && identity_matches;
     PublishRecoveryState(h, publish_bcode, dashboard_connected, connect_state,
@@ -1279,7 +1310,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
      *  The rolling metrics and labels below are display-only and never feed
      *  watchdog or relay decisions. */
     /** Link-derived durations must be computed after the final LinkStat copy,
-     *  otherwise NOW/HS60 and link_up can disagree within one dashboard frame. */
+     *  otherwise CURRENT/handshake_timeouts and connected can disagree within
+     *  one dashboard frame. */
     std::string outage_duration;
     if (ls.last_disconnect_ns == 0) {
       outage_duration = "--";
@@ -1394,12 +1426,15 @@ void StatsTimerCb(const ros::TimerEvent &) {
     } else {
       snprintf(loss60_text, sizeof(loss60_text), "--");
     }
-    snprintf(line, sizeof(line), kDashboardRowFormat, id_cell.c_str(),
+    snprintf(line, sizeof(line), kCurrentRowFormat, id_cell.c_str(),
              dashboard_bcode.c_str(), display_state.c_str(),
-             DashboardTrendName(trend), recv_cell.c_str(), loss60_text,
-             qdrop_cell.c_str(), health_cell.c_str(), link_up.c_str(),
+             DashboardTrendName(trend), recv_cell.c_str(),
+             health_cell.c_str(), link_up.c_str());
+    current_table << line;
+    snprintf(line, sizeof(line), kRecentRowFormat, id_cell.c_str(),
+             dashboard_bcode.c_str(), loss60_text, qdrop_cell.c_str(),
              hs60_cell.c_str());
-    table << line;
+    recent_table << line;
 
     if (current_incident) {
       any_active_alert = true;
@@ -1701,10 +1736,13 @@ void StatsTimerCb(const ros::TimerEvent &) {
     }
     if (!startup_dashboard_row[i]) {
       char startup_line[256];
-      snprintf(startup_line, sizeof(startup_line), kDashboardRowFormat, "S",
+      snprintf(startup_line, sizeof(startup_line), kCurrentRowFormat, "S",
                tracker.broadcast_code.c_str(), "STARTUP_MISSING", "ACTIVE",
-               "-", "--", "-", "-", "--", "-");
-      table << startup_line;
+               "-", "-", "--");
+      current_table << startup_line;
+      snprintf(startup_line, sizeof(startup_line), kRecentRowFormat, "S",
+               tracker.broadcast_code.c_str(), "--", "-", "-");
+      recent_table << startup_line;
       ++known_count;
       ++trend_count[kDashboardTrendActive];
       any_active_alert = true;
@@ -1726,28 +1764,48 @@ void StatsTimerCb(const ros::TimerEvent &) {
 
   std::ostringstream ss;
   ss << "===== Livox LiDAR Status (1 Hz) =====\n";
-  ss << "SUMMARY: known=" << known_count
-     << " | ATTENTION: ACTIVE=" << trend_count[kDashboardTrendActive]
-     << " UNSTABLE=" << trend_count[kDashboardTrendUnstable]
-     << " WATCH=" << trend_count[kDashboardTrendWatch]
-     << " | TRANSITION: RECOVERING="
-     << trend_count[kDashboardTrendRecovering]
-     << " OBSERVE=" << trend_count[kDashboardTrendObserve]
-     << " | OK: STABLE=" << trend_count[kDashboardTrendStable]
-     << " IDLE=" << trend_count[kDashboardTrendIdle] << "\n";
+  ss << "SOFTWARE (embedded in this running binary):\n"
+     << "  Driver commit=" << ShortBuildCommit(LIVOX_DRIVER_GIT_COMMIT)
+     << " ROS=" << LIVOX_ROS_DRIVER_VERSION_STRING
+     << " | paired SDK commit=" << ShortBuildCommit(LIVOX_SDK_GIT_COMMIT)
+     << " SDK=" << LinkedSdkVersion()
+     << " | compatibility=PINNED\n";
+  const uint32_t operating_count =
+      trend_count[kDashboardTrendStable] +
+      trend_count[kDashboardTrendObserve] +
+      trend_count[kDashboardTrendWatch] +
+      trend_count[kDashboardTrendUnstable];
+  ss << "FLEET:\n"
+     << "  configured=" << startup_trackers.size()
+     << " shown=" << known_count
+     << " (configured=JSON whitelist; shown=rows below)\n"
+     << "  CURRENT: fault=" << trend_count[kDashboardTrendActive]
+     << " recovering=" << trend_count[kDashboardTrendRecovering]
+     << " intentional_idle=" << trend_count[kDashboardTrendIdle]
+     << " operating=" << operating_count << "\n"
+     << "  ASSESSMENT: unstable=" << trend_count[kDashboardTrendUnstable]
+     << " watch=" << trend_count[kDashboardTrendWatch]
+     << " observe=" << trend_count[kDashboardTrendObserve]
+     << " stable=" << trend_count[kDashboardTrendStable] << "\n";
   if (any_active_alert) {
-    ss << "ACTIVE ALERTS:\n" << active_alerts.str();
+    ss << "CURRENT ALERTS:\n" << active_alerts.str();
   } else {
-    ss << "ACTIVE ALERTS: none\n";
+    ss << "CURRENT ALERTS: none\n";
   }
-  ss << "LEGEND: loss60=point-packet loss; qdrop60=local queue drops; "
-        "HS60=SDK timeout attempts, not incidents (last 60s)\n";
-  ss << "TREND: repeated episodes/actions use last 10m; PROCESS HISTORY is "
-        "Driver-process cumulative only\n";
-  ss << table.str();
+  ss << "CURRENT DEVICES:\n" << current_table.str();
   if (known_count == 0) {
     ss << "(no lidar seen yet)\n";
   }
+  ss << "RECENT 60 SECONDS (rolling window; samples expire after 60s):\n"
+     << recent_table.str()
+     << "  packet_loss=network point-packet loss; queue_drops=packets received "
+        "but dropped by Driver queue\n"
+     << "  handshake_timeouts=SDK handshake attempts, not independent fault "
+        "episodes\n"
+     << "ASSESSMENT GUIDE: ACTIVE=current fault; RECOVERING=automatic recovery "
+        "in progress; IDLE=intentional low-power\n"
+     << "  STABLE/OBSERVE/WATCH/UNSTABLE combine the rolling 60s metrics with "
+        "repeated events/actions in the last 10m\n";
   if (any_process_history) {
     ss << "PROCESS HISTORY (Driver process; resets on restart; not current alarms):\n"
        << process_history.str();

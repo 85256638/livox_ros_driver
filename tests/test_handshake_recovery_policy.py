@@ -16,6 +16,9 @@ DRIVER = (
 WAKE_POLICY = (
     ROOT / "livox_ros_driver" / "livox_ros_driver" / "wake_dropout_policy.h"
 ).read_text(encoding="utf-8")
+CMAKE = (ROOT / "livox_ros_driver" / "CMakeLists.txt").read_text(
+    encoding="utf-8"
+)
 
 
 class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
@@ -98,7 +101,9 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
             DRIVER.index("void StatsTimerCb(") :
             DRIVER.index("int main(")
         ]
-        self.assertIn("HS60", stats)
+        self.assertIn("RECENT 60 SECONDS", stats)
+        self.assertIn("handshake_timeouts", stats)
+        self.assertIn("not independent fault", stats)
         self.assertIn(
             "dashboard_counters.handshake_timeout_attempts =", stats
         )
@@ -115,14 +120,23 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         ]
         self.assertNotIn("handshake_timeout_count", current_classification)
 
+    def test_dashboard_identifies_the_running_binary_build_pair(self):
+        self.assertIn("LIVOX_DRIVER_GIT_COMMIT", CMAKE)
+        self.assertIn("LIVOX_SDK_GIT_COMMIT", CMAKE)
+        self.assertIn("target_compile_definitions", CMAKE)
+        self.assertIn("SOFTWARE (embedded in this running binary)", DRIVER)
+        self.assertIn("paired SDK commit=", DRIVER)
+        self.assertNotIn("git -C", DRIVER)
+
     def test_dashboard_active_alerts_use_current_handshake_state(self):
         stats = DRIVER[
             DRIVER.index("void StatsTimerCb(") :
             DRIVER.index("int main(")
         ]
-        self.assertIn('" | ATTENTION: ACTIVE="', stats)
-        self.assertIn('" | TRANSITION: RECOVERING="', stats)
-        self.assertIn('" | OK: STABLE="', stats)
+        self.assertIn('"  CURRENT: fault="', stats)
+        self.assertIn('" recovering="', stats)
+        self.assertIn('" intentional_idle="', stats)
+        self.assertIn('"  ASSESSMENT: unstable="', stats)
         current_classification = stats[
             stats.index("const bool power_reason_handshake") :
             stats.index("const DashboardTrend trend")

@@ -98,6 +98,28 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(cmake/pinned_livox_sdk.cmake)
 
+# Embed the exact source pair in the executable.  The dashboard must describe
+# the binary which is actually running, not whichever revisions happen to be
+# checked out on disk after a later update.
+execute_process(
+  COMMAND "${GIT_EXECUTABLE}" -C "${CMAKE_CURRENT_SOURCE_DIR}" rev-parse HEAD
+  RESULT_VARIABLE _livox_driver_git_result
+  OUTPUT_VARIABLE LIVOX_DRIVER_GIT_COMMIT
+  ERROR_VARIABLE _livox_driver_git_error
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+string(LENGTH "${LIVOX_DRIVER_GIT_COMMIT}" _livox_driver_git_length)
+if(NOT _livox_driver_git_result EQUAL 0 OR
+   NOT _livox_driver_git_length EQUAL 40 OR
+   NOT LIVOX_DRIVER_GIT_COMMIT MATCHES "^[0-9a-fA-F]+$")
+  set(LIVOX_DRIVER_GIT_COMMIT "unknown")
+  message(WARNING
+    "Could not determine livox_ros_driver Git commit; the runtime dashboard "
+    "will show unknown. ${_livox_driver_git_error}")
+endif()
+message(STATUS
+  "Embedding Livox build pair: Driver=${LIVOX_DRIVER_GIT_COMMIT} "
+  "SDK=${LIVOX_SDK_GIT_COMMIT}")
+
 ## PCL library
 link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
@@ -114,6 +136,11 @@ add_executable(${PROJECT_NAME}_node
 #---------------------------------------------------------------------------------------
 target_compile_options(${PROJECT_NAME}_node
     PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wall>
+    )
+
+target_compile_definitions(${PROJECT_NAME}_node PRIVATE
+    LIVOX_DRIVER_GIT_COMMIT="${LIVOX_DRIVER_GIT_COMMIT}"
+    LIVOX_SDK_GIT_COMMIT="${LIVOX_SDK_GIT_COMMIT}"
     )
 
 #---------------------------------------------------------------------------------------
