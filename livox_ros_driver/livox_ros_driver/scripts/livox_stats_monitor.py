@@ -13,11 +13,15 @@
 #
 import json
 import math
+import os
 import re
+import sqlite3
 import sys
 import textwrap
 import threading
 import time
+from contextlib import closing
+from pathlib import Path
 
 try:
     import rospy
@@ -43,6 +47,10 @@ _DRIVER_STALE_SECONDS = 5.0  # Driver publishes at 1 Hz.
 _MANAGER_STALE_SECONDS = 30.0  # Manager heartbeat publishes every 10 s.
 _MAX_STATS_BYTES = 1024 * 1024
 _MAX_POWER_JSON_BYTES = 64 * 1024
+_RELAY_HISTORY_LIMIT = 5
+_DEFAULT_RELAY_HISTORY_DB = os.path.expanduser(
+    "~/.local/state/livox-power-cycle-manager/state.sqlite3"
+)
 _BROADCAST_CODE_RE = re.compile(r"^[A-Za-z0-9]{15}$")
 _POWER_GROUP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _STATE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
@@ -212,7 +220,153 @@ def _append_detail(lines, detail):
     )
 
 
-def _compose_dashboard(stats_text, stats_received_mono, rows, now_mono):
+def _relay_history_db_path():
+    override = os.environ.get("LIVOX_POWER_CYCLE_STATE_DB")
+    return os.path.abspath(os.path.expanduser(override or _DEFAULT_RELAY_HISTORY_DB))
+
+
+def _finite_timestamp(value):
+    number = _finite_number(value)
+    if number is None or number < 0:
+        return None
+    return number
+
+
+def _read_relay_history(path=None, limit=_RELAY_HISTORY_LIMIT):
+    """Read a bounded, validated history snapshot without creating the DB."""
+    db_path = os.path.abspath(os.path.expanduser(path or _relay_history_db_path()))
+    if not os.path.isfile(db_path):
+        return [], None
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
+        return [], "invalid relay history limit"
+    try:
+        uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.2)) as db:
+            db.execute("PRAGMA query_only=ON")
+            rows = db.execute(
+                "SELECT c.id,c.started_at,c.trigger_bcode,c.group_id,"
+                "c.off_confirmed_at,c.on_confirmed_at,c.outcome,c.detail,"
+                "COALESCE(e.recovery_reason,'UNKNOWN') "
+                "FROM power_cycles AS c LEFT JOIN power_events AS e "
+                "ON e.event_id=c.event_id ORDER BY c.id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    except (OSError, sqlite3.Error) as exc:
+        return [], _safe_inline(str(exc))[:240] or "unknown SQLite error"
+
+    history = []
+    for row in rows:
+        if not isinstance(row, tuple) or len(row) != 9:
+            return [], "relay history row has an invalid shape"
+        (
+            cycle_id,
+            started_at,
+            trigger,
+            group_id,
+            off_confirmed_at,
+            on_confirmed_at,
+            outcome,
+            detail,
+            reason,
+        ) = row
+        if (
+            isinstance(cycle_id, bool)
+            or not isinstance(cycle_id, int)
+            or cycle_id <= 0
+            or _finite_timestamp(started_at) is None
+            or not isinstance(trigger, str)
+            or _BROADCAST_CODE_RE.fullmatch(trigger) is None
+            or not isinstance(group_id, str)
+            or _POWER_GROUP_RE.fullmatch(group_id) is None
+            or not isinstance(outcome, str)
+            or _STATE_RE.fullmatch(outcome) is None
+            or not isinstance(detail, str)
+            or len(detail) > 1000
+            or not isinstance(reason, str)
+            or (reason != "UNKNOWN" and _STATE_RE.fullmatch(reason) is None)
+        ):
+            return [], "relay history contains an invalid value"
+        off_time = None if off_confirmed_at is None else _finite_timestamp(off_confirmed_at)
+        on_time = None if on_confirmed_at is None else _finite_timestamp(on_confirmed_at)
+        if (off_confirmed_at is not None and off_time is None) or (
+            on_confirmed_at is not None and on_time is None
+        ):
+            return [], "relay history contains an invalid confirmation time"
+        history.append(
+            {
+                "id": cycle_id,
+                "started_at": float(started_at),
+                "trigger": trigger,
+                "group_id": group_id,
+                "off_confirmed_at": off_time,
+                "on_confirmed_at": on_time,
+                "outcome": outcome,
+                "detail": detail,
+                "reason": reason,
+            }
+        )
+    return history, None
+
+
+def _wall_time_text(timestamp):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+    except (ValueError, OverflowError, OSError):
+        return "invalid-time"
+
+
+def _append_relay_history(lines, history, error):
+    lines.extend(
+        [
+            "",
+            "==================== RELAY HISTORY ==================",
+            "  (latest 5 persisted cycles; survives Driver/monitor restart)",
+        ]
+    )
+    if error:
+        lines.append("  unavailable: %s" % _safe_inline(error))
+        return
+    if not history:
+        lines.append("  no relay cycle has been recorded")
+        return
+    for item in history:
+        lines.append(
+            "  %s  trigger=%s  reason=%s  group=%s"
+            % (
+                _wall_time_text(item["started_at"]),
+                item["trigger"],
+                item["reason"],
+                item["group_id"],
+            )
+        )
+        lines.append(
+            "    OFF=%s  ON=%s  outcome=%s"
+            % (
+                "YES" if item["off_confirmed_at"] is not None else "--",
+                "YES" if item["on_confirmed_at"] is not None else "--",
+                item["outcome"],
+            )
+        )
+        detail = _safe_inline(item["detail"])
+        if detail:
+            lines.extend(
+                textwrap.wrap(
+                    detail,
+                    width=132,
+                    initial_indent="    detail: ",
+                    subsequent_indent="            ",
+                )
+            )
+
+
+def _compose_dashboard(
+    stats_text,
+    stats_received_mono,
+    rows,
+    now_mono,
+    relay_history=(),
+    relay_history_error=None,
+):
     """Pure formatter. All liveness ages use the caller's monotonic clock."""
     driver_age = _elapsed_seconds(stats_received_mono, now_mono)
     if stats_received_mono is None:
@@ -322,6 +476,7 @@ def _compose_dashboard(stats_text, stats_received_mono, rows, now_mono):
                     )
                 )
             _append_detail(lines, detail)
+    _append_relay_history(lines, relay_history, relay_history_error)
     lines.extend(["", "(local refresh; liveness ages use monotonic time)"])
     return "\n".join(lines) + "\n"
 
@@ -333,8 +488,14 @@ def _render():
             stats_text = _stats_text
             stats_received_mono = _stats_received_mono
             rows = [dict(item) for item in _power_status.values()]
+        relay_history, relay_history_error = _read_relay_history()
         output = _compose_dashboard(
-            stats_text, stats_received_mono, rows, now_mono
+            stats_text,
+            stats_received_mono,
+            rows,
+            now_mono,
+            relay_history,
+            relay_history_error,
         )
         # ESC[2J = clear screen, ESC[H = cursor to home (top-left)
         sys.stdout.write("\033[2J\033[H")

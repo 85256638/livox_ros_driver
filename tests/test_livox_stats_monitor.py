@@ -1,7 +1,10 @@
 import importlib.util
 import json
+import sqlite3
 import sys
+import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -224,6 +227,79 @@ class MonitorStateTest(unittest.TestCase):
         self.assertIn("NOW=MANAGER_STALE", rendered)
         self.assertIn("driver_age=40s", rendered)
         self.assertIn("manager_age=40s", rendered)
+
+    def test_relay_history_reads_latest_five_persisted_cycles_read_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite3"
+            with closing(sqlite3.connect(str(path))) as db:
+                db.execute(
+                    "CREATE TABLE power_cycles (id INTEGER PRIMARY KEY,"
+                    "event_id TEXT,started_at REAL,trigger_bcode TEXT,"
+                    "group_id TEXT,off_confirmed_at REAL,on_confirmed_at REAL,"
+                    "outcome TEXT,detail TEXT)"
+                )
+                db.execute(
+                    "CREATE TABLE power_events (event_id TEXT PRIMARY KEY,"
+                    "recovery_reason TEXT)"
+                )
+                for index in range(1, 7):
+                    event_id = "event-%d" % index
+                    db.execute(
+                        "INSERT INTO power_events VALUES(?,?)",
+                        (event_id, "NORMAL_DROPOUT"),
+                    )
+                    db.execute(
+                        "INSERT INTO power_cycles VALUES(?,?,?,?,?,?,?,?,?)",
+                        (
+                            index,
+                            event_id,
+                            1700000000.0 + index,
+                            "1WEDH5900100001",
+                            "pit1",
+                            1700000010.0 + index,
+                            1700000020.0 + index if index != 6 else None,
+                            "RECOVERY_VERIFIED" if index != 6 else "POWER_ON_UNCONFIRMED",
+                            "cycle detail %d" % index,
+                        ),
+                    )
+                db.commit()
+            history, error = MONITOR._read_relay_history(str(path))
+            self.assertIsNone(error)
+            self.assertEqual([6, 5, 4, 3, 2], [item["id"] for item in history])
+            rendered = MONITOR._compose_dashboard(
+                "driver\n", 100.0, [], 101.0, history, error
+            )
+            self.assertIn("==================== RELAY HISTORY", rendered)
+            self.assertIn("reason=NORMAL_DROPOUT", rendered)
+            self.assertIn("OFF=YES  ON=--  outcome=POWER_ON_UNCONFIRMED", rendered)
+            self.assertNotIn("cycle detail 1", rendered)
+
+    def test_relay_history_missing_database_is_empty_not_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            history, error = MONITOR._read_relay_history(
+                str(Path(tmp) / "missing.sqlite3")
+            )
+            self.assertEqual([], history)
+            self.assertIsNone(error)
+            rendered = MONITOR._compose_dashboard(
+                "driver\n", 100.0, [], 101.0, history, error
+            )
+            self.assertIn("no relay cycle has been recorded", rendered)
+
+    def test_relay_history_schema_error_does_not_break_dashboard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad.sqlite3"
+            with closing(sqlite3.connect(str(path))) as db:
+                db.execute("CREATE TABLE unrelated (id INTEGER)")
+                db.commit()
+            history, error = MONITOR._read_relay_history(str(path))
+            self.assertEqual([], history)
+            self.assertIsNotNone(error)
+            rendered = MONITOR._compose_dashboard(
+                "driver\n", 100.0, [], 101.0, history, error
+            )
+            self.assertIn("RELAY HISTORY", rendered)
+            self.assertIn("unavailable:", rendered)
 
 
 class MainTimerTest(unittest.TestCase):

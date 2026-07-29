@@ -7,7 +7,7 @@
 3. **可配置点云距离过滤** — 通过 launch 参数设置最大发布距离，无需重新编译
 4. **掉线崩溃修复（UAF）** — 修复官方驱动在雷达掉线时的 use-after-free 竞态崩溃（收包/统计/队列已并入同一把锁的事务）
 5. **状态抖动断流修复** — 避免温度/电机告警等瞬时状态抖动导致话题断流
-6. **健康与丢包监控** — 异常日志告警 + 四段式实时看板（数据源健康、当前告警、逐台状态/滚动趋势、Driver 进程历史），独立终端原地刷新；数据面计数 64 位，长期连续连接不回绕
+6. **健康与丢包监控** — 异常日志告警 + 分层实时看板（数据源、软件版本、当前告警、逐台状态/滚动趋势、Driver进程历史、继电器当前状态与持久历史），独立终端原地刷新；数据面计数64位，长期连续连接不回绕
 7. **畸形包硬化** — 拒绝非法 `data_type`；发布时**按每包自身类型**解析，堵住类型混用越界（ASan 实证过的内存破坏）
 8. **零点洪泛防护** — 大丢包/掉线时限制零点回填，避免整片假点污染融合点云
 9. **自动恢复看门狗（可选）** — 检测到假活（`Normal` 但**没有点云发布**）、配置长期不完成、`Error`（如电机故障）或显式唤醒后持续无广播时按各自路径恢复，带严格归因、重试上限和防死循环门禁
@@ -571,7 +571,7 @@ rosrun livox_ros_driver livox_stats_monitor.py
 > 或直接用绝对路径运行：`python3 $(rospack find livox_ros_driver)/livox_ros_driver/scripts/livox_stats_monitor.py`
 > （注意本仓库源码目录多嵌套一层 `livox_ros_driver`）。
 
-看板按固定层次显示：数据源存活、运行二进制版本、整组摘要、当前告警、当前逐台状态、最近60秒滚动指标、判定说明和进程历史。普通瞬时掉线标 `DISCONNECTED`，已归因的运行期掉线标 `NORMAL_NO_BROADCAST / NORMAL_DROPOUT`，启动缺失标 `STARTUP_MISSING`，显式唤醒归因则标 `WAKE_NO_BROADCAST / WAKE_DROPOUT`。白名单成员即使从未取得 SDK handle，也会以合成 `L255` 行出现：
+看板按固定层次显示：数据源存活、运行二进制版本、整组摘要、当前告警、当前逐台状态及掉线次数、最近60秒滚动指标、判定说明、Driver进程历史、继电器当前状态和最近5次持久操作历史。普通瞬时掉线标 `DISCONNECTED`，已归因的运行期掉线标 `NORMAL_NO_BROADCAST / NORMAL_DROPOUT`，启动缺失标 `STARTUP_MISSING`，显式唤醒归因则标 `WAKE_NO_BROADCAST / WAKE_DROPOUT`。白名单成员即使从未取得 SDK handle，也会以合成 `L255` 行出现：
 ```
 ==================== SOURCE HEALTH ==================
   DRIVER   NOW=LIVE  severity=INFO  driver_age=0s  expected=1Hz stale>5s
@@ -590,11 +590,11 @@ rosrun livox_ros_driver livox_stats_monitor.py
     handshake: broadcast=alive; reset=completed; power-cycle request published; see POWER RECOVERY manager
     last SDK event: TIMEOUT; detail=500
 ==================== CURRENT DEVICES =============
-ID  broadcast_code   CURRENT               ASSESS     points/s  HW            connected
-0   3WEDH7600111191  NORMAL                STABLE         2496  OK                2h13m
-1   3WEDH5900100671  POWER_CYCLE_REQUIRED  ACTIVE            -  -                    --
-2   3WEDJA700100021  NORMAL                UNSTABLE       2498  OK                8m05s
-3   3WEDH7600103661  POWER_SAVING          IDLE               0  OK                2h13m
+ID  broadcast_code   CURRENT               ASSESS     points/s  HW            connected    disc
+0   3WEDH7600111191  NORMAL                STABLE         2496  OK                2h13m       0
+1   3WEDH5900100671  POWER_CYCLE_REQUIRED  ACTIVE            -  -                    --       3
+2   3WEDJA700100021  NORMAL                UNSTABLE       2498  OK                8m05s       1
+3   3WEDH7600103661  POWER_SAVING          IDLE               0  OK                2h13m       0
 ==================== RECENT 60 SECONDS ===========
   (rolling window; samples expire after 60s)
 ID  broadcast_code     packet_loss  queue_drops  handshake_timeouts
@@ -622,6 +622,12 @@ ID  broadcast_code     packet_loss  queue_drops  handshake_timeouts
   (shared relay; separate manager process)
   MANAGER   NOW=MANAGER_HEARTBEAT  severity=INFO  manager_age=2s
     detail: mode=auto worker=alive
+
+==================== RELAY HISTORY ==================
+  (latest 5 persisted cycles; survives Driver/monitor restart)
+  2026-07-30 13:42:18  trigger=3WEDH5900100671  reason=HANDSHAKE_STUCK  group=pit1
+    OFF=YES  ON=YES  outcome=RECOVERY_VERIFIED
+    detail: all 4 members healthy for 10s
 
 (local refresh; liveness ages use monotonic time)
 ```
@@ -653,9 +659,18 @@ ID  broadcast_code     packet_loss  queue_drops  handshake_timeouts
 | `queue_drops` | 最近60秒队列丢包包数：包已到 Driver、但本地队列处理不过来。它和网络丢包 `packet_loss` 是两回事；非0通常指向 CPU、下游订阅者或发布消费瓶颈 |
 | `HW` | 当前硬件健康位；`OK` 正常，异常时显示 `temp/motor/fan/dirty/volt/fw/sys`，多个短标签以 `+` 连接，过长显示 `MULTI`（完整标签仍在顶部告警）。这是状态码，不是具体温度℃或风扇转速 |
 | `connected` | 当前心跳连接已维持多久；不是点云连续发布时长，`POWER_SAVING` 时也会继续增长，未连接显示 `--` |
+| `disc` | **本次Driver进程内**该雷达的非计划掉线episode累计数，0也会常驻显示；Driver重启后清零。共享继电器已通过intent/ACK识别的计划维护断线单独计数，不增加这里的 `disc` |
 | `handshake_timeouts` | 最近60秒 SDK 握手 `TIMEOUT` **尝试数**。一次持续卡死期间 SDK 会进行多笔握手，所以它不是独立故障次数，也不是点云UDP丢包率；它单独出现只会把健康雷达提升为 `WATCH`，不会直接判为 `UNSTABLE` |
 
 这里的“60”不是错误码，也不是阈值：它只是滚动观察窗口长度。选择60秒是为了过滤1～2秒瞬时抖动，同时让已经消失的问题在一分钟后退出当前视图；长期判断另用最近10分钟episode和底部进程历史。
+
+`ASSESS` 严格按下面的顺序从左到右判定，命中第一个条件后立即停止：
+
+```text
+ACTIVE → RECOVERING → IDLE → UNSTABLE → WATCH → OBSERVE → STABLE
+```
+
+因此当前真实状态永远优先于历史趋势：正在故障时显示 `ACTIVE`，自动恢复过程中显示 `RECOVERING`，人为PowerSaving/StandBy显示 `IDLE`；只有三者都不成立，才使用最近60秒指标和最近10分钟事件判定后四种稳定性。
 
 | `ASSESS` | 判定（从上到下优先）|
 |---------|----------------------|
@@ -666,6 +681,8 @@ ID  broadcast_code     packet_loss  queue_drops  handshake_timeouts
 | `WATCH` | `packet_loss >= 0.10%`、`queue_drops > 0`、最近60秒存在任一种握手错误尝试，或最近10分钟出现过任一故障 episode/恢复动作；尚未满足 `UNSTABLE` |
 | `OBSERVE` | 当前与窗口内均无异常，但针对这个 broadcast code 的连续观察尚不足 10 分钟 |
 | `STABLE` | 当前正常，且已连续观察至少 10 分钟，滚动窗口内没有上述异常 |
+
+典型变化示例：Driver刚开始观察一台正常雷达时为 `OBSERVE`，连续无异常满10分钟后变为 `STABLE`；最近60秒丢包达到0.10%或出现队列丢包时变为 `WATCH`，丢包达到1.00%时直接变为 `UNSTABLE`；最近10分钟只有一次掉线/故障/恢复动作通常为 `WATCH`，同类 `handshake-stuck/wake-dropout/normal-dropout/escalated-to-power/硬件故障/mode-fail` episode或自动重启动作达到2次则为 `UNSTABLE`。普通 `disconnect` 和同一硬恢复episode内重复发布的power-request edge不会单独把雷达升级为 `UNSTABLE`。
 
 > **共享继电器伴生断线不再污染单机历史：**manager 在OFF前先发布带token、Driver instance和4个members的计划断电意图；Driver只有在members与实际白名单完全一致时才为4台建立短时标记并ACK。manager收到ACK后还会再复核一次触发故障，随后才允许OFF。健康伴随雷达的断线记录为 `PLANNED_GROUP_POWER_CYCLE`，单独计入maintenance历史，不增加 `disconnect / NORMAL_DROPOUT / POWER_CYCLE_REQUIRED`，也不影响稳定性趋势。ACK超时、拒绝、实例变化或复核恢复都会先确认所选通道集合仍全部为ON，再取消循环。
 
@@ -691,11 +708,20 @@ ID  broadcast_code     packet_loss  queue_drops  handshake_timeouts
 | `automatic reboot actions` | 自动恢复看门狗实际接受的雷达软重启动作数和最近时间 |
 | `mode failures` | 所有目标模式合计的失败总数、最后一次失败的目标模式和最近时间；`last-mode` 不是按模式拆分计数 |
 
+`CURRENT DEVICES / disc` 现在始终显示每台本次Driver进程的掉线次数，包括0次；`PROCESS HISTORY / link: disconnect episodes=...` 只在该台确实出现过历史事件时显示，并补充最近掉线持续时间和当前连接时长。两者的 `disconnect` 口径相同，均不包含已正确标记的共享继电器计划维护断线。
+
 `stuck=23, escalated-to-power=6` **无需相等，这种情况正常**：前者表示 23 个 episode 到达“广播存在但握手持续失败”的门槛，后者只统计其中进一步满足 session reset 已完成、额外观察时间已满、广播仍新鲜且最近没有本机 `NETWORK_ERROR` 等全部条件的 6 个唯一 episode。其余 episode 可能已握手恢复、广播消失、reset 被拒绝/未完成、检测模式未启用恢复，或被网络错误门禁拦住。旧看板的 `power-alert` 更接近现在单独列出的 `POWER_CYCLE_REQUIRED entries`；它是进入硬断电升级状态的次数，同一 episode 被网络门禁取消后可以再次出现，而且极窄竞态下可能在请求真正发布前取消。`reset accepted/rejected` 又是 session 恢复动作，三者都不能一一对应。
 
 `wake-dropout` 与上述握手口径独立：它不需要、也不执行 session reset，不会增加 `stuck`、`session reset actions` 或握手 `escalated-to-power`。它只增加 `wake dropout episodes`，若 `auto_recover=true` 再以 `reason=WAKE_DROPOUT` 进入通用 `POWER_CYCLE_REQUIRED entries`。
 
 > **判断哪台最该排查/换：**先看 `ACTIVE`；没有当前故障时，看同一 Driver 下谁长期反复进入 `UNSTABLE/WATCH`。重点比较 `packet_loss`、最近 10 分钟重复 episode，并用 `PROCESS HISTORY` 的 `timeout/rejected/network/protocol`、故障标签和自动重启次数定位方向。不要只凭一个很大的 `timeout` 历史累计就判定 498 次独立故障。
+
+##### 第五层：`POWER RECOVERY` 与 `RELAY HISTORY`
+
+- `POWER RECOVERY` 是manager对每个共享电源组的**当前/最近状态**，新状态会覆盖旧状态，不是时间线。
+- `RELAY HISTORY` 每次以只读方式查询 `~/.local/state/livox-power-cycle-manager/state.sqlite3`，按时间倒序显示最近5个持久化cycle；Driver、manager或看板重启后仍保留。每条显示触发雷达、原因、电源组、OFF/ON是否得到B0确认、最终 `outcome` 和detail。
+- `OFF=--` 表示该cycle没有取得OFF确认，可能在OFF前安全取消或命令失败；`ON=--` 表示尚未取得ON确认，必须结合 `outcome/detail` 判断，不能理解为当前一定处于断电。当前必须补ON的义务仍由manager和systemd安全钩子负责。
+- 数据库不存在时显示 `no relay cycle has been recorded`；数据库被占用、损坏或schema不兼容时显示 `unavailable`，但不会影响Driver、manager或其他看板板块。
 
 #### 关于温度与风扇（重要说明）
 
@@ -1225,7 +1251,7 @@ git clone --branch 'network-relay-added' --single-branch https://github.com/8525
 | `CMakeLists.txt` | 注册两个 srv，并链接固定 SDK CMake target |
 | `cmake/pinned_livox_sdk.cmake` | 固定 SDK fork/branch/SHA，校验 clean checkout，fail closed |
 | `livox_ros_driver/lds_lidar.h/.cpp` | 模式切换 + 重启 + 批量 Normal 错峰/ACK grace/有界重发 + 每台配置链串行 + 状态机抖动修复 + 广播/握手状态机、session reset 与严格 `WAKE_DROPOUT` 归因 |
-| `livox_ros_driver/livox_ros_driver.cpp` | 模式/重启 Service、AsyncSpinner、max_distance 参数、五类自动恢复调度、四段式 `livox/lidar_stats` 看板，以及显式停止 timer/spinner 后的正常关闭 |
+| `livox_ros_driver/livox_ros_driver.cpp` | 模式/重启 Service、AsyncSpinner、max_distance 参数、五类自动恢复调度、分层 `livox/lidar_stats` 看板，以及显式停止 timer/spinner 后的正常关闭 |
 | `livox_ros_driver/dashboard_metrics.h` | **新增** — 按 broadcast code 隔离的 60 秒/10 分钟滚动窗口与 `ASSESS` 纯判定逻辑；握手与 wake-dropout episode 分开计数 |
 | `livox_ros_driver/recovery_event_json.h` | Driver→manager 的结构化恢复状态/请求；显式携带 `recovery_reason` 和原因特定证据 |
 | `livox_ros_driver/lddc.h/.cpp` | 距离过滤 + 读取端 UAF 加锁 |

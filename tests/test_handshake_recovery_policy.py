@@ -104,6 +104,8 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         self.assertIn("RECENT 60 SECONDS", stats)
         self.assertIn("==================== CURRENT DEVICES", stats)
         self.assertIn("==================== ASSESSMENT GUIDE", stats)
+        self.assertIn('"connected", "disc"', stats)
+        self.assertIn("ls.disconnect_count", stats)
         self.assertIn("handshake_timeouts", stats)
         self.assertIn("not independent fault", stats)
         self.assertIn(

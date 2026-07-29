@@ -823,14 +823,14 @@ void StatsTimerCb(const ros::TimerEvent &) {
   std::ostringstream active_alerts;
   std::ostringstream process_history;
   static const char kCurrentRowFormat[] =
-      "%-2.2s  %-15.15s  %-20.20s  %-10.10s  %8.8s  %-10.10s  %11.11s\n";
+      "%-2.2s  %-15.15s  %-20.20s  %-10.10s  %8.8s  %-10.10s  %11.11s  %6.6s\n";
   static const char kRecentRowFormat[] =
       "%-2.2s  %-15.15s  %12.12s  %11.11s  %18.18s\n";
   char current_header[128];
   char recent_header[128];
   snprintf(current_header, sizeof(current_header), kCurrentRowFormat, "ID",
            "broadcast_code", "CURRENT", "ASSESS", "points/s", "HW",
-           "connected");
+           "connected", "disc");
   snprintf(recent_header, sizeof(recent_header), kRecentRowFormat, "ID",
            "broadcast_code", "packet_loss", "queue_drops",
            "handshake_timeouts");
@@ -1420,6 +1420,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
         DashboardCountCell(window.queue_drops_60s, 7);
     const std::string hs60_cell =
         DashboardCountCell(window.handshake_timeout_60s, 5);
+    const std::string disconnect_cell =
+        DashboardCountCell(ls.disconnect_count, 6);
     if (window.loss_60s_has_data) {
       snprintf(loss60_text, sizeof(loss60_text), "%.2f%%",
                window.loss_60s_percent);
@@ -1429,7 +1431,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
     snprintf(line, sizeof(line), kCurrentRowFormat, id_cell.c_str(),
              dashboard_bcode.c_str(), display_state.c_str(),
              DashboardTrendName(trend), recv_cell.c_str(),
-             health_cell.c_str(), link_up.c_str());
+             health_cell.c_str(), link_up.c_str(), disconnect_cell.c_str());
     current_table << line;
     snprintf(line, sizeof(line), kRecentRowFormat, id_cell.c_str(),
              dashboard_bcode.c_str(), loss60_text, qdrop_cell.c_str(),
@@ -1738,7 +1740,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
       char startup_line[256];
       snprintf(startup_line, sizeof(startup_line), kCurrentRowFormat, "S",
                tracker.broadcast_code.c_str(), "STARTUP_MISSING", "ACTIVE",
-               "-", "-", "--");
+               "-", "-", "--", "-");
       current_table << startup_line;
       snprintf(startup_line, sizeof(startup_line), kRecentRowFormat, "S",
                tracker.broadcast_code.c_str(), "--", "-", "-");
