@@ -79,7 +79,7 @@ if [ -d "$HOME/Livox-SDK/.git" ]; then git -C "$HOME/Livox-SDK" remote set-url o
 **阶段2：人工修改并校验磁盘上的新版配置。** 此时新参数和新文件已经存在，但尚未被正在运行的旧进程读取。按下一节清单修改 Driver JSON、multi launch 和外部继电器 JSON；如果要在新版第一次启动时启用自动硬恢复，应在人工接线验收后同时设置 `power_groups.<组>.enabled=true` 和 `relay_power_cycle_enable=true`。先运行下面这一条离线校验；只有两项都成功且最后输出 `Site identity valid` 才进入阶段3：
 
 ```bash
-python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py" --config "$HOME/.config/livox/power_cycle.json" --validate-config && python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/validate_livox_power_cycle_site.py" --relay-config "$HOME/.config/livox/power_cycle.json" --driver-config "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_lidar_config_multi.json" --launch "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_lidar_multi.launch"
+python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py" --config "$HOME/.config/livox/power_cycle.json" --validate-config && python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/livox_ros_driver/scripts/validate_livox_power_cycle_site.py" --relay-config "$HOME/.config/livox/power_cycle.json" --driver-config "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_lidar_config_multi.json" --launch "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_lidar_multi.launch"
 ```
 
 **阶段3：切换到已配置好的新版。** 保持 Geph 开启并执行下面这一条；版本未变化时会跳过重复编译，但仍会安全暂存/恢复现场 JSON 和 launch、再次校验继电器身份与安全钩子，全部成功后才重启服务。新 Driver 第一次启动就会读取阶段2保存的参数：
@@ -104,7 +104,7 @@ LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --
 修改完成后先运行这一条一致性校验；只有输出 `Site identity valid` 才允许重启服务：
 
 ```bash
-python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/validate_livox_power_cycle_site.py" --relay-config "$HOME/.config/livox/power_cycle.json" --driver-config "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_lidar_config_multi.json" --launch "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_lidar_multi.launch"
+python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/livox_ros_driver/scripts/validate_livox_power_cycle_site.py" --relay-config "$HOME/.config/livox/power_cycle.json" --driver-config "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_lidar_config_multi.json" --launch "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_lidar_multi.launch"
 ```
 
 迁移命令全部成功后，用下面这一条核对 SDK commit、Driver commit 和服务状态；最后一项应输出 `active`：
@@ -929,19 +929,19 @@ bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh"
 新版模板显式使用 `off_seconds: 5`，manager 也强制断电保持时间不得短于 5 秒。为兼容已经部署的 `schema_version=2` 现场配置，省略 `off_seconds` 与显式写 `off_seconds: 10` 都继续按旧值 10 秒生效；更新器会保护仓库外的现场 JSON，不会自动把它们改成 5 秒。因此旧配置无论省略该字段还是显式保存 10 秒，只要希望切换为 5 秒，都必须执行下面的显式迁移。确认现场电气允许后，用这一条命令先在原目录生成候选文件、校验候选文件，通过后才备份生产配置并用 `os.replace` 原子替换；校验输出必须包含 `off_seconds=5`：
 
 ```bash
-python3 -c 'import json,os,pathlib; p=pathlib.Path.home()/".config/livox/power_cycle.json"; c=p.with_name(p.name+".candidate"); d=json.loads(p.read_text(encoding="utf-8")); d.setdefault("policy",{})["off_seconds"]=5; c.write_text(json.dumps(d,ensure_ascii=False,indent=2)+"\n",encoding="utf-8"); os.chmod(str(c),p.stat().st_mode & 0o777); print("candidate="+str(c))' && python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py" --config "$HOME/.config/livox/power_cycle.json.candidate" --validate-config && python3 -c 'import datetime,os,pathlib,shutil; p=pathlib.Path.home()/".config/livox/power_cycle.json"; c=p.with_name(p.name+".candidate"); b=p.with_name(p.name+".bak."+datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")); shutil.copy2(str(p),str(b)); os.replace(str(c),str(p)); print("installed="+str(p)+" backup="+str(b))'
+python3 -c 'import json,os,pathlib; p=pathlib.Path.home()/".config/livox/power_cycle.json"; c=p.with_name(p.name+".candidate"); d=json.loads(p.read_text(encoding="utf-8")); d.setdefault("policy",{})["off_seconds"]=5; c.write_text(json.dumps(d,ensure_ascii=False,indent=2)+"\n",encoding="utf-8"); os.chmod(str(c),p.stat().st_mode & 0o777); print("candidate="+str(c))' && python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py" --config "$HOME/.config/livox/power_cycle.json.candidate" --validate-config && python3 -c 'import datetime,os,pathlib,shutil; p=pathlib.Path.home()/".config/livox/power_cycle.json"; c=p.with_name(p.name+".candidate"); b=p.with_name(p.name+".bak."+datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")); shutil.copy2(str(p),str(b)); os.replace(str(c),str(p)); print("installed="+str(p)+" backup="+str(b))'
 ```
 
 修改后只做本地格式/安全约束校验：
 
 ```bash
-python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py" --config "$HOME/.config/livox/power_cycle.json" --validate-config
+python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py" --config "$HOME/.config/livox/power_cycle.json" --validate-config
 ```
 
 再校验实际Driver白名单、enabled继电器members与launch授权；launch已武装时两组广播码必须完全一致，lidar remap不一致会单独WARNING：
 
 ```bash
-python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/validate_livox_power_cycle_site.py" --relay-config "$HOME/.config/livox/power_cycle.json" --driver-config "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_lidar_config_multi.json" --launch "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_lidar_multi.launch"
+python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/livox_ros_driver/scripts/validate_livox_power_cycle_site.py" --relay-config "$HOME/.config/livox/power_cycle.json" --driver-config "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_lidar_config_multi.json" --launch "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_lidar_multi.launch"
 ```
 
 只读查询所有已启用映射的四路状态（不会改变任何输出）：
