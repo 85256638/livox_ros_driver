@@ -963,6 +963,35 @@ class ManagerCliTests(unittest.TestCase):
                     self.assertEqual(len(received), 1)
                     self.assertEqual(received[0].mode, cli_mode)
 
+    def test_roslaunch_remapping_arguments_do_not_kill_manager(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            state_db = Path(tmp) / "state.sqlite3"
+            self._write_config(path, state_db, "observe")
+            received = []
+
+            with mock.patch.object(
+                manager,
+                "run_ros",
+                side_effect=lambda config: received.append(config) or 0,
+            ):
+                result = manager.main(
+                    [
+                        "--config",
+                        str(path),
+                        "/livox/lidar_TEST:=/site/lidar_left",
+                        "__name:=livox_power_cycle_manager",
+                        "__log:=/tmp/manager.log",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(len(received), 1)
+
+    def test_non_ros_unknown_argument_remains_a_hard_error(self):
+        with self.assertRaises(SystemExit):
+            manager.parse_arguments(["--unknown-manager-option"])
+
     def test_validate_config_reports_effective_off_seconds(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

@@ -636,7 +636,7 @@ ID  broadcast_code     packet_loss  queue_drops  handshake_timeouts
 ##### 第一层：`DATA SOURCE`
 
 - `DRIVER NOW=LIVE` 才表示下方 Driver 看板仍在实时更新；超过 5 秒没有收到新数据会变为 `DRIVER_STALE/CRITICAL`，此时下方内容只能当最后一次快照，不能当当前状态。
-- 收到过 manager 首帧后，同一区域还会显示 `POWER-MGR`；其心跳超过 30 秒未收到时显示 `MANAGER_STALE/CRITICAL`。底部 `POWER RECOVERY` 保留更完整的 manager/电源组细节。两者都按本机单调时钟计算，不受系统时间跳变或消息内时间戳影响。
+- `POWER-MGR NOW=NOT_SEEN` 表示看板启动以来没有收到manager首帧，可能是继电器功能未启用、正在启动或manager启动失败；它不证明继电器硬件本身故障。收到首帧后显示实际状态，后续心跳超过30秒未收到则显示 `MANAGER_STALE/CRITICAL`。底部 `POWER RECOVERY` 保留更完整的manager/电源组细节。两者都按本机单调时钟计算，不受系统时间跳变或消息内时间戳影响。
 
 ##### 第二层：`SOFTWARE` 与 `CURRENT ALERTS`
 
@@ -1108,7 +1108,7 @@ sudo systemctl restart livox-ros-driver && systemctl is-active livox-ros-driver
 
 查看自动硬恢复的最近状态可继续使用同一看板。看板最上方 `DATA SOURCE` 用本机单调时钟显示 Driver topic 的接收年龄：超过 5 秒没有新 `/livox/lidar_stats` 会明确显示 `NOW=DRIVER_STALE severity=CRITICAL`，不会用旧表和新的渲染时间伪装成实时数据。脚本自身每秒刷新，因此 Driver 和 manager 同时停发时 stale 年龄仍会继续增长。
 
-`livox_stats_monitor.py` 在收到至少一条通过校验的manager消息后，会同时在顶部 `DATA SOURCE` 板块增加 `POWER-MGR` 摘要，并在Driver看板之后追加独立的 `POWER RECOVERY` 板块；若manager从未成功发布首帧，尚无可缓存身份，因此不会凭空显示manager行。详情中的 `MANAGER` 行显示manager的 `NOW/severity/manager_age`，每个 `GROUP <power_group>` 再分行显示该共享组的 `NOW/severity/rx_age/trigger/members/relay` 和完整 `detail`；`relay=1,2,3,4` 可直接确认本次状态对应四路集合，结构化status同时保留 `relay_channels` 和四种 `recovery_reason`。白名单外事件显示为 `UNMAPPED trigger=...`，绝不会伪装成manager行。这部分来自独立manager进程，不计入Driver的逐台 `ASSESS` 和 `PROCESS HISTORY`；收到首帧后若manager心跳超过30秒未接收，顶部摘要和底部详情都会明确改显 `MANAGER_STALE/CRITICAL`。所有stale判定都用本机接收时刻，不信任消息内wall-clock。
+`livox_stats_monitor.py` 会在顶部 `DATA SOURCE` 常驻 `POWER-MGR` 摘要：首帧到达前显示 `NOT_SEEN/WARN`，收到至少一条通过校验的manager消息后显示实际状态，并在Driver看板之后追加独立的 `POWER RECOVERY` 板块。详情中的 `MANAGER` 行显示manager的 `NOW/severity/manager_age`，每个 `GROUP <power_group>` 再分行显示该共享组的 `NOW/severity/rx_age/trigger/members/relay` 和完整 `detail`；`relay=1,2,3,4` 可直接确认本次状态对应四路集合，结构化status同时保留 `relay_channels` 和四种 `recovery_reason`。白名单外事件显示为 `UNMAPPED trigger=...`，绝不会伪装成manager行。这部分来自独立manager进程，不计入Driver的逐台 `ASSESS` 和 `PROCESS HISTORY`；收到首帧后若manager心跳超过30秒未接收，顶部摘要和底部详情都会明确改显 `MANAGER_STALE/CRITICAL`。所有stale判定都用本机接收时刻，不信任消息内wall-clock。
 
 ```bash
 rostopic echo /livox/power_cycle_status

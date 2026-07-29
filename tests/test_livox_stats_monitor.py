@@ -198,6 +198,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertIn("LIVE=realtime", live)
         self.assertIn("NOW=LIVE", live)
         self.assertIn("driver_age=4s", live)
+        self.assertIn("POWER-MGR NOW=NOT_SEEN", live)
         self.assertIn("NOW=DRIVER_STALE", stale)
         self.assertIn("driver_age=6s", stale)
 

@@ -4305,8 +4305,26 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse manager options while accepting roslaunch remapping arguments.
+
+    roslaunch appends inherited topic remaps plus ``__name``/``__log`` to a
+    Python node's command line.  Keep ordinary CLI parsing strict, but discard
+    only unknown ROS remap tokens.  ``parse_known_args`` is used deliberately
+    so a recognized option value containing ``:=`` is still consumed normally.
+    Importing ``rospy.myargv`` here would break the offline validation and
+    emergency-ON paths on hosts where the ROS environment is not sourced.
+    """
+    parser = build_argument_parser()
+    args, unknown = parser.parse_known_args(argv)
+    unrecognized = [token for token in unknown if ":=" not in token]
+    if unrecognized:
+        parser.error("unrecognized arguments: %s" % " ".join(unrecognized))
+    return args
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_argument_parser().parse_args(argv)
+    args = parse_arguments(argv)
     state_db_override = None
     if args.state_db:
         state_db_override = os.path.abspath(

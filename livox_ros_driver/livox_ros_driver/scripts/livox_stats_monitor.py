@@ -414,6 +414,11 @@ def _compose_dashboard(
                 _age_text_from_seconds(manager_age),
             )
         )
+    else:
+        lines.append(
+            "  POWER-MGR NOW=NOT_SEEN  severity=WARN  manager_age=--  "
+            "disabled, starting, or failed before first heartbeat"
+        )
     lines.append("")
     if isinstance(stats_text, str) and stats_text:
         lines.extend(stats_text.rstrip("\n").splitlines())
