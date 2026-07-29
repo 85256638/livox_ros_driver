@@ -133,15 +133,15 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         self.assertIn("paired SDK commit=", DRIVER)
         self.assertNotIn("git -C", DRIVER)
 
-    def test_dashboard_active_alerts_use_current_handshake_state(self):
+    def test_dashboard_rows_and_active_alerts_use_current_handshake_state(self):
         stats = DRIVER[
             DRIVER.index("void StatsTimerCb(") :
             DRIVER.index("int main(")
         ]
-        self.assertIn('"  CURRENT: fault="', stats)
-        self.assertIn('" recovering="', stats)
-        self.assertIn('" intentional_idle="', stats)
-        self.assertIn('"  ASSESSMENT: unstable="', stats)
+        self.assertNotIn("==================== FLEET", stats)
+        self.assertIn("==================== CURRENT ALERTS", stats)
+        self.assertIn("==================== CURRENT DEVICES", stats)
+        self.assertIn("EvaluateTrend(window, live_signals)", stats)
         current_classification = stats[
             stats.index("const bool power_reason_handshake") :
             stats.index("const DashboardTrend trend")

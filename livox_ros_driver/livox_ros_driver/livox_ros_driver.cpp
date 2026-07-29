@@ -839,7 +839,6 @@ void StatsTimerCb(const ros::TimerEvent &) {
   bool any_active_alert = false;
   bool any_process_history = false;
   uint32_t known_count = 0;
-  uint32_t trend_count[kDashboardTrendStable + 1] = {0};
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
     /** Counters are written by the ingest/publish threads under data_lock_.
      *  Take one coherent snapshot so the watchdog never drives hardware from
@@ -1409,7 +1408,6 @@ void StatsTimerCb(const ros::TimerEvent &) {
     live_signals.intentionally_idle =
         display_state == "POWER_SAVING" || display_state == "STANDBY";
     const DashboardTrend trend = EvaluateTrend(window, live_signals);
-    trend_count[static_cast<unsigned>(trend)]++;
     known_count++;
 
     char loss60_text[16];
@@ -1746,7 +1744,6 @@ void StatsTimerCb(const ros::TimerEvent &) {
                tracker.broadcast_code.c_str(), "--", "-", "-");
       recent_table << startup_line;
       ++known_count;
-      ++trend_count[kDashboardTrendActive];
       any_active_alert = true;
       active_alerts << "  " << (g_auto_recover ? "[CRIT]" : "[ALERT]")
                     << " L255 " << tracker.broadcast_code
@@ -1773,23 +1770,6 @@ void StatsTimerCb(const ros::TimerEvent &) {
      << " | paired SDK commit=" << ShortBuildCommit(LIVOX_SDK_GIT_COMMIT)
      << " SDK=" << LinkedSdkVersion()
      << " | compatibility=PINNED\n";
-  const uint32_t operating_count =
-      trend_count[kDashboardTrendStable] +
-      trend_count[kDashboardTrendObserve] +
-      trend_count[kDashboardTrendWatch] +
-      trend_count[kDashboardTrendUnstable];
-  ss << "==================== FLEET =======================\n"
-     << "  configured=" << startup_trackers.size()
-     << " shown=" << known_count
-     << " (configured=JSON whitelist; shown=rows below)\n"
-     << "  CURRENT: fault=" << trend_count[kDashboardTrendActive]
-     << " recovering=" << trend_count[kDashboardTrendRecovering]
-     << " intentional_idle=" << trend_count[kDashboardTrendIdle]
-     << " operating=" << operating_count << "\n"
-     << "  ASSESSMENT: unstable=" << trend_count[kDashboardTrendUnstable]
-     << " watch=" << trend_count[kDashboardTrendWatch]
-     << " observe=" << trend_count[kDashboardTrendObserve]
-     << " stable=" << trend_count[kDashboardTrendStable] << "\n";
   if (any_active_alert) {
     ss << "==================== CURRENT ALERTS ==============\n"
        << active_alerts.str();

@@ -380,13 +380,14 @@ def _compose_dashboard(
         driver_severity = "INFO"
 
     lines = [
-        "==================== SOURCE HEALTH ==================",
+        "==================== DATA SOURCE ====================",
         "  DRIVER   NOW=%s  severity=%s  driver_age=%s  expected=1Hz stale>5s"
         % (
             driver_state,
             driver_severity,
             _age_text_from_seconds(driver_age),
         ),
+        "  LIVE=realtime; DRIVER_STALE=the sections below are the last snapshot",
     ]
     manager_row = next(
         (

@@ -571,20 +571,17 @@ rosrun livox_ros_driver livox_stats_monitor.py
 > 或直接用绝对路径运行：`python3 $(rospack find livox_ros_driver)/livox_ros_driver/scripts/livox_stats_monitor.py`
 > （注意本仓库源码目录多嵌套一层 `livox_ros_driver`）。
 
-看板按固定层次显示：数据源存活、运行二进制版本、整组摘要、当前告警、当前逐台状态及掉线次数、最近60秒滚动指标、判定说明、Driver进程历史、继电器当前状态和最近5次持久操作历史。普通瞬时掉线标 `DISCONNECTED`，已归因的运行期掉线标 `NORMAL_NO_BROADCAST / NORMAL_DROPOUT`，启动缺失标 `STARTUP_MISSING`，显式唤醒归因则标 `WAKE_NO_BROADCAST / WAKE_DROPOUT`。白名单成员即使从未取得 SDK handle，也会以合成 `L255` 行出现：
+看板按固定层次显示：数据源存活、运行二进制版本、当前告警、当前逐台状态及掉线次数、最近60秒滚动指标、判定说明、Driver进程历史、继电器当前状态和最近5次持久操作历史。普通瞬时掉线标 `DISCONNECTED`，已归因的运行期掉线标 `NORMAL_NO_BROADCAST / NORMAL_DROPOUT`，启动缺失标 `STARTUP_MISSING`，显式唤醒归因则标 `WAKE_NO_BROADCAST / WAKE_DROPOUT`。白名单成员即使从未取得 SDK handle，也会以合成 `L255` 行出现：
 ```
-==================== SOURCE HEALTH ==================
+==================== DATA SOURCE ====================
   DRIVER   NOW=LIVE  severity=INFO  driver_age=0s  expected=1Hz stale>5s
+  LIVE=realtime; DRIVER_STALE=the sections below are the last snapshot
   POWER-MGR NOW=MANAGER_HEARTBEAT  severity=INFO  manager_age=2s  heartbeat=10s stale>30s
 
 ===== Livox LiDAR Status (1 Hz) =====
 ==================== SOFTWARE ====================
   (versions embedded in this running binary)
   Driver commit=<12-char SHA> ROS=2.6.0 | paired SDK commit=e45774c5d4f2 SDK=2.3.0 | compatibility=PINNED
-==================== FLEET =======================
-  configured=4 shown=4 (configured=JSON whitelist; shown=rows below)
-  CURRENT: fault=1 recovering=0 intentional_idle=1 operating=2
-  ASSESSMENT: unstable=1 watch=0 observe=0 stable=1
 ==================== CURRENT ALERTS ==============
   [CRIT] L1 3WEDH5900100671 POWER_CYCLE_REQUIRED reason=HANDSHAKE_STUCK age=12s
     handshake: broadcast=alive; reset=completed; power-cycle request published; see POWER RECOVERY manager
@@ -636,15 +633,14 @@ ID  broadcast_code     packet_loss  queue_drops  handshake_timeouts
 
 #### 怎么读看板
 
-##### 第一层：`SOURCE HEALTH`
+##### 第一层：`DATA SOURCE`
 
 - `DRIVER NOW=LIVE` 才表示下方 Driver 看板仍在实时更新；超过 5 秒没有收到新数据会变为 `DRIVER_STALE/CRITICAL`，此时下方内容只能当最后一次快照，不能当当前状态。
 - 收到过 manager 首帧后，同一区域还会显示 `POWER-MGR`；其心跳超过 30 秒未收到时显示 `MANAGER_STALE/CRITICAL`。底部 `POWER RECOVERY` 保留更完整的 manager/电源组细节。两者都按本机单调时钟计算，不受系统时间跳变或消息内时间戳影响。
 
-##### 第二层：`SOFTWARE`、`FLEET` 与 `CURRENT ALERTS`
+##### 第二层：`SOFTWARE` 与 `CURRENT ALERTS`
 
 - `SOFTWARE` 显示**正在运行的二进制**编译时内嵌的 Driver commit 和固定配套 SDK commit。源码更新后若尚未重启，这里仍会如实显示旧二进制版本；`compatibility=PINNED` 表示构建时已通过精确SDK SHA校验，不表示GitHub以后不会再发布更新。
-- `FLEET configured=4` 表示多雷达JSON白名单配置了4台；`shown=4` 表示下方当前有4行。旧版 `known=4` 只等同于现在的 `shown=4`，它从不表示4台在线或4台健康。`CURRENT` 是当前处置状态；`ASSESSMENT` 是无当前故障雷达的稳定性分级。
 - `CURRENT ALERTS` **只显示当前仍存在的故障**，恢复后立即消失。`POWER_CYCLE_REQUIRED` 以及已武装自动恢复的 `STARTUP_MISSING` 标为 `[CRIT]`，其余当前故障标为 `[ALERT]`；握手告警带 session reset 和 SDK 事件，唤醒告警带 request/generation，正常运行掉线带“健康至少 30 秒 + 当前静默至少 5 秒”证据，启动缺失带 30 秒宽限和合成 `handle=255`，`NO_DATA/ERROR/Config` 仍显示各自的有界软恢复阶段。
 - 顶部没有告警不代表进程内从未发生过故障；已经恢复的事件在底部 `PROCESS HISTORY` 查。
 
@@ -1110,9 +1106,9 @@ sudo systemctl restart livox-ros-driver && systemctl is-active livox-ros-driver
 
 卸载同样不是直接删文件：先把 launch 开关改回 `false` 并安全停止 Driver，再执行 `bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" --uninstall`。脚本只接受 Driver 已处于 `inactive/failed`，独立补 ON 成功后才删除 Driver drop-in；任何一步失败都会保留安全钩子，现场 JSON 和 SQLite 始终保留。
 
-查看自动硬恢复的最近状态可继续使用同一看板。看板最上方 `SOURCE HEALTH` 用本机单调时钟显示 Driver topic 的接收年龄：超过 5 秒没有新 `/livox/lidar_stats` 会明确显示 `NOW=DRIVER_STALE severity=CRITICAL`，不会用旧表和新的渲染时间伪装成实时数据。脚本自身每秒刷新，因此 Driver 和 manager 同时停发时 stale 年龄仍会继续增长。
+查看自动硬恢复的最近状态可继续使用同一看板。看板最上方 `DATA SOURCE` 用本机单调时钟显示 Driver topic 的接收年龄：超过 5 秒没有新 `/livox/lidar_stats` 会明确显示 `NOW=DRIVER_STALE severity=CRITICAL`，不会用旧表和新的渲染时间伪装成实时数据。脚本自身每秒刷新，因此 Driver 和 manager 同时停发时 stale 年龄仍会继续增长。
 
-`livox_stats_monitor.py` 在收到至少一条通过校验的manager消息后，会同时在顶部 `SOURCE HEALTH` 板块增加 `POWER-MGR` 摘要，并在Driver看板之后追加独立的 `POWER RECOVERY` 板块；若manager从未成功发布首帧，尚无可缓存身份，因此不会凭空显示manager行。详情中的 `MANAGER` 行显示manager的 `NOW/severity/manager_age`，每个 `GROUP <power_group>` 再分行显示该共享组的 `NOW/severity/rx_age/trigger/members/relay` 和完整 `detail`；`relay=1,2,3,4` 可直接确认本次状态对应四路集合，结构化status同时保留 `relay_channels` 和四种 `recovery_reason`。白名单外事件显示为 `UNMAPPED trigger=...`，绝不会伪装成manager行。这部分来自独立manager进程，不计入Driver的 `FLEET/ASSESSMENT/PROCESS HISTORY`；收到首帧后若manager心跳超过30秒未接收，顶部摘要和底部详情都会明确改显 `MANAGER_STALE/CRITICAL`。所有stale判定都用本机接收时刻，不信任消息内wall-clock。
+`livox_stats_monitor.py` 在收到至少一条通过校验的manager消息后，会同时在顶部 `DATA SOURCE` 板块增加 `POWER-MGR` 摘要，并在Driver看板之后追加独立的 `POWER RECOVERY` 板块；若manager从未成功发布首帧，尚无可缓存身份，因此不会凭空显示manager行。详情中的 `MANAGER` 行显示manager的 `NOW/severity/manager_age`，每个 `GROUP <power_group>` 再分行显示该共享组的 `NOW/severity/rx_age/trigger/members/relay` 和完整 `detail`；`relay=1,2,3,4` 可直接确认本次状态对应四路集合，结构化status同时保留 `relay_channels` 和四种 `recovery_reason`。白名单外事件显示为 `UNMAPPED trigger=...`，绝不会伪装成manager行。这部分来自独立manager进程，不计入Driver的逐台 `ASSESS` 和 `PROCESS HISTORY`；收到首帧后若manager心跳超过30秒未接收，顶部摘要和底部详情都会明确改显 `MANAGER_STALE/CRITICAL`。所有stale判定都用本机接收时刻，不信任消息内wall-clock。
 
 ```bash
 rostopic echo /livox/power_cycle_status
