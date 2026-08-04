@@ -337,6 +337,8 @@ static const char *PowerCycleReasonStr(LdsLidar::PowerCycleReason reason) {
       return "WAKE_DROPOUT";
     case LdsLidar::kPowerCycleReasonNormalDropout:
       return "NORMAL_DROPOUT";
+    case LdsLidar::kPowerCycleReasonErrorRebootExhausted:
+      return "ERROR_REBOOT_EXHAUSTED";
     case LdsLidar::kPowerCycleReasonStartupMissing:
       return "STARTUP_MISSING";
     default:
@@ -356,7 +358,10 @@ static bool IsPowerCycleRequired(const LdsLidar::LinkStat &link) {
          (link.power_cycle_reason ==
               LdsLidar::kPowerCycleReasonNormalDropout &&
           link.normal_dropout_state ==
-              LdsLidar::kNormalDropoutPowerCycleRequired);
+              LdsLidar::kNormalDropoutPowerCycleRequired) ||
+         (link.power_cycle_reason ==
+              LdsLidar::kPowerCycleReasonErrorRebootExhausted &&
+          link.measurement_session.error_power_cycle_required);
 }
 
 static const char *RecoveryStateStr(const LdsLidar::LinkStat &link) {
@@ -428,6 +433,10 @@ static void PublishRecoveryState(
   const bool normal_reason =
       IsPowerCycleRequired(link) &&
       link.power_cycle_reason == LdsLidar::kPowerCycleReasonNormalDropout;
+  const bool error_reason =
+      IsPowerCycleRequired(link) &&
+      link.power_cycle_reason ==
+          LdsLidar::kPowerCycleReasonErrorRebootExhausted;
   msg.data = BuildLidarRecoveryStateJson(
       static_cast<int64_t>(time(nullptr)), g_driver_instance_id, handle,
       broadcast_code, connected, ConnectStateStr(connect_state),
@@ -435,7 +444,8 @@ static void PublishRecoveryState(
       RecoveryStateStr(link),
       IsPowerCycleRequired(link) ? PowerCycleReasonStr(link.power_cycle_reason)
                                  : "NONE",
-      WakeStateStr(link.wake_state), wake_reason ? link.wake_request_id : 0,
+      error_reason ? "IDLE" : WakeStateStr(link.wake_state),
+      wake_reason ? link.wake_request_id : 0,
       wake_reason ? link.wake_connection_generation : 0,
       wake_reason ? link.wake_dropout_generation : 0,
       wake_reason ? link.wake_started_wall_s : 0,
@@ -443,12 +453,16 @@ static void PublishRecoveryState(
       wake_reason ? link.wake_dropout_wall_s : 0,
       broadcast_fresh, publishing, published_packets,
       link.power_cycle_required_count, link.power_cycle_required_wall_s,
-      NormalDropoutStateStr(link.normal_dropout_state),
+      error_reason ? "IDLE"
+                   : NormalDropoutStateStr(link.normal_dropout_state),
       normal_reason ? link.normal_connection_generation : 0,
       normal_reason ? link.normal_dropout_generation : 0,
       normal_reason ? link.normal_healthy_since_wall_s : 0,
       normal_reason ? link.normal_attributed_disconnect_wall_s : 0,
-      normal_reason ? link.normal_dropout_wall_s : 0, "IDLE", 0);
+      normal_reason ? link.normal_dropout_wall_s : 0, "IDLE", 0,
+      error_reason ? link.measurement_session.session_id : 0,
+      error_reason ? link.measurement_session.error_reboot_attempts : 0,
+      error_reason ? link.measurement_session.error_since_wall_s : 0);
   g_recovery_state_pub.publish(msg);
 }
 
@@ -470,6 +484,9 @@ static void PublishPowerCycleRequest(uint8_t handle, const char *broadcast_code,
       link.power_cycle_reason == LdsLidar::kPowerCycleReasonNormalDropout;
   const bool handshake_reason =
       link.power_cycle_reason == LdsLidar::kPowerCycleReasonHandshakeStuck;
+  const bool error_reason =
+      link.power_cycle_reason ==
+      LdsLidar::kPowerCycleReasonErrorRebootExhausted;
   std_msgs::String msg;
   msg.data = BuildPowerCycleRequestJson(
       event_id_text.c_str(), static_cast<int64_t>(time(nullptr)), detected_at,
@@ -487,7 +504,10 @@ static void PublishPowerCycleRequest(uint8_t handle, const char *broadcast_code,
       normal_reason ? link.normal_dropout_generation : 0,
       normal_reason ? link.normal_healthy_since_wall_s : 0,
       normal_reason ? link.normal_attributed_disconnect_wall_s : 0,
-      normal_reason ? link.normal_dropout_wall_s : 0, 0);
+      normal_reason ? link.normal_dropout_wall_s : 0, 0,
+      error_reason ? link.measurement_session.session_id : 0,
+      error_reason ? link.measurement_session.error_reboot_attempts : 0,
+      error_reason ? link.measurement_session.error_since_wall_s : 0);
   g_power_cycle_request_pub.publish(msg);
   ROS_ERROR("[LivoxPowerCycle] published request event_id=%s lidar[%u][%s]",
             event_id_text.c_str(), static_cast<unsigned>(handle),
@@ -605,15 +625,15 @@ static std::string CurrentHealthTags(uint32_t code) {
 static std::string DashboardNowState(
     bool connected, bool broadcast_recent, const char *connected_state,
     const LdsLidar::LinkStat &link) {
+  if (IsPowerCycleRequired(link)) {
+    return "POWER_CYCLE_REQUIRED";
+  }
   if (!connected) {
     const int64_t now =
         std::chrono::steady_clock::now().time_since_epoch().count();
     if (link.planned_group_power_cycle_active &&
         link.planned_group_power_cycle_deadline_ns >= now) {
       return "PLANNED_POWER_CYCLE";
-    }
-    if (IsPowerCycleRequired(link)) {
-      return "POWER_CYCLE_REQUIRED";
     }
     if (link.wake_state == LdsLidar::kWakeRecoveryDropout) {
       return "WAKE_DROPOUT";
@@ -740,10 +760,9 @@ static const uint32_t kConfigRebootMaxAttempts = 3;
 static const uint32_t kNoDataLogSec = 3;
 static const int64_t kStartupMissingGraceNs = 30000000000LL;
 
-/** The Error reboot budget (kErrorRebootMaxAttempts) is cleared only after the
- *  lidar has been out of Error this long. A reboot cycles through Init/Normal
- *  for a few ticks; clearing on any single non-Error tick would reset the
- *  budget every cycle and bypass the "max attempts then manual" stop. */
+/** Config recovery still requires sustained publication before its independent
+ *  reboot budget is cleared. Error recovery now belongs to a measurement
+ *  session and is cleared only by a verified Normal -> low-power completion. */
 static const uint32_t kErrorClearAfterSec = 60;
 
 /** Timer callback (runs on the AsyncSpinner thread, independent of the data
@@ -770,9 +789,6 @@ void StatsTimerCb(const ros::TimerEvent &) {
   static uint32_t zero_secs[kMaxLidarCount] = {0};      /**< stage timer of the current stall (reset when a recovery cycle recycles) */
   static uint32_t nodata_secs[kMaxLidarCount] = {0};    /**< whole-episode stall duration (display + NODATA/DATABACK log) */
   static uint8_t recover_stage[kMaxLidarCount] = {0};   /**< 0=ok 1=restarted sampling 2=rebooted */
-  static uint32_t error_secs[kMaxLidarCount] = {0};     /**< consecutive 1s ticks in Error state */
-  static uint32_t error_free_secs[kMaxLidarCount] = {0}; /**< consecutive non-Error ticks, for clearing the attempt budget */
-  static uint8_t error_reboots[kMaxLidarCount] = {0};   /**< reboots attempted this Error episode */
   static uint32_t config_secs[kMaxLidarCount] = {0};    /**< consecutive ticks stuck in Config */
   static uint8_t config_reboots[kMaxLidarCount] = {0};  /**< bounded reboots for the Config episode */
   static uint32_t config_healthy_secs[kMaxLidarCount] = {0}; /**< sustained published recovery before budget reset */
@@ -891,9 +907,6 @@ void StatsTimerCb(const ros::TimerEvent &) {
         zero_secs[h] = 0;
         nodata_secs[h] = 0;
         recover_stage[h] = 0;
-        error_secs[h] = 0;
-        error_free_secs[h] = 0;
-        error_reboots[h] = 0;
         config_secs[h] = 0;
         config_reboots[h] = 0;
         config_healthy_secs[h] = 0;
@@ -1120,68 +1133,146 @@ void StatsTimerCb(const ros::TimerEvent &) {
         }
       }
 
-      /** (C) Error-state auto-recovery. A lidar reporting Error (e.g. a
-       *  recoverable motor fault) never counts as "streaming", so path (B)
-       *  above ignores it. Reboot just this lidar on a bounded schedule. */
-      bool in_error = (info.state == kLidarStateError);
-      if (in_error) {
-        error_secs[h]++;
-        error_free_secs[h] = 0;
-      } else {
-        error_secs[h] = 0;      /** left Error (recovered or other state) */
-        /** Clear the reboot budget only after a SUSTAINED recovery
-         *  (kErrorClearAfterSec out of Error). A reboot passes through
-         *  Init/Normal for a few ticks; clearing on any one of them would
-         *  reset the budget every cycle and turn "max 3 attempts then
-         *  manual" into an endless reboot loop. */
-        if (error_reboots[h] != 0 && ++error_free_secs[h] >= kErrorClearAfterSec) {
-          error_reboots[h] = 0;
-          error_free_secs[h] = 0;
+      /** (C) Error-state recovery is budgeted by the operator's measurement
+       *  session. Reconnects and temporary healthy periods do not erase the
+       *  three soft-reboot attempts. A fourth confirmed Error escalates the
+       *  shared relay; only a healthy, successful Normal -> low-power close
+       *  clears the budget. */
+      const bool in_error = (info.state == kLidarStateError);
+      MeasurementTickResult measurement_result;
+      uint64_t measurement_session_id = 0;
+      uint8_t measurement_attempts_before = 0;
+      int64_t measurement_error_since_ns = 0;
+      {
+        std::lock_guard<std::mutex> lock(
+            g_read_lidar->link_stat_lock_[h]);
+        LdsLidar::LinkStat &live = g_read_lidar->link_stat_[h];
+        MeasurementTickInput input;
+        input.connected = watchdog_connected;
+        input.in_error = in_error;
+        input.normal_sampling_publishing =
+            info.state == kLidarStateNormal &&
+            connect_state == kConnectStateSampling && publishing_now;
+        input.mode_transition_active = transition_active;
+        input.auto_recover = g_auto_recover;
+        input.connection_generation = connection_generation;
+        input.now_ns = now_ns;
+        input.now_wall_s = static_cast<int64_t>(time(nullptr));
+        measurement_result = TickMeasurementSession(
+            &live.measurement_session, input, kErrorRebootDelaySec, 3,
+            kErrorRebootMaxAttempts,
+            static_cast<int64_t>(kErrorRebootCooldownSec) * 1000000000LL);
+        if (measurement_result.power_cycle_cancelled &&
+            live.power_cycle_reason ==
+                LdsLidar::kPowerCycleReasonErrorRebootExhausted) {
+          live.power_cycle_reason = LdsLidar::kPowerCycleReasonNone;
         }
+        measurement_session_id = live.measurement_session.session_id;
+        measurement_attempts_before =
+            live.measurement_session.error_reboot_attempts;
+        measurement_error_since_ns =
+            live.measurement_session.error_since_ns;
+        ls = live;
       }
-      if (g_auto_recover && in_error) {
-        if (error_reboots[h] < kErrorRebootMaxAttempts) {
-          /** reboot #n is due at delay + n*cooldown seconds in Error
-           *  (3s, 43s, 83s for delay=3, cooldown=40). error_secs is frozen
-           *  while the lidar is disconnected mid-reboot, so the real gap is
-           *  the cooldown plus reconnect time. */
-          uint32_t due = kErrorRebootDelaySec +
-                         error_reboots[h] * kErrorRebootCooldownSec;
-          if (error_secs[h] >= due &&
-              ((error_secs[h] - due) % 5) == 0) {
-            livox_status s = g_read_lidar->RequestLidarReboot(h);
-            if (s == kStatusSuccess) {
-              int64_t now_wall = (int64_t)time(nullptr);
-              {
-                std::lock_guard<std::mutex> lock(
-                    g_read_lidar->link_stat_lock_[h]);
-                LdsLidar::LinkStat &live = g_read_lidar->link_stat_[h];
-                live.recover_reboot_count++;
-                live.recover_last_wall_s = now_wall;
-                ls.recover_reboot_count = live.recover_reboot_count;
-                ls.recover_last_wall_s = live.recover_last_wall_s;
-              }
-              error_reboots[h]++;
-              ROS_WARN("[LivoxRecover] Lidar[%d] in Error %us -> reboot "
-                       "(attempt %u/%u)", h, error_secs[h],
-                       static_cast<unsigned>(error_reboots[h]),
-                       kErrorRebootMaxAttempts);
-              char rb[40];
-              snprintf(rb, sizeof(rb), "Error %us attempt %u/%u",
-                       error_secs[h],
-                       static_cast<unsigned>(error_reboots[h]),
-                       kErrorRebootMaxAttempts);
-              hlog.LogEvent(h, last_bcode[h], "REBOOT", rb);
-            } else {
-              ROS_WARN("[LivoxRecover] Lidar[%d] Error reboot was not "
-                       "accepted: %d", h, s);
+      if (measurement_result.implicit_session_started) {
+        ROS_WARN("[LivoxRecover] Lidar[%d] entered Error without an explicit "
+                 "wake boundary; started implicit measurement session %llu",
+                 h, static_cast<unsigned long long>(measurement_session_id));
+        hlog.LogEvent(h, last_bcode[h], "MEASUREMENT_SESSION_IMPLICIT",
+                      "Error observed while Driver started in Normal");
+      }
+      if (measurement_result.recovery_confirmed_edge) {
+        hlog.LogEvent(h, last_bcode[h], "ERROR_RECOVERY_CONFIRMED",
+                      "point cloud healthy for 3s; budget retained until sleep");
+      }
+      if (measurement_result.power_cycle_cancelled) {
+        hlog.LogEvent(h, last_bcode[h], "POWER_CYCLE_CANCELLED_ERROR_CLEARED",
+                      "Error state cleared before relay precheck");
+      }
+      if (measurement_result.action == kMeasurementErrorSoftReboot) {
+        livox_status status =
+            g_read_lidar->RequestLidarRebootIfModeIdle(h);
+        if (status == kStatusSuccess) {
+          const int64_t accepted_ns =
+              std::chrono::steady_clock::now().time_since_epoch().count();
+          const int64_t accepted_wall_s = static_cast<int64_t>(time(nullptr));
+          bool committed = false;
+          uint8_t committed_attempt = 0;
+          {
+            std::lock_guard<std::mutex> lock(
+                g_read_lidar->link_stat_lock_[h]);
+            LdsLidar::LinkStat &live = g_read_lidar->link_stat_[h];
+            if (live.measurement_session.active &&
+                live.measurement_session.session_id ==
+                    measurement_session_id &&
+                live.measurement_session.error_reboot_attempts ==
+                    measurement_attempts_before) {
+              CommitMeasurementErrorReboot(
+                  &live.measurement_session, connection_generation,
+                  accepted_ns);
+              live.recover_reboot_count++;
+              live.recover_last_wall_s = accepted_wall_s;
+              committed_attempt =
+                  live.measurement_session.error_reboot_attempts;
+              ls = live;
+              committed = true;
             }
           }
-        } else if ((error_secs[h] % 30) == 0) {
-          /** Exhausted attempts: stop rebooting, warn loudly every 30s. */
-          ROS_ERROR("[LivoxRecover] Lidar[%d] still in Error after %u reboots; "
-                    "manual intervention needed (likely fan/motor hardware "
-                    "fault)", h, kErrorRebootMaxAttempts);
+          if (committed) {
+            ROS_WARN("[LivoxRecover] Lidar[%d] Error persisted 3s -> reboot "
+                     "(measurement session %llu attempt %u/%u)", h,
+                     static_cast<unsigned long long>(measurement_session_id),
+                     static_cast<unsigned>(committed_attempt),
+                     kErrorRebootMaxAttempts);
+            char detail[96];
+            snprintf(detail, sizeof(detail),
+                     "Error 3s session %llu attempt %u/%u",
+                     static_cast<unsigned long long>(measurement_session_id),
+                     static_cast<unsigned>(committed_attempt),
+                     kErrorRebootMaxAttempts);
+            hlog.LogEvent(h, last_bcode[h], "REBOOT", detail);
+          }
+        } else {
+          ROS_WARN("[LivoxRecover] Lidar[%d] Error reboot was not accepted: %d",
+                   h, status);
+        }
+      } else if (measurement_result.action ==
+                 kMeasurementErrorPowerCycle) {
+        bool committed = false;
+        {
+          std::lock_guard<std::mutex> lock(
+              g_read_lidar->link_stat_lock_[h]);
+          LdsLidar::LinkStat &live = g_read_lidar->link_stat_[h];
+          MeasurementSessionState &session = live.measurement_session;
+          if (session.active && session.session_id == measurement_session_id &&
+              session.error_reboot_attempts >= kErrorRebootMaxAttempts &&
+              session.error_active &&
+              session.error_since_ns == measurement_error_since_ns &&
+              (live.power_cycle_reason == LdsLidar::kPowerCycleReasonNone ||
+               live.power_cycle_reason ==
+                   LdsLidar::kPowerCycleReasonErrorRebootExhausted)) {
+            CommitMeasurementErrorPowerCycle(&session);
+            live.power_cycle_reason =
+                LdsLidar::kPowerCycleReasonErrorRebootExhausted;
+            live.power_cycle_required_count++;
+            if (!session.error_power_cycle_counted_this_session) {
+              live.power_cycle_required_episode_count++;
+              live.error_power_cycle_episode_count++;
+              session.error_power_cycle_counted_this_session = true;
+            }
+            live.power_cycle_required_wall_s =
+                static_cast<int64_t>(time(nullptr));
+            ls = live;
+            committed = true;
+          }
+        }
+        if (committed) {
+          ROS_ERROR("[LivoxRecover] Lidar[%d] fourth Error in measurement "
+                    "session %llu; shared power cycle required", h,
+                    static_cast<unsigned long long>(measurement_session_id));
+          hlog.LogEvent(
+              h, last_bcode[h], "POWER_CYCLE_REQUIRED",
+              "reason=ERROR_REBOOT_EXHAUSTED; 3 soft reboots already accepted");
         }
       }
 
@@ -1251,6 +1342,10 @@ void StatsTimerCb(const ros::TimerEvent &) {
     const uint64_t expected_normal_generation =
         ls.normal_dropout_generation;
     const int64_t expected_normal_silence = ls.normal_dropout_since_ns;
+    const uint64_t expected_error_session =
+        ls.measurement_session.session_id;
+    const int64_t expected_error_since =
+        ls.measurement_session.error_since_ns;
     const LdsLidar::PowerCycleReason expected_power_reason =
         ls.power_cycle_reason;
     const uint32_t expected_power_count = ls.power_cycle_required_count;
@@ -1277,11 +1372,17 @@ void StatsTimerCb(const ros::TimerEvent &) {
                      ? live.wake_request_id == expected_wake_request_id &&
                            live.wake_dropout_since_ns == expected_wake_dropout
                      : expected_power_reason ==
-                               LdsLidar::kPowerCycleReasonNormalDropout &&
-                           live.normal_dropout_generation ==
-                               expected_normal_generation &&
-                           live.normal_dropout_since_ns ==
-                               expected_normal_silence) &&
+                               LdsLidar::kPowerCycleReasonNormalDropout
+                           ? live.normal_dropout_generation ==
+                                     expected_normal_generation &&
+                                 live.normal_dropout_since_ns ==
+                                     expected_normal_silence
+                           : expected_power_reason ==
+                                     LdsLidar::kPowerCycleReasonErrorRebootExhausted &&
+                                 live.measurement_session.session_id ==
+                                     expected_error_session &&
+                                 live.measurement_session.error_since_ns ==
+                                     expected_error_since) &&
           live.power_cycle_required_count == expected_power_count;
       /** Keep the later footer coherent with the state just published. */
       ls = live;
@@ -1378,6 +1479,10 @@ void StatsTimerCb(const ros::TimerEvent &) {
     const bool power_reason_normal =
         display_state == "POWER_CYCLE_REQUIRED" &&
         ls.power_cycle_reason == LdsLidar::kPowerCycleReasonNormalDropout;
+    const bool power_reason_error =
+        display_state == "POWER_CYCLE_REQUIRED" &&
+        ls.power_cycle_reason ==
+            LdsLidar::kPowerCycleReasonErrorRebootExhausted;
     const bool handshake_incident =
         display_state == "HANDSHAKE_STUCK" ||
         power_reason_handshake;
@@ -1525,6 +1630,18 @@ void StatsTimerCb(const ros::TimerEvent &) {
           active_alerts << "; post-reset observation";
         }
         active_alerts << "\n";
+      } else if (power_reason_error) {
+        active_alerts
+            << " age="
+            << FmtDur(now_ns - ls.measurement_session.error_since_ns)
+            << "\n    error: measurement session="
+            << ls.measurement_session.session_id
+            << "; soft reboots="
+            << static_cast<unsigned>(
+                   ls.measurement_session.error_reboot_attempts)
+            << "/" << kErrorRebootMaxAttempts
+            << "; fourth Error persisted 3s; shared power-cycle request "
+               "published\n";
       } else if (display_state == "STARTUP_MISSING") {
         active_alerts
             << "\n    startup: configured whitelist member absent; "
@@ -1541,9 +1658,16 @@ void StatsTimerCb(const ros::TimerEvent &) {
         active_alerts << "\n    stream: silent=" << nodata_secs[h]
                       << "s; recovery=" << stage << "\n";
       } else if (display_state == "ERROR") {
-        active_alerts << "\n    error: age=" << error_secs[h]
-                      << "s; reboot actions this episode="
-                      << static_cast<unsigned>(error_reboots[h]) << "/"
+        const std::string error_age =
+            ls.measurement_session.error_since_ns != 0 &&
+                    now_ns >= ls.measurement_session.error_since_ns
+                ? FmtDur(now_ns - ls.measurement_session.error_since_ns)
+                : "--";
+        active_alerts << "\n    error: age=" << error_age
+                      << "; reboot actions this measurement="
+                      << static_cast<unsigned>(
+                             ls.measurement_session.error_reboot_attempts)
+                      << "/"
                       << kErrorRebootMaxAttempts
                        << "; auto-recover=" << (g_auto_recover ? "on" : "off")
                        << "\n";

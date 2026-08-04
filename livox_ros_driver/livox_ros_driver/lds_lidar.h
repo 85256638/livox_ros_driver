@@ -40,6 +40,7 @@
 
 #include "lds.h"
 #include "livox_sdk.h"
+#include "measurement_session_policy.h"
 #include "rapidjson/document.h"
 #include "timesync.h"
 
@@ -170,6 +171,7 @@ class LdsLidar : public Lds {
     kPowerCycleReasonHandshakeStuck,
     kPowerCycleReasonWakeDropout,
     kPowerCycleReasonNormalDropout,
+    kPowerCycleReasonErrorRebootExhausted,
     kPowerCycleReasonStartupMissing
   };
 
@@ -235,6 +237,10 @@ class LdsLidar : public Lds {
     uint32_t handshake_power_cycle_episode_count = 0;
     uint32_t wake_power_cycle_episode_count = 0;
     uint32_t normal_power_cycle_episode_count = 0;
+    uint32_t error_power_cycle_episode_count = 0;
+    /** Error recovery belongs to one measurement session rather than one
+     *  transient connection. Soft reboots and reconnects keep this budget. */
+    MeasurementSessionState measurement_session;
     /** Shared relay outages acknowledged before OFF are maintenance actions,
      *  not single-lidar instability. Keep them visible without incrementing
      *  disconnect/normal-dropout/power-escalation history. */
@@ -343,6 +349,7 @@ class LdsLidar : public Lds {
       explicit_wake_source = false;
       explicit_wake_generation = 0;
       wake_observation_armed = false;
+      measurement_close_eligible = false;
       memset(broadcast_code, 0, sizeof(broadcast_code));
     }
 
@@ -360,6 +367,8 @@ class LdsLidar : public Lds {
     bool explicit_wake_source; /**< initial explicit request saw PowerSaving/StandBy */
     uint64_t explicit_wake_generation; /**< session which supplied that low-power fact */
     bool wake_observation_armed; /**< first accepted SDK enqueue armed LinkStat */
+    bool measurement_close_eligible; /**< healthy snapshot captured before a
+                                       *   Normal -> low-power request */
     char broadcast_code[kBroadcastCodeSize];
   };
 
@@ -413,7 +422,10 @@ class LdsLidar : public Lds {
   bool ResetModeRequestIfTarget(uint8_t handle, LidarMode target,
                                 uint64_t expected_request_id = 0,
                                 uint64_t expected_command_id = 0,
-                                uint64_t expected_generation = 0);
+                                uint64_t expected_generation = 0,
+                                bool *measurement_close_eligible = nullptr);
+  void RecordMeasurementModeSuccess(uint8_t handle, LidarMode mode,
+                                    bool close_was_eligible);
   void MarkModeRequestDisconnected(uint8_t handle);
   livox_status SendModeChangeRequest(uint8_t handle, LidarMode mode,
                                      bool from_reconnect,

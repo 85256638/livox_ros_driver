@@ -33,7 +33,8 @@ int main() {
       "\"normal_dropout_generation\":0,"
       "\"normal_healthy_since_at\":0,\"normal_dropout_at\":0,"
       "\"normal_silence_at\":0,\"startup_state\":\"IDLE\","
-      "\"startup_missing_since\":0,"
+      "\"startup_missing_since\":0,\"measurement_session_id\":0,"
+      "\"error_reboot_attempts\":0,\"error_since_at\":0,"
       "\"broadcast_fresh\":true,\"publishing\":false,"
       "\"published_packets\":1234,\"power_cycle_required_count\":2,"
       "\"power_cycle_required_at\":99}";
@@ -59,6 +60,8 @@ int main() {
       "\"normal_dropout_generation\":0,"
       "\"normal_healthy_since_at\":0,\"normal_dropout_at\":0,"
       "\"normal_silence_at\":0,\"startup_missing_since\":0,"
+      "\"measurement_session_id\":0,\"error_reboot_attempts\":0,"
+      "\"error_since_at\":0,"
       "\"session_reset_attempts\":1,"
       "\"episode_count\":2}";
   if (request != expected_request) {
@@ -137,6 +140,38 @@ int main() {
           std::string::npos) {
     std::cerr << "startup state JSON mismatch:\n" << startup_state << "\n";
     return 8;
+  }
+
+  const std::string error_request = BuildPowerCycleRequestJson(
+      "error:event", 300, 300, 204, 0, "TESTLIDAR000005",
+      "ERROR_REBOOT_EXHAUSTED", true, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0,
+      0, 0, 0, 0, 42, 3, 296);
+  if (error_request.find(
+          "\"recovery_reason\":\"ERROR_REBOOT_EXHAUSTED\"") ==
+          std::string::npos ||
+      error_request.find("\"measurement_session_id\":42") ==
+          std::string::npos ||
+      error_request.find("\"error_reboot_attempts\":3") ==
+          std::string::npos ||
+      error_request.find("\"error_since_at\":296") ==
+          std::string::npos) {
+    std::cerr << "Error exhaustion request JSON mismatch:\n"
+              << error_request << "\n";
+    return 9;
+  }
+
+  const std::string error_state = BuildLidarRecoveryStateJson(
+      300, 204, 0, "TESTLIDAR000005", true, "Sampling", "Error", "IDLE",
+      "POWER_CYCLE_REQUIRED", "ERROR_REBOOT_EXHAUSTED", "IDLE", 0, 0,
+      0, 0, 0, 0, true, false, 900, 7, 300, "IDLE", 0, 0, 0, 0, 0,
+      "IDLE", 0, 42, 3, 296);
+  if (error_state.find("\"connected\":true") == std::string::npos ||
+      error_state.find("\"lidar_state\":\"Error\"") == std::string::npos ||
+      error_state.find("\"measurement_session_id\":42") ==
+          std::string::npos) {
+    std::cerr << "Error exhaustion state JSON mismatch:\n"
+              << error_state << "\n";
+    return 10;
   }
 
   std::cout << "recovery_event_json_qc: OK\n";

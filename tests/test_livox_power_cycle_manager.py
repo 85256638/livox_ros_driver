@@ -263,6 +263,9 @@ def _required_state(broadcast_code=BCODE, driver_instance=123, episode_count=1):
         "normal_silence_at": 0,
         "startup_state": "IDLE",
         "startup_missing_since": 0,
+        "measurement_session_id": 0,
+        "error_reboot_attempts": 0,
+        "error_since_at": 0,
         "broadcast_fresh": True,
         "publishing": False,
         "published_packets": 0,
@@ -370,6 +373,35 @@ def _startup_required_state(
             "startup_state": "POWER_CYCLE_REQUIRED",
             "startup_missing_since": now - 30,
             "broadcast_fresh": False,
+            "power_cycle_required_at": now,
+        }
+    )
+    return payload
+
+
+def _error_required_state(
+    broadcast_code=BCODE, driver_instance=123, episode_count=1
+):
+    now = int(time.time())
+    payload = _required_state(
+        broadcast_code, driver_instance, episode_count
+    )
+    payload.update(
+        {
+            "timestamp": now,
+            "connected": True,
+            "connect_state": "Sampling",
+            "lidar_state": "Error",
+            "handshake_state": "IDLE",
+            "recovery_reason": "ERROR_REBOOT_EXHAUSTED",
+            "wake_state": "IDLE",
+            "normal_state": "IDLE",
+            "startup_state": "IDLE",
+            "broadcast_fresh": True,
+            "publishing": False,
+            "measurement_session_id": 42,
+            "error_reboot_attempts": 3,
+            "error_since_at": now - 3,
             "power_cycle_required_at": now,
         }
     )
@@ -900,8 +932,48 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "session-reset evidence"):
             manager.PowerCycleRequest.from_payload(unrelated_reset)
 
+    def test_error_exhaustion_requires_live_error_and_session_evidence(self):
+        state = _error_required_state()
+        request = manager.PowerCycleRequest.from_state(state)
+        self.assertEqual(
+            request.recovery_reason,
+            manager.RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED,
+        )
+        self.assertEqual(request.measurement_session_id, 42)
+        self.assertEqual(request.error_reboot_attempts, 3)
+        manager.PowerCycleRequest.from_payload(_request_payload_from_state(state))
+
+        for field, value in (
+            ("connected", False),
+            ("connect_state", "Off"),
+            ("lidar_state", "Normal"),
+            ("publishing", True),
+            ("measurement_session_id", 0),
+            ("error_reboot_attempts", 2),
+            ("error_since_at", state["power_cycle_required_at"] - 2),
+            ("wake_state", "OBSERVING"),
+            ("normal_state", "NORMAL_DROPOUT"),
+            ("startup_state", "POWER_CYCLE_REQUIRED"),
+            ("handle", 255),
+        ):
+            with self.subTest(field=field):
+                invalid = dict(state)
+                invalid[field] = value
+                with self.assertRaises(ValueError):
+                    manager.PowerCycleRequest.from_state(invalid)
+
+        unrelated_reset = _request_payload_from_state(state)
+        unrelated_reset["session_reset_attempts"] = 1
+        with self.assertRaisesRegex(ValueError, "session-reset evidence"):
+            manager.PowerCycleRequest.from_payload(unrelated_reset)
+
     def test_only_startup_missing_may_use_synthetic_handle(self):
-        for factory in (_required_state, _wake_required_state, _normal_required_state):
+        for factory in (
+            _required_state,
+            _wake_required_state,
+            _normal_required_state,
+            _error_required_state,
+        ):
             with self.subTest(factory=factory.__name__):
                 payload = _request_payload_from_state(factory())
                 payload["handle"] = 255
@@ -2126,6 +2198,15 @@ class StoreTests(unittest.TestCase):
                 migrated.obligations()[0][3],
                 manager.RECOVERY_REASON_STARTUP_MISSING,
             )
+            migrated.clear_obligation(target.power_key, startup.event_id)
+            error = manager.PowerCycleRequest.from_state(
+                _error_required_state(MEMBERS[3], episode_count=4)
+            )
+            migrated.set_obligation(error, target)
+            self.assertEqual(
+                migrated.obligations()[0][3],
+                manager.RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED,
+            )
             db = sqlite3.connect(str(path))
             try:
                 self.assertEqual(
@@ -2146,14 +2227,14 @@ class StoreTests(unittest.TestCase):
             finally:
                 db.close()
 
-            class FailingV5Store(manager.StateStore):
+            class FailingV6Store(manager.StateStore):
                 def _connect(self):
                     connection = super()._connect()
 
                     def authorize(action, one, _two, _db_name, _source):
                         if (
                             action == sqlite3.SQLITE_CREATE_TABLE
-                            and one == "power_obligations_v5"
+                            and one == "power_obligations_v6"
                         ):
                             return sqlite3.SQLITE_DENY
                         return sqlite3.SQLITE_OK
@@ -2162,7 +2243,7 @@ class StoreTests(unittest.TestCase):
                     return connection
 
             with self.assertRaises(sqlite3.DatabaseError):
-                FailingV5Store(str(path))
+                FailingV6Store(str(path))
             db = sqlite3.connect(str(path))
             try:
                 self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
@@ -2176,8 +2257,8 @@ class StoreTests(unittest.TestCase):
                 db.close()
             self.assertIn("power_events", tables)
             self.assertIn("power_obligations", tables)
-            self.assertNotIn("power_events_v5", tables)
-            self.assertNotIn("power_obligations_v5", tables)
+            self.assertNotIn("power_events_v6", tables)
+            self.assertNotIn("power_obligations_v6", tables)
 
     def test_obligation_survives_reopen_with_group_and_trigger_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3644,10 +3725,14 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(power_off["broadcast_code"], trigger)
             self.assertFalse(manager.StateStore(config.state_db).obligations())
 
-    def test_normal_and_startup_causes_each_trigger_one_shared_cycle(self):
+    def test_non_handshake_causes_each_trigger_one_shared_cycle(self):
         cases = (
             (_normal_required_state, manager.RECOVERY_REASON_NORMAL_DROPOUT),
             (_startup_required_state, manager.RECOVERY_REASON_STARTUP_MISSING),
+            (
+                _error_required_state,
+                manager.RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED,
+            ),
         )
         for factory, expected_reason in cases:
             with self.subTest(reason=expected_reason), tempfile.TemporaryDirectory() as tmp:

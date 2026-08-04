@@ -203,6 +203,7 @@ if(CATKIN_ENABLE_TESTING)
   set(LIVOX_RECOVERY_QC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tests")
   set(LIVOX_RECOVERY_QC_TARGETS
     dashboard_metrics_qc
+    measurement_session_policy_qc
     normal_dropout_policy_qc
     wake_dropout_policy_qc
     recovery_event_json_qc

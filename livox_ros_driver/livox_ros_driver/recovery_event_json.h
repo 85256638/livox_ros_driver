@@ -72,7 +72,10 @@ inline std::string BuildLidarRecoveryStateJson(
     int64_t normal_dropout_at = 0,
     int64_t normal_silence_at = 0,
     const char *startup_state = "IDLE",
-    int64_t startup_missing_since = 0) {
+    int64_t startup_missing_since = 0,
+    uint64_t measurement_session_id = 0,
+    uint8_t error_reboot_attempts = 0,
+    int64_t error_since_at = 0) {
   std::ostringstream json;
   json << "{\"schema_version\":1,\"type\":\"LIDAR_RECOVERY_STATE\""
        << ",\"timestamp\":" << timestamp
@@ -109,6 +112,10 @@ inline std::string BuildLidarRecoveryStateJson(
        << ",\"startup_state\":\"" << RecoveryJsonEscape(startup_state)
        << "\""
        << ",\"startup_missing_since\":" << startup_missing_since
+       << ",\"measurement_session_id\":" << measurement_session_id
+       << ",\"error_reboot_attempts\":"
+       << static_cast<unsigned>(error_reboot_attempts)
+       << ",\"error_since_at\":" << error_since_at
        << ",\"broadcast_fresh\":"
        << (broadcast_fresh ? "true" : "false")
        << ",\"publishing\":" << (publishing ? "true" : "false")
@@ -133,7 +140,10 @@ inline std::string BuildPowerCycleRequestJson(
     int64_t normal_healthy_since_at = 0,
     int64_t normal_dropout_at = 0,
     int64_t normal_silence_at = 0,
-    int64_t startup_missing_since = 0) {
+    int64_t startup_missing_since = 0,
+    uint64_t measurement_session_id = 0,
+    uint8_t error_reboot_attempts = 0,
+    int64_t error_since_at = 0) {
   std::ostringstream json;
   json << "{\"schema_version\":1,\"type\":\"POWER_CYCLE_REQUIRED\""
        << ",\"event_id\":\"" << RecoveryJsonEscape(event_id) << "\""
@@ -161,6 +171,10 @@ inline std::string BuildPowerCycleRequestJson(
        << ",\"normal_dropout_at\":" << normal_dropout_at
        << ",\"normal_silence_at\":" << normal_silence_at
        << ",\"startup_missing_since\":" << startup_missing_since
+       << ",\"measurement_session_id\":" << measurement_session_id
+       << ",\"error_reboot_attempts\":"
+       << static_cast<unsigned>(error_reboot_attempts)
+       << ",\"error_since_at\":" << error_since_at
        << ",\"session_reset_attempts\":"
        << static_cast<unsigned>(session_reset_attempts)
        << ",\"episode_count\":" << episode_count << "}";

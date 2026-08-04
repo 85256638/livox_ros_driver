@@ -2,7 +2,7 @@
 """Fail-safe CORX relay power-cycle manager for Livox LiDAR recovery.
 
 The Livox driver publishes a POWER_CYCLE_REQUIRED event only after a bounded
-soft-recovery/attribution path reaches one of four strict causes: a live-
+soft-recovery/attribution path reaches one of five strict causes: a live-
 broadcast handshake stall, an explicit low-power wake dropout, a sustained
 dropout after healthy Normal publication, or a configured member missing at
 startup.  This independent ROS node validates cause-specific live evidence and an explicit power-group
@@ -42,7 +42,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 WIRE_SCHEMA_VERSION = 1
 CONFIG_SCHEMA_VERSION = 2
-STATE_DB_SCHEMA_VERSION = 5
+STATE_DB_SCHEMA_VERSION = 6
 REQUEST_TYPE = "POWER_CYCLE_REQUIRED"
 STATE_TYPE = "LIDAR_RECOVERY_STATE"
 STATUS_TYPE = "POWER_CYCLE_STATUS"
@@ -56,11 +56,13 @@ RECOVERY_REASON_HANDSHAKE = "HANDSHAKE_STUCK"
 RECOVERY_REASON_WAKE_DROPOUT = "WAKE_DROPOUT"
 RECOVERY_REASON_NORMAL_DROPOUT = "NORMAL_DROPOUT"
 RECOVERY_REASON_STARTUP_MISSING = "STARTUP_MISSING"
+RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED = "ERROR_REBOOT_EXHAUSTED"
 RECOVERY_REASONS = {
     RECOVERY_REASON_HANDSHAKE,
     RECOVERY_REASON_WAKE_DROPOUT,
     RECOVERY_REASON_NORMAL_DROPOUT,
     RECOVERY_REASON_STARTUP_MISSING,
+    RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED,
 }
 WAKE_STATE_REQUIRED = REQUEST_TYPE
 TERMINAL_EVENT_STATES = {
@@ -116,6 +118,8 @@ _WAKE_DROPOUT_CONFIRM_MIN_SECONDS = 10.0
 _NORMAL_HEALTHY_ARM_MIN_SECONDS = 30.0
 _NORMAL_DROPOUT_CONFIRM_MIN_SECONDS = 5.0
 _STARTUP_MISSING_GRACE_MIN_SECONDS = 30.0
+_ERROR_CONFIRM_MIN_SECONDS = 3.0
+_ERROR_REBOOT_ATTEMPTS_REQUIRED = 3
 _EVENT_TIME_FUTURE_TOLERANCE_SECONDS = 2.0
 
 
@@ -314,6 +318,9 @@ class PowerCycleRequest:
     normal_dropout_at: float = 0.0
     normal_silence_at: float = 0.0
     startup_missing_since: float = 0.0
+    measurement_session_id: int = 0
+    error_reboot_attempts: int = 0
+    error_since_at: float = 0.0
 
     @property
     def identity(self) -> Tuple[Any, ...]:
@@ -344,6 +351,9 @@ class PowerCycleRequest:
             int(self.normal_dropout_at),
             int(self.normal_silence_at),
             int(self.startup_missing_since),
+            self.measurement_session_id,
+            self.error_reboot_attempts,
+            int(self.error_since_at),
         )
 
     @classmethod
@@ -378,6 +388,11 @@ class PowerCycleRequest:
             normal_silence_at,
             startup_missing_since,
         ) = _recovery_evidence(payload, recovery_reason)
+        (
+            measurement_session_id,
+            error_reboot_attempts,
+            error_since_at,
+        ) = _error_recovery_evidence(payload, recovery_reason)
         session_reset_attempts = _integer(
             payload, "session_reset_attempts", default=0, minimum=0, maximum=255
         )
@@ -431,15 +446,23 @@ class PowerCycleRequest:
             raise ValueError(
                 "STARTUP_MISSING request violates the 30s startup grace"
             )
+        if (
+            recovery_reason == RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED
+            and detected_at - error_since_at < _ERROR_CONFIRM_MIN_SECONDS
+        ):
+            raise ValueError(
+                "ERROR_REBOOT_EXHAUSTED request violates the 3s Error confirmation"
+            )
         if detected_at > timestamp + _EVENT_TIME_FUTURE_TOLERANCE_SECONDS:
             raise ValueError("power-cycle detection follows request timestamp")
         broadcast_fresh = payload.get("broadcast_fresh")
         if not isinstance(broadcast_fresh, bool):
             raise ValueError("broadcast_fresh must be a boolean in request")
-        expected_broadcast_fresh = (
-            recovery_reason == RECOVERY_REASON_HANDSHAKE
-        )
-        if broadcast_fresh is not expected_broadcast_fresh:
+        expected_broadcast_fresh = recovery_reason == RECOVERY_REASON_HANDSHAKE
+        if (
+            recovery_reason != RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED
+            and broadcast_fresh is not expected_broadcast_fresh
+        ):
             raise ValueError(
                 "%s request has inconsistent broadcast_fresh"
                 % recovery_reason
@@ -485,6 +508,9 @@ class PowerCycleRequest:
             normal_dropout_at=normal_dropout_at,
             normal_silence_at=normal_silence_at,
             startup_missing_since=startup_missing_since,
+            measurement_session_id=measurement_session_id,
+            error_reboot_attempts=error_reboot_attempts,
+            error_since_at=error_since_at,
         )
 
     @classmethod
@@ -583,10 +609,11 @@ def _recovery_reason(
         RECOVERY_REASON_WAKE_DROPOUT,
         RECOVERY_REASON_NORMAL_DROPOUT,
         RECOVERY_REASON_STARTUP_MISSING,
+        RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED,
     ):
         raise ValueError(
             "recovery_reason must be NONE, HANDSHAKE_STUCK, WAKE_DROPOUT, "
-            "NORMAL_DROPOUT, or STARTUP_MISSING"
+            "NORMAL_DROPOUT, STARTUP_MISSING, or ERROR_REBOOT_EXHAUSTED"
         )
     return value
 
@@ -725,6 +752,40 @@ def _recovery_evidence(
     )
 
 
+def _error_recovery_evidence(
+    payload: Mapping[str, Any], recovery_reason: str
+) -> Tuple[int, int, float]:
+    measurement_session_id = _integer(
+        payload, "measurement_session_id", default=0, minimum=0
+    )
+    error_reboot_attempts = _integer(
+        payload, "error_reboot_attempts", default=0, minimum=0, maximum=255
+    )
+    error_since_at = _number(
+        payload, "error_since_at", default=0, minimum=0
+    )
+    if recovery_reason == RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED:
+        if (
+            measurement_session_id <= 0
+            or error_reboot_attempts != _ERROR_REBOOT_ATTEMPTS_REQUIRED
+            or error_since_at <= 0
+        ):
+            raise ValueError(
+                "ERROR_REBOOT_EXHAUSTED requires a positive measurement "
+                "session, exactly three accepted soft reboots, and a positive "
+                "Error onset timestamp"
+            )
+    elif (
+        measurement_session_id != 0
+        or error_reboot_attempts != 0
+        or error_since_at != 0
+    ):
+        raise ValueError(
+            "%s contains unrelated measurement Error evidence" % recovery_reason
+        )
+    return measurement_session_id, error_reboot_attempts, error_since_at
+
+
 def _wake_timing_evidence_valid(
     wake_started_at: float,
     wake_dropout_at: float,
@@ -793,6 +854,7 @@ def _request_from_live_recovery_state(
             raise ValueError("%s must be a boolean in recovery state" % name)
 
     connect_state = _required_text(payload, "connect_state", maximum=32)
+    lidar_state = _required_text(payload, "lidar_state", maximum=32)
     handshake_state = _required_text(
         payload, "handshake_state", maximum=64
     )
@@ -869,7 +931,20 @@ def _request_from_live_recovery_state(
             "recovery state is internally inconsistent: power-cycle "
             "detection follows state timestamp"
         )
-    if (
+    if recovery_reason == RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED:
+        if (
+            connected is not True
+            or connect_state == "Off"
+            or lidar_state != "Error"
+            or publishing is not False
+            or handle == 255
+        ):
+            raise ValueError(
+                "recovery state is internally inconsistent: "
+                "ERROR_REBOOT_EXHAUSTED requires a connected real handle in "
+                "Error and no point publication"
+            )
+    elif (
         connected is not False
         or connect_state != "Off"
         or publishing is not False
@@ -916,7 +991,7 @@ def _request_from_live_recovery_state(
                 "recovery state is internally inconsistent: NORMAL_DROPOUT "
                 "requires IDLE handshake/wake, absent broadcast, and a real handle"
             )
-    else:
+    elif recovery_reason == RECOVERY_REASON_STARTUP_MISSING:
         if (
             handle != 255
             or handshake_state != RECOVERY_STATE_IDLE
@@ -928,6 +1003,18 @@ def _request_from_live_recovery_state(
             raise ValueError(
                 "recovery state is internally inconsistent: STARTUP_MISSING "
                 "requires synthetic handle 255 and no live link evidence"
+            )
+    else:
+        if (
+            handshake_state != RECOVERY_STATE_IDLE
+            or wake_state != RECOVERY_STATE_IDLE
+            or normal_state != RECOVERY_STATE_IDLE
+            or startup_state != RECOVERY_STATE_IDLE
+            or handle == 255
+        ):
+            raise ValueError(
+                "recovery state is internally inconsistent: "
+                "ERROR_REBOOT_EXHAUSTED requires no competing recovery cause"
             )
 
     (
@@ -944,6 +1031,11 @@ def _request_from_live_recovery_state(
         normal_silence_at,
         startup_missing_since,
     ) = _recovery_evidence(payload, recovery_reason)
+    (
+        measurement_session_id,
+        error_reboot_attempts,
+        error_since_at,
+    ) = _error_recovery_evidence(payload, recovery_reason)
     if (
         recovery_reason == RECOVERY_REASON_WAKE_DROPOUT
         and not _wake_timing_evidence_valid(
@@ -980,6 +1072,14 @@ def _request_from_live_recovery_state(
             "recovery state is internally inconsistent: STARTUP_MISSING "
             "violates the 30s startup grace"
         )
+    if (
+        recovery_reason == RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED
+        and detected_at - error_since_at < _ERROR_CONFIRM_MIN_SECONDS
+    ):
+        raise ValueError(
+            "recovery state is internally inconsistent: "
+            "ERROR_REBOOT_EXHAUSTED violates the 3s Error confirmation"
+        )
     event_id = "%s:%d:%d:%d" % (
         broadcast_code,
         driver_instance,
@@ -1007,6 +1107,9 @@ def _request_from_live_recovery_state(
         normal_dropout_at=normal_dropout_at,
         normal_silence_at=normal_silence_at,
         startup_missing_since=startup_missing_since,
+        measurement_session_id=measurement_session_id,
+        error_reboot_attempts=error_reboot_attempts,
+        error_since_at=error_since_at,
     )
 
 
@@ -1570,10 +1673,10 @@ class StateStore:
                 "unexpected table(s) in dedicated state database: %s"
                 % ",".join(sorted(unknown))
             )
-        if version not in {0, 2, 3, 4, STATE_DB_SCHEMA_VERSION}:
+        if version not in {0, 2, 3, 4, 5, STATE_DB_SCHEMA_VERSION}:
             raise StateStoreError(
                 "unsupported state database schema version %d "
-                "(expected 2, 3, 4, or %d)"
+                "(expected 2, 3, 4, 5, or %d)"
                 % (version, STATE_DB_SCHEMA_VERSION)
             )
         if version == 2:
@@ -1652,7 +1755,7 @@ class StateStore:
                 )
                 if actual_previous != expected_previous:
                     raise StateStoreError(
-                        "state table %s cannot be migrated to schema 5: %s"
+                        "state table %s cannot be migrated to schema 6: %s"
                         % (table, ",".join(actual_previous))
                     )
                 db.execute(
@@ -1660,14 +1763,14 @@ class StateStore:
                     "NOT NULL DEFAULT 'HANDSHAKE_STUCK' "
                     "CHECK(recovery_reason IN "
                     "('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',"
-                    "'STARTUP_MISSING'))" % table
+                    "'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED'))" % table
                 )
 
-        if version == 4:
+        if version in {4, 5}:
             # SQLite cannot widen a column CHECK constraint with ALTER TABLE.
             # Rebuild both reason-bearing tables inside this existing IMMEDIATE
-            # transaction so a crash leaves either the complete v4 database or
-            # the complete v5 database, never one table of each.
+            # transaction so a crash leaves either the complete old database or
+            # the complete v6 database, never one table of each.
             for table in ("power_events", "power_obligations"):
                 if table not in tables:
                     continue
@@ -1679,13 +1782,13 @@ class StateStore:
                 )
                 if actual != self._EXPECTED_COLUMNS[table]:
                     raise StateStoreError(
-                        "state table %s cannot be migrated from schema 4: %s"
-                        % (table, ",".join(actual))
+                        "state table %s cannot be migrated from schema %d: %s"
+                        % (table, version, ",".join(actual))
                     )
             if "power_events" in tables:
                 db.execute(
                     """
-                    CREATE TABLE power_events_v5 (
+                    CREATE TABLE power_events_v6 (
                       event_id TEXT PRIMARY KEY,
                       trigger_bcode TEXT NOT NULL,
                       group_id TEXT NOT NULL,
@@ -1698,19 +1801,19 @@ class StateStore:
                       detail TEXT NOT NULL DEFAULT '',
                       recovery_reason TEXT NOT NULL CHECK(recovery_reason IN
                         ('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',
-                         'STARTUP_MISSING'))
+                         'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED'))
                     )
                     """
                 )
                 db.execute(
-                    "INSERT INTO power_events_v5 SELECT * FROM power_events"
+                    "INSERT INTO power_events_v6 SELECT * FROM power_events"
                 )
                 db.execute("DROP TABLE power_events")
-                db.execute("ALTER TABLE power_events_v5 RENAME TO power_events")
+                db.execute("ALTER TABLE power_events_v6 RENAME TO power_events")
             if "power_obligations" in tables:
                 db.execute(
                     """
-                    CREATE TABLE power_obligations_v5 (
+                    CREATE TABLE power_obligations_v6 (
                       power_key TEXT PRIMARY KEY,
                       group_id TEXT NOT NULL,
                       event_id TEXT NOT NULL,
@@ -1726,17 +1829,17 @@ class StateStore:
                       last_attempt REAL NOT NULL DEFAULT 0,
                       recovery_reason TEXT NOT NULL CHECK(recovery_reason IN
                         ('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',
-                         'STARTUP_MISSING'))
+                         'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED'))
                     )
                     """
                 )
                 db.execute(
-                    "INSERT INTO power_obligations_v5 "
+                    "INSERT INTO power_obligations_v6 "
                     "SELECT * FROM power_obligations"
                 )
                 db.execute("DROP TABLE power_obligations")
                 db.execute(
-                    "ALTER TABLE power_obligations_v5 "
+                    "ALTER TABLE power_obligations_v6 "
                     "RENAME TO power_obligations"
                 )
 
@@ -1756,7 +1859,7 @@ class StateStore:
               recovery_reason TEXT NOT NULL
                 CHECK(recovery_reason IN
                   ('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',
-                   'STARTUP_MISSING'))
+                   'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED'))
             )
             """,
             """
@@ -1802,7 +1905,7 @@ class StateStore:
               recovery_reason TEXT NOT NULL
                 CHECK(recovery_reason IN
                   ('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',
-                   'STARTUP_MISSING'))
+                   'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED'))
             )
             """,
             """

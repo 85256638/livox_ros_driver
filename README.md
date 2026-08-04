@@ -13,7 +13,7 @@
 9. **自动恢复看门狗（可选）** — 检测到假活（`Normal` 但**没有点云发布**）、配置长期不完成、`Error`（如电机故障）或显式唤醒后持续无广播时按各自路径恢复，带严格归因、重试上限和防死循环门禁
 10. **持久化健康日志（可选）** — 把健康事件与网络趋势落盘成 CSV（边沿事件 + 周期快照），供长期无人值守的趋势分析与故障取证
 11. **广播存活但握手卡死的识别与恢复** — 看板区分 `BROADCAST_ONLY / HANDSHAKE_STUCK / POWER_CYCLE_REQUIRED`；按单台雷达清理本地 session 并有限重试，仍失败时明确要求物理断电
-12. **共享电源组硬恢复闭环（可选、默认关闭）** — 独立 ROS manager 严格处理 `HANDSHAKE_STUCK / WAKE_DROPOUT / NORMAL_DROPOUT / STARTUP_MISSING`；任一成员需要硬恢复时，共用通道的 4 台只断/上电一次，SQLite 持久化补上电义务、冷却与次数上限，并以 4 台全部持续恢复点云作为最终成功判据
+12. **共享电源组硬恢复闭环（可选、默认关闭）** — 独立 ROS manager 严格处理 `HANDSHAKE_STUCK / WAKE_DROPOUT / NORMAL_DROPOUT / STARTUP_MISSING / ERROR_REBOOT_EXHAUSTED`；任一成员需要硬恢复时，共用通道的 4 台只断/上电一次，SQLite 持久化补上电义务、冷却与次数上限，并以 4 台全部持续恢复点云作为最终成功判据
 
 > **整个分支必须配套固定版 SDK。** Driver 的异步 callback context 生命周期依赖 SDK 的 exactly-once completion/cancellation 契约；不能只为模式切换换 SDK、再让其他功能链接任意同名库。
 
@@ -629,7 +629,7 @@ ID  broadcast_code     packet_loss  queue_drops  handshake_timeouts
 (local refresh; liveness ages use monotonic time)
 ```
 
-上例从上往下回答：数据源是否仍在更新、实际运行的是哪一对 Driver/SDK、4台里当前有几台故障、每台当前状态、最近60秒发生了什么，以及这个 Driver 进程里以前发生过什么。例如 2 号雷达当前仍在出点，但最近60秒 `packet_loss=2.24%`，因此 `ASSESS=UNSTABLE`；1 号雷达当前是握手故障，所以 `reason=HANDSHAKE_STUCK`。另外三种共享硬恢复原因分别显示 `WAKE_DROPOUT`、`NORMAL_DROPOUT` 和 `STARTUP_MISSING`，告警区会给出各自的请求、generation、健康/静默或启动宽限证据，历史按原因分开计数。
+上例从上往下回答：数据源是否仍在更新、实际运行的是哪一对 Driver/SDK、4台里当前有几台故障、每台当前状态、最近60秒发生了什么，以及这个 Driver 进程里以前发生过什么。例如 2 号雷达当前仍在出点，但最近60秒 `packet_loss=2.24%`，因此 `ASSESS=UNSTABLE`；1 号雷达当前是握手故障，所以 `reason=HANDSHAKE_STUCK`。另外四种共享硬恢复原因分别显示 `WAKE_DROPOUT`、`NORMAL_DROPOUT`、`STARTUP_MISSING` 和 `ERROR_REBOOT_EXHAUSTED`，告警区会给出各自的请求、generation、健康/静默、启动宽限或测量会话预算证据，历史按原因分开计数。
 
 #### 怎么读看板
 
@@ -648,7 +648,7 @@ ID  broadcast_code     packet_loss  queue_drops  handshake_timeouts
 
 | 列 | 含义 |
 |----|------|
-| `CURRENT` | 这一秒的真实状态：`NORMAL` / `NO_DATA` / `DISCONNECTED` / `PLANNED_POWER_CYCLE` / `NORMAL_NO_BROADCAST` / `BROADCAST_RETURNING` / `NORMAL_DROPOUT` / `STARTUP_MISSING` / `WAKE_NO_BROADCAST` / `WAKE_DROPOUT` / `BROADCAST_ONLY` / `HANDSHAKE_STUCK` / `POWER_CYCLE_REQUIRED` / `POWER_SAVING` / `STANDBY` / `CONFIG` / `INIT` / `ERROR`；计划内共享断电不计单机故障趋势，`POWER_CYCLE_REQUIRED` 的告警详情明确标注四种原因之一，未知 SDK 状态显示 `?` 并进入 `ACTIVE` |
+| `CURRENT` | 这一秒的真实状态：`NORMAL` / `NO_DATA` / `DISCONNECTED` / `PLANNED_POWER_CYCLE` / `NORMAL_NO_BROADCAST` / `BROADCAST_RETURNING` / `NORMAL_DROPOUT` / `STARTUP_MISSING` / `WAKE_NO_BROADCAST` / `WAKE_DROPOUT` / `BROADCAST_ONLY` / `HANDSHAKE_STUCK` / `POWER_CYCLE_REQUIRED` / `POWER_SAVING` / `STANDBY` / `CONFIG` / `INIT` / `ERROR`；计划内共享断电不计单机故障趋势，`POWER_CYCLE_REQUIRED` 的告警详情明确标注五种原因之一，未知 SDK 状态显示 `?` 并进入 `ACTIVE` |
 | `ASSESS` | 当前状态优先，再结合最近60秒数据面/握手尝试和最近10分钟故障 episode 得出的可操作分级；它不是又一个连接状态，具体规则见下表 |
 | `points/s` | 1 Hz 看板相邻两次刷新间收到的点云包数（近似每秒速率）；Horizon 正常采样时通常约2500，未连接显示 `-` |
 | `packet_loss` | `RECENT 60 SECONDS` 中最近60秒点云网络丢包率，按 `lost / (received + lost)` 计算；窗口内没有点云样本显示 `--`。它不是 Driver 启动以来累计；连接 generation 会显式标记断线清零，即使一秒内重连后的新计数已经超过旧值也不会错误差分 |
@@ -697,7 +697,7 @@ ACTIVE → RECOVERING → IDLE → UNSTABLE → WATCH → OBSERVE → STABLE
 | `handshake failure episodes` | `stuck` 与 `escalated-to-power` 是按广播故障周期去重的 **episode** 计数；`subset of stuck` 表示后者只是满足全部硬断电升级条件的前者子集，无需相等 |
 | `wake dropout episodes` | 仅统计具有显式 PowerSaving/StandBy→Normal、同 broadcast code + generation 证据且持续无广播 10 秒的唯一 episode；普通 `DISCONNECTED` 不进入该计数，也不计入 `handshake failure episodes` |
 | `normal-dropout episodes` | 仅统计同一 generation 已连续健康发布至少 30 秒、随后控制和广播持续消失至少 5 秒的唯一 episode；广播短暂返回会重置连续静默，稳定 3 秒/3 帧才移交握手路径 |
-| `POWER_CYCLE_REQUIRED: episodes / entries` | `episodes` 是所有原因合计并按故障周期去重的硬恢复 episode；`entries` 是 Driver 已提交进入/重新进入该状态的次数。日志/告警标注 `HANDSHAKE_STUCK / WAKE_DROPOUT / NORMAL_DROPOUT / STARTUP_MISSING`。同一 episode 可能在 OFF 前恢复并取消，所以 entries 不能当作独立故障数 |
+| `POWER_CYCLE_REQUIRED: episodes / entries` | `episodes` 是所有原因合计并按故障周期去重的硬恢复 episode；`entries` 是 Driver 已提交进入/重新进入该状态的次数。日志/告警标注 `HANDSHAKE_STUCK / WAKE_DROPOUT / NORMAL_DROPOUT / STARTUP_MISSING / ERROR_REBOOT_EXHAUSTED`。同一 episode 可能在 OFF 前恢复并取消，所以 entries 不能当作独立故障数 |
 | `session reset actions` | Driver 请求 SDK 清理 session 的**恢复动作**计数；accepted 只表示 API 接受，不保证 `RESET` 完成或连接恢复，也不能当作新的故障 episode |
 | `last SDK event` | 最近握手事件、detail、目标 IP 与时间；当前 episode 结束/成功重连后仍保留。`NETWORK_ERROR` 指向本机 socket/路由/端口证据，不能仅凭它要求雷达断电 |
 | `hardware fault episodes` / `temperature state changes` | 硬件故障 episode、故障标签，以及温度状态变化次数和最近时间；恢复后仍保留 |
@@ -828,7 +828,7 @@ handle 0 / 1 的离线时长分别约 1228 秒和 1212 秒，期间始终没有�
 
 ##### 错误检测、升级与共享继电器恢复流程
 
-下图把四种硬恢复原因分开判定，只在各自证据完整时才汇入同一共享电源组恢复。时间均使用单调时钟；wall-clock 只作为跨进程证据随消息传递。
+下图把五种硬恢复原因分开判定，只在各自证据完整时才汇入同一共享电源组恢复。时间均使用单调时钟；wall-clock 只作为跨进程证据随消息传递。
 
 ```mermaid
 flowchart TD
@@ -915,12 +915,30 @@ flowchart TD
     SM -.->|任何广播 / Connect 出现| SOK
   end
 
-  subgraph HARD["5. Relay Manager 共享硬恢复（同组 4 台）"]
+  subgraph ERRORSESSION["5. 测量会话内 Error 升级"]
+    E0["显式 PowerSaving → Normal 成功<br/>开始测量会话；软重启预算 0/3"] --> ER{"Error 已连续存在满 3 秒？"}
+    EI["Driver 启动时雷达已在 Normal<br/>首次 Error 建立隐式测量会话"] --> ER
+    ER -->|否 / Error 自行清除| EHEALTH["点云恢复；连续 3 秒后仅确认当前恢复<br/>不清空本次测量的软重启预算"]
+    EHEALTH --> ER
+    ER -->|是，已接受少于 3 次软重启| ES["单台软重启 attempt + 1<br/>断开 / 握手 / 新 generation 均保留会话预算"]
+    ES --> EG{"重启后出现新 connection generation？"}
+    EG -->|是| ER
+    EG -->|否| EWAIT["同一连接最多等待 40 秒冷却<br/>避免 SDK 只接受命令却未重启时形成命令风暴"]
+    EWAIT --> ER
+    ER -->|是，已接受 3 次软重启| EPCR["POWER_CYCLE_REQUIRED<br/>reason = ERROR_REBOOT_EXHAUSTED"]
+    EHEALTH --> ECLOSE{"点云已连续恢复 3 秒<br/>且正常完成 Normal → PowerSaving / StandBy？"}
+    ECLOSE -->|是| ECLEAR["结束测量会话<br/>Error 预算清零"]
+    ECLOSE -->|否：未恢复就进入低功耗| EPAUSE["保留预算到下一次测量"]
+    EPAUSE --> E0
+  end
+
+  subgraph HARD["6. Relay Manager 共享硬恢复（同组 4 台）"]
     PCR --> M0["收到带唯一 episode 身份和 reason 的请求<br/>同组并发事件合并为同一物理端点的一次循环"]
     WPCR --> M0
     NPCR --> M0
     SPCR --> M0
-    M0 --> M1{"原因特定安全复核通过？<br/>HANDSHAKE：required + 广播新鲜 + reset 完成<br/>WAKE：两个 generation 相等；窗内归因；静默 ≥10 秒<br/>NORMAL：两个 generation 相等；此前健康 ≥30 秒；静默 ≥5 秒<br/>STARTUP：handle=255；启动缺失 ≥30 秒；无连接/广播/发布<br/>其余原因证据必须为 0<br/>armed + 恰好 4 members + 所选通道全部 ON<br/>B0 预检后再收到同 episode/reason 新状态"}
+    EPCR --> M0
+    M0 --> M1{"原因特定安全复核通过？<br/>HANDSHAKE：required + 广播新鲜 + reset 完成<br/>WAKE：两个 generation 相等；窗内归因；静默 ≥10 秒<br/>NORMAL：两个 generation 相等；此前健康 ≥30 秒；静默 ≥5 秒<br/>STARTUP：handle=255；启动缺失 ≥30 秒；无连接/广播/发布<br/>ERROR：仍 connected + Error + 无点云；同一测量会话已接受 3 次软重启；当前 Error ≥3 秒<br/>其余原因证据必须为 0<br/>armed + 恰好 4 members + 所选通道全部 ON<br/>B0 预检后再收到同 episode/reason 新状态"}
     M1 -->|否| SUP["不发送 OFF并保留明确告警<br/>瞬态预检：间隔 60 秒，总计最多 5 次<br/>已恢复 / 禁用：取消"]
     M1 -->|是| INTENT["发布计划断电 token<br/>携带 Driver instance + 精确 4 members<br/>此时尚未占用断电预算"]
     INTENT --> ACK{"当前 Driver 已先标记 4 台<br/>且白名单与 members 完全一致并 ACK？<br/>每次等待 3 秒，最多 3 次，间隔 0.5 秒"}
@@ -960,11 +978,11 @@ flowchart TD
   classDef danger fill:#ffe4e6,stroke:#be123c,color:#7f1d1d;
   classDef success fill:#dcfce7,stroke:#15803d,color:#14532d;
   classDef guard fill:#f3f4f6,stroke:#6b7280,color:#374151;
-  class A,B,C,G,WS,WG,WC,WN,N0,ND,NN,SG,HOLD,PON normal;
-  class E,OBS,FAIL,WAIT,NET,WD,WOBS,NCONF,NOBS,SM,SOBS,SUP,CANCEL0,CANCEL,TIMEOUT,REPAIR,RESTORED,ABORT warning;
-  class PCR,WPCR,NPCR,SPCR,POFF danger;
-  class OK,WOK,NOK,SOK,DONE success;
-  class D,H,AR,RESET,ACCEPT,COMPLETE,I,NOTE,WQ,WR,WAR,WARM,WBR,NARM,NDISC,NR,NBR,NAR,S0,SP,SAR,M0,M1,INTENT,ACK,M2,BUDGET,OBL,M3,OFFQ,ONQ,RETRY,PHASE,VERIFY,LIMIT guard;
+  class A,B,C,G,WS,WG,WC,WN,N0,ND,NN,SG,E0,EI,EHEALTH,ES,EWAIT,HOLD,PON normal;
+  class E,OBS,FAIL,WAIT,NET,WD,WOBS,NCONF,NOBS,SM,SOBS,EPAUSE,SUP,CANCEL0,CANCEL,TIMEOUT,REPAIR,RESTORED,ABORT warning;
+  class PCR,WPCR,NPCR,SPCR,EPCR,POFF danger;
+  class OK,WOK,NOK,SOK,ECLEAR,DONE success;
+  class D,H,AR,RESET,ACCEPT,COMPLETE,I,NOTE,WQ,WR,WAR,WARM,WBR,NARM,NDISC,NR,NBR,NAR,S0,SP,SAR,ER,EG,ECLOSE,M0,M1,INTENT,ACK,M2,BUDGET,OBL,M3,OFFQ,ONQ,RETRY,PHASE,VERIFY,LIMIT guard;
 ```
 
 | 握手时间（从首次连续广播起） | 状态/动作 |
@@ -997,6 +1015,15 @@ flowchart TD
 | 满 30 秒仍无连接/新鲜广播且从未健康发布 | `STARTUP_MISSING`，持续发布合成 `handle=255` 状态；`auto_recover=true` 时升级同名 reason |
 | 后续任何广播或 Connect | 立即撤销合成状态和待 OFF 身份；由真实 handle 接管 |
 
+| 测量会话内 Error | 状态/动作 |
+|------|------|
+| 显式 `PowerSaving→Normal` 成功 | 建立本次测量会话，软重启预算从 `0/3` 开始；Driver 启动时雷达已在 Normal，则第一次 Error 自动建立隐式会话 |
+| 每次 Error 连续满 3 秒 | 前 3 次分别执行一次单台软重启；软重启、断开、重新握手、新 connection generation 和点云暂时恢复都不清空预算 |
+| SDK 接受软重启但 connection generation 没变化 | 同一连接保留 40 秒冷却后才允许下一动作，避免重启命令风暴；一旦出现新 generation，下一次独立 Error 仍只需重新确认 3 秒 |
+| 已接受 3 次软重启后，第 4 次 Error 连续满 3 秒 | `POWER_CYCLE_REQUIRED reason=ERROR_REBOOT_EXHAUSTED`；manager 在 OFF 前再次要求目标仍为 connected + Error + 无点云，且会话 ID、3 次预算和 Error 起点仍完全一致 |
+| 点云恢复 | 连续发布 3 秒只确认当前恢复，不清空预算；若 relay OFF 前 Error 已消失，当前硬恢复请求立即失效 |
+| 点云已连续恢复 3 秒，随后正常完成 `Normal→PowerSaving/StandBy` | 这是唯一清空本次测量 Error 预算的边界；未满足恢复条件就进入低功耗时预算保留到下一次测量 |
+
 - 整个软恢复窗口内不是只尝试一次握手：上一笔 pending 握手进入终态/超时，或被 session reset 清理后，后续新广播仍可触发下一笔握手；限制的是同一时刻最多一个 pending 握手
 - SDK 对同一 broadcast code 最多只保留一个 pending 握手；不会因每次广播都新建 socket
 - 握手 ACK 被设备接受但 DeviceInfo/命令服务卡住属于 **provisional 半连接**，也可以定向清理，且不会向 Driver 制造一次假的 Disconnect
@@ -1004,18 +1031,18 @@ flowchart TD
 - `NETWORK_ERROR` 会显示真实 socket errno/detail，并使用独立单调时间门禁抑制“雷达必须断电”的误报；即使后续出现 `RESET/TIMEOUT` 也不会覆盖该保护。若 OFF 前发布的新一帧 1 Hz 状态已反映网络错误或成功连接，manager 会取消本次断电；状态帧发布到 OFF 命令之间仍存在一个不足约 1 秒、无法跨进程原子消除的竞态窗口
 - `auto_recover=false` 时仍识别并显示 `HANDSHAKE_STUCK`，但不声称已经执行 session reset，也不会升级为 `POWER_CYCLE_REQUIRED`
 
-前面三类恢复只处理**出问题的那一台**。情况 D～G 只在各自原因证据完整时才升级共享硬恢复：D 统计 handshake/session，E 统计 wake dropout，F 统计 normal dropout，G 通过白名单合成实时状态。四种 reason 互斥，非本 reason 的证据字段必须全部为 0。启动日志仍分别显示自动恢复和握手 session 恢复是否启用。
+前面的软恢复只处理**出问题的那一台**。五条硬恢复路径只在各自原因证据完整时汇入共享继电器：handshake/session、wake dropout、normal dropout、白名单启动缺失，以及同一测量会话耗尽 3 次 Error 软重启。五种 reason 互斥，非本 reason 的证据字段必须全部为 0。启动日志仍分别显示自动恢复和握手 session 恢复是否启用。
 
 > ⚠️ 这是驱动**自主重启硬件**的行为，所以默认关闭、需显式开启。无显示器的机器也能用（它和看板无关）。
 
-> **某台 `packet_loss` 偏高 → 排查该台网线/接头/散热；`NO_DATA` → 已连接但无点云；`HANDSHAKE_STUCK` → 广播仍在但控制服务卡住；`WAKE_DROPOUT` → 显式唤醒归因；`NORMAL_DROPOUT` → 此前稳定运行后控制和广播一起消失；`STARTUP_MISSING` → 白名单成员启动宽限内从未出现。`POWER_CYCLE_REQUIRED` 必须继续看 reason。本现场配置 `channels: [1,2,3,4]`，任一有效原因都会用一个掩码让四路及4台雷达一起断电5秒；连接 generation、最新状态复核、冷却和熔断会阻止伴生掉线再次循环。**
+> **某台 `packet_loss` 偏高 → 排查该台网线/接头/散热；`NO_DATA` → 已连接但无点云；`HANDSHAKE_STUCK` → 广播仍在但控制服务卡住；`WAKE_DROPOUT` → 显式唤醒归因；`NORMAL_DROPOUT` → 此前稳定运行后控制和广播一起消失；`STARTUP_MISSING` → 白名单成员启动宽限内从未出现；`ERROR_REBOOT_EXHAUSTED` → 同一测量会话已经接受 3 次单台软重启，第 4 次 Error 仍持续。`POWER_CYCLE_REQUIRED` 必须继续看 reason。本现场配置 `channels: [1,2,3,4]`，任一有效原因都会用一个掩码让四路及4台雷达一起断电5秒；连接 generation、最新状态复核、冷却和熔断会阻止伴生掉线再次循环。**
 
 #### 可选：原因特定的 `POWER_CYCLE_REQUIRED` 自动继电器硬恢复
 
-这一层只处理四种已确认原因：`HANDSHAKE_STUCK`、`WAKE_DROPOUT`、`NORMAL_DROPOUT` 和 `STARTUP_MISSING`。没有连续健康/启动宽限等证据的单次 `DISCONNECTED` 仍不是触发原因。当前继电器1～4路全部只控制这4台雷达，所以该组配置 `channels: [1,2,3,4]`；任一成员通过原因特定复核后，manager用一条A1掩码命令同时操作四路，该组只执行一次OFF/ON。OFF保持采用现场有效 `off_seconds`（新模板5秒，未迁移旧配置可能仍为10秒）。继电器TCP/SQLite运行在独立ROS Python进程中，不进入C++点云收包线程：
+这一层只处理五种已确认原因：`HANDSHAKE_STUCK`、`WAKE_DROPOUT`、`NORMAL_DROPOUT`、`STARTUP_MISSING` 和 `ERROR_REBOOT_EXHAUSTED`。没有连续健康/启动宽限/测量会话预算等证据的单次 `DISCONNECTED` 仍不是触发原因。当前继电器1～4路全部只控制这4台雷达，所以该组配置 `channels: [1,2,3,4]`；任一成员通过原因特定复核后，manager用一条A1掩码命令同时操作四路，该组只执行一次OFF/ON。OFF保持采用现场有效 `off_seconds`（新模板5秒，未迁移旧配置可能仍为10秒）。继电器TCP/SQLite运行在独立ROS Python进程中，不进入C++点云收包线程：
 
-1. Driver 在状态首次进入 `POWER_CYCLE_REQUIRED` 时发布带唯一 `event_id`、`recovery_reason` 和原因证据的 `/livox/power_cycle_request`，并以 1 Hz 发布 `/livox/lidar_recovery_state`。normal 请求携带两代相等的 generation、健康起点、归因断线和当前静默起点；startup 请求携带合成 handle 和缺失起点。
-2. `livox_power_cycle_manager.py` 只接受配置中 `power_groups.<组名>.members` 明确列出的 broadcast code，并按四种 reason 严格复核：handshake 要求广播新鲜与 reset 终态；wake 要求同 generation、60 秒归因窗和 10 秒静默；normal 要求同 generation、此前健康至少 30 秒和当前静默至少 5 秒；startup 要求 `handle=255`、启动缺失至少 30 秒且无连接/广播/发布。非本原因证据必须为 0。继电器 B0 预检查后还必须收到触发成员的一帧更新状态；触发者恢复或身份变化时 fail closed，不发 OFF。
+1. Driver 在状态首次进入 `POWER_CYCLE_REQUIRED` 时发布带唯一 `event_id`、`recovery_reason` 和原因证据的 `/livox/power_cycle_request`，并以 1 Hz 发布 `/livox/lidar_recovery_state`。normal 请求携带两代相等的 generation、健康起点、归因断线和当前静默起点；startup 请求携带合成 handle 和缺失起点；Error耗尽请求携带测量会话ID、已接受的3次软重启和当前Error起点。
+2. `livox_power_cycle_manager.py` 只接受配置中 `power_groups.<组名>.members` 明确列出的 broadcast code，并按五种 reason 严格复核：handshake 要求广播新鲜与 reset 终态；wake 要求同 generation、60 秒归因窗和 10 秒静默；normal 要求同 generation、此前健康至少 30 秒和当前静默至少 5 秒；startup 要求 `handle=255`、启动缺失至少 30 秒且无连接/广播/发布；Error耗尽要求真实handle仍连接、状态仍为Error、没有点云、同一测量会话已接受恰好3次软重启且当前Error至少持续3秒。非本原因证据必须为 0。继电器 B0 预检查后还必须收到触发成员的一帧更新状态；触发者恢复或身份变化时 fail closed，不发 OFF。
 3. 现场上位机/PLC已在任一雷达异常时中断测量流程，而且已确认继电器1～4路全部只给这4台雷达供电，因此硬恢复不再等待额外的 `SAFE_TO_CYCLE` 许可。守护进程只允许控制该电源组明确白名单化的 `channels` 集合；本现场用掩码 `0x000F` 同时控制1～4路。代码不提供绕过配置范围的无条件“全部关闭”接口；真正只使用一路的旧现场仍可使用兼容字段 `channel`。
 4. manager 在占用断电预算和写 obligation **之前**，先通过 `/livox/group_power_cycle_intent` 发送 token、当前 Driver instance 和 4 个 members。Driver 要求 members 与实际连接白名单完全相等，建立默认 15 秒计划停电标记后才通过 `/livox/group_power_cycle_ack` ACK。每次默认等待 3 秒，超时后发布 CANCEL 并间隔 0.5 秒换新 token 快速重试，最多 3 次（总计约 10 秒）；明确拒绝不重试。3 次均超时、Driver拒绝、身份/成员不一致或ACK后故障已恢复，均不发送 OFF，也不会创建 cycle/obligation 或占用断电预算。ACK 成功后每秒刷新 intent，直到继电器操作结束。
 5. 发送OFF前已按物理供电端点把“所选通道集合必须全部恢复ON”、通道掩码及4个成员快照提交到SQLite；OFF、ON都通过独立B0查询确认所有选中位。Driver的systemd安全钩子使用 `~/.local/libexec/livox-power-cycle-manager/` 中的稳定原子更新副本，在每次启动前和停止后执行与源码checkout、现场JSON、ROS无关的紧急补上电；仍有任何补上电义务时，全局禁止新的OFF。计划维护标签最多保持180秒；仍未重连时当前状态回到 `DISCONNECTED`，不会永久用维护标签掩盖恢复失败。
@@ -1102,13 +1129,13 @@ sudo systemctl restart livox-ros-driver && systemctl is-active livox-ros-driver
 | 断电后异常 | ON 无法确认时保留持久化 obligation，每 30 秒继续尝试并发出 CRITICAL；systemd 启动前先独立补 ON，配置损坏也不会跳过；补 ON 未完成前禁止任何新 OFF |
 | 告警存续 | 每个物理端点的活动 CRITICAL 独立存入 SQLite，重启后在 `MANAGER_READY` 之后重新发布；只有该端点后续完成 `RECOVERY_VERIFIED` 才自动清除 |
 
-配置和状态均在仓库外：更新 Driver 不会覆盖 `~/.config/livox/power_cycle.json`。生产安装把审计/去重数据库固定为 `~/.local/state/livox-power-cycle-manager/state.sqlite3`，配置中的 `state_db` 必须解析到同一路径。不要删除、替换或手工修改 SQLite，否则会丢失冷却预算和补上电义务；v2/v3 会保守补入旧原因字段，v4 会在一个 `BEGIN IMMEDIATE` 事务内原子重建两张带 reason 约束的表并升级到 v5，从而允许四种原因。任一步失败会整体回滚；未知、损坏或 legacy 结构仍严格拒绝，不会静默重建。
+配置和状态均在仓库外：更新 Driver 不会覆盖 `~/.config/livox/power_cycle.json`。生产安装把审计/去重数据库固定为 `~/.local/state/livox-power-cycle-manager/state.sqlite3`，配置中的 `state_db` 必须解析到同一路径。不要删除、替换或手工修改 SQLite，否则会丢失冷却预算和补上电义务；v2/v3 会保守补入旧原因字段，v4/v5 会在一个 `BEGIN IMMEDIATE` 事务内原子重建两张带 reason 约束的表并升级到 v6，从而允许五种原因。任一步失败会整体回滚；未知、损坏或 legacy 结构仍严格拒绝，不会静默重建。
 
 卸载同样不是直接删文件：先把 launch 开关改回 `false` 并安全停止 Driver，再执行 `bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" --uninstall`。脚本只接受 Driver 已处于 `inactive/failed`，独立补 ON 成功后才删除 Driver drop-in；任何一步失败都会保留安全钩子，现场 JSON 和 SQLite 始终保留。
 
 查看自动硬恢复的最近状态可继续使用同一看板。看板最上方 `DATA SOURCE` 用本机单调时钟显示 Driver topic 的接收年龄：超过 5 秒没有新 `/livox/lidar_stats` 会明确显示 `NOW=DRIVER_STALE severity=CRITICAL`，不会用旧表和新的渲染时间伪装成实时数据。脚本自身每秒刷新，因此 Driver 和 manager 同时停发时 stale 年龄仍会继续增长。
 
-`livox_stats_monitor.py` 会在顶部 `DATA SOURCE` 常驻 `POWER-MGR` 摘要：首帧到达前显示 `NOT_SEEN/WARN`，收到至少一条通过校验的manager消息后显示实际状态，并在Driver看板之后追加独立的 `POWER RECOVERY` 板块。详情中的 `MANAGER` 行显示manager的 `NOW/severity/manager_age`，每个 `GROUP <power_group>` 再分行显示该共享组的 `NOW/severity/rx_age/trigger/members/relay` 和完整 `detail`；`relay=1,2,3,4` 可直接确认本次状态对应四路集合，结构化status同时保留 `relay_channels` 和四种 `recovery_reason`。白名单外事件显示为 `UNMAPPED trigger=...`，绝不会伪装成manager行。这部分来自独立manager进程，不计入Driver的逐台 `ASSESS` 和 `PROCESS HISTORY`；收到首帧后若manager心跳超过30秒未接收，顶部摘要和底部详情都会明确改显 `MANAGER_STALE/CRITICAL`。所有stale判定都用本机接收时刻，不信任消息内wall-clock。
+`livox_stats_monitor.py` 会在顶部 `DATA SOURCE` 常驻 `POWER-MGR` 摘要：首帧到达前显示 `NOT_SEEN/WARN`，收到至少一条通过校验的manager消息后显示实际状态，并在Driver看板之后追加独立的 `POWER RECOVERY` 板块。详情中的 `MANAGER` 行显示manager的 `NOW/severity/manager_age`，每个 `GROUP <power_group>` 再分行显示该共享组的 `NOW/severity/rx_age/trigger/members/relay` 和完整 `detail`；`relay=1,2,3,4` 可直接确认本次状态对应四路集合，结构化status同时保留 `relay_channels` 和五种 `recovery_reason`。白名单外事件显示为 `UNMAPPED trigger=...`，绝不会伪装成manager行。这部分来自独立manager进程，不计入Driver的逐台 `ASSESS` 和 `PROCESS HISTORY`；收到首帧后若manager心跳超过30秒未接收，顶部摘要和底部详情都会明确改显 `MANAGER_STALE/CRITICAL`。所有stale判定都用本机接收时刻，不信任消息内wall-clock。
 
 ```bash
 rostopic echo /livox/power_cycle_status
@@ -1282,7 +1309,7 @@ rosservice call /livox_lidar_mode "{handle: 1, mode: 1}"  # 1 号保持正常
 看 `[LivoxStats]` 日志：`net_loss` 高 → 网络/雷达硬件（查网线、交换机、散热）；`queue_drop` 高 → 下游消费太慢（订阅者慢 / CPU 瓶颈）。
 
 ### Q: 雷达长时间运行后无响应 / 丢包严重，怎么远程恢复？
-若 Driver 仍已连接该雷达且命令通道可用，可调用软重启 service：`rosservice call /livox_lidar_reboot "{handle: 255}"`（255 = 全部）。对 `HANDSHAKE_STUCK / WAKE_DROPOUT / NORMAL_DROPOUT / STARTUP_MISSING` 应使用本章的自动闭环；未满足原因证据的短暂 `DISCONNECTED` 不应手工高频断电。
+若 Driver 仍已连接该雷达且命令通道可用，可调用软重启 service：`rosservice call /livox_lidar_reboot "{handle: 255}"`（255 = 全部）。对 `HANDSHAKE_STUCK / WAKE_DROPOUT / NORMAL_DROPOUT / STARTUP_MISSING / ERROR_REBOOT_EXHAUSTED` 应使用本章的自动闭环；未满足原因证据的短暂 `DISCONNECTED` 不应手工高频断电。
 
 ---
 

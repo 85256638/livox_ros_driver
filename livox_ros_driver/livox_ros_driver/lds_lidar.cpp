@@ -450,6 +450,10 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
   } else {
     ClearNormalDropoutState(&s);
   }
+  MeasurementSessionDisconnected(&s.measurement_session);
+  if (s.power_cycle_reason == kPowerCycleReasonErrorRebootExhausted) {
+    s.power_cycle_reason = kPowerCycleReasonNone;
+  }
   s.connect_since_ns = 0;
   s.health_code = 0;  /** stale once disconnected */
   s.last_broadcast_ns = 0;
@@ -1816,7 +1820,8 @@ void LdsLidar::RememberBroadcastCode(uint8_t handle, const char *broadcast_code)
 bool LdsLidar::ResetModeRequestIfTarget(uint8_t handle, LidarMode target,
                                         uint64_t expected_request_id,
                                         uint64_t expected_command_id,
-                                        uint64_t expected_generation) {
+                                        uint64_t expected_generation,
+                                        bool *measurement_close_eligible) {
   if (handle >= kMaxLidarCount) {
     return false;
   }
@@ -1836,6 +1841,9 @@ bool LdsLidar::ResetModeRequestIfTarget(uint8_t handle, LidarMode target,
   }
 
   char broadcast_code[kBroadcastCodeSize] = {0};
+  if (measurement_close_eligible != nullptr) {
+    *measurement_close_eligible = request.measurement_close_eligible;
+  }
   strncpy(broadcast_code, request.broadcast_code, sizeof(broadcast_code) - 1);
   request = ModeChangeRequest();
   if (broadcast_code[0] != '\0') {
@@ -1844,6 +1852,70 @@ bool LdsLidar::ResetModeRequestIfTarget(uint8_t handle, LidarMode target,
     request.broadcast_code[sizeof(request.broadcast_code) - 1] = '\0';
   }
   return true;
+}
+
+void LdsLidar::RecordMeasurementModeSuccess(uint8_t handle, LidarMode mode,
+                                            bool close_was_eligible) {
+  if (handle >= kMaxLidarCount) {
+    return;
+  }
+  const int64_t now_ns =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  const int64_t now_wall_s = static_cast<int64_t>(time(nullptr));
+  bool started = false;
+  bool resumed = false;
+  bool closed = false;
+  bool retained = false;
+  uint64_t session_id = 0;
+  uint8_t attempts = 0;
+  char broadcast_code[kBroadcastCodeSize] = {0};
+  {
+    lock_guard<mutex> lock(link_stat_lock_[handle]);
+    LinkStat &link = link_stat_[handle];
+    strncpy(broadcast_code, link.broadcast_code,
+            sizeof(broadcast_code) - 1);
+    MeasurementSessionState &session = link.measurement_session;
+    if (mode == kLidarModeNormal) {
+      started = !session.active;
+      resumed = session.active && session.paused;
+      BeginMeasurementSession(&session, false, now_ns, now_wall_s);
+    } else {
+      const bool was_active = session.active;
+      closed = FinishMeasurementSession(&session, close_was_eligible);
+      retained = was_active && !closed;
+    }
+    if (!session.error_power_cycle_required &&
+        link.power_cycle_reason == kPowerCycleReasonErrorRebootExhausted) {
+      link.power_cycle_reason = kPowerCycleReasonNone;
+    }
+    session_id = session.session_id;
+    attempts = session.error_reboot_attempts;
+  }
+  if (started || resumed) {
+    char detail[96];
+    snprintf(detail, sizeof(detail), "session=%llu; retained-error-reboots=%u",
+             static_cast<unsigned long long>(session_id),
+             static_cast<unsigned>(attempts));
+    HealthLogger::Get().LogEvent(
+        handle, broadcast_code,
+        started ? "MEASUREMENT_SESSION_STARTED"
+                : "MEASUREMENT_SESSION_RESUMED",
+        detail);
+  } else if (closed) {
+    char detail[64];
+    snprintf(detail, sizeof(detail), "session=%llu; Error budget cleared",
+             static_cast<unsigned long long>(session_id));
+    HealthLogger::Get().LogEvent(handle, broadcast_code,
+                                 "MEASUREMENT_SESSION_CLOSED", detail);
+  } else if (retained) {
+    char detail[96];
+    snprintf(detail, sizeof(detail),
+             "session=%llu; Error budget retained=%u (recovery not confirmed)",
+             static_cast<unsigned long long>(session_id),
+             static_cast<unsigned>(attempts));
+    HealthLogger::Get().LogEvent(handle, broadcast_code,
+                                 "MEASUREMENT_SESSION_PAUSED", detail);
+  }
 }
 
 bool LdsLidar::IsModeTransitionActive(uint8_t handle) {
@@ -1972,8 +2044,12 @@ void LdsLidar::TickSleepModeVerification() {
       }
     }
     if (done) {
-      ResetModeRequestIfTarget(h, desired, request_id, 0,
-                               connection_generation);
+      bool close_was_eligible = false;
+      if (ResetModeRequestIfTarget(h, desired, request_id, 0,
+                                   connection_generation,
+                                   &close_was_eligible)) {
+        RecordMeasurementModeSuccess(h, desired, close_was_eligible);
+      }
     } else if (initial_send) {
       printf("Lidar[%d] staggered Normal wake is due -- sending first command\n",
              h);
@@ -2117,6 +2193,13 @@ livox_status LdsLidar::SendModeChangeRequest(
     return kStatusFailure;
   }
 
+  bool measurement_close_eligible = false;
+  if (connected && mode != kLidarModeNormal) {
+    lock_guard<mutex> lock(link_stat_lock_[handle]);
+    measurement_close_eligible = MeasurementSessionCloseEligible(
+        link_stat_[handle].measurement_session);
+  }
+
   uint64_t request_id = 0;
   uint64_t command_id = 0;
   bool send_now = false;
@@ -2143,6 +2226,7 @@ livox_status LdsLidar::SendModeChangeRequest(
       request.explicit_wake_generation =
           request.explicit_wake_source ? connection_generation : 0;
       request.wake_observation_armed = false;
+      request.measurement_close_eligible = measurement_close_eligible;
       request.request_id = ++next_mode_request_id_;
       cancel_wake_observation = mode != kLidarModeNormal;
     } else if (!request.active || request.desired_mode != mode ||
@@ -2709,9 +2793,13 @@ void LdsLidar::OnDeviceChange(const DeviceInfo *info, DeviceEvent type) {
      *  sleep verify tick then never runs and the switch is silently lost. */
     if (info->state == ModeToState(kLidarModeNormal) &&
         active_normal_request_id != 0) {
-      g_lds_ldiar->ResetModeRequestIfTarget(
-          handle, kLidarModeNormal, active_normal_request_id, 0,
-          event_generation);
+      bool close_was_eligible = false;
+      if (g_lds_ldiar->ResetModeRequestIfTarget(
+              handle, kLidarModeNormal, active_normal_request_id, 0,
+              event_generation, &close_was_eligible)) {
+        g_lds_ldiar->RecordMeasurementModeSuccess(
+            handle, kLidarModeNormal, close_was_eligible);
+      }
     }
   }
 
@@ -2984,6 +3072,7 @@ void LdsLidar::SetModeCb(livox_status status, uint8_t handle, uint8_t response,
 
   LdsLidar *lds_lidar = g_lds_ldiar;
   bool clear_request = false;
+  bool confirmed_mode_success = false;
   bool wait_for_reconnect = false;
   bool cancel_wake_observation = false;
   LidarMode desired_mode = context->mode;
@@ -3017,6 +3106,7 @@ void LdsLidar::SetModeCb(livox_status status, uint8_t handle, uint8_t response,
             printf("Lidar[%d] already in Normal; mode request complete\n",
                    handle);
             clear_request = true;
+            confirmed_mode_success = true;
           } else {
             /** response 2 explicitly means motor spin-up. response 0 also only
              *  acknowledges the command, not the later heartbeat state. Start
@@ -3069,9 +3159,14 @@ void LdsLidar::SetModeCb(livox_status status, uint8_t handle, uint8_t response,
   }
 
   if (clear_request) {
-    lds_lidar->ResetModeRequestIfTarget(
-        handle, desired_mode, context->mode_request_id,
-        context->mode_command_id, context->connection_generation);
+    bool close_was_eligible = false;
+    if (lds_lidar->ResetModeRequestIfTarget(
+            handle, desired_mode, context->mode_request_id,
+            context->mode_command_id, context->connection_generation,
+            &close_was_eligible) && confirmed_mode_success) {
+      lds_lidar->RecordMeasurementModeSuccess(
+          handle, desired_mode, close_was_eligible);
+    }
     if (cancel_wake_observation) {
       lds_lidar->CancelWakeObservation(handle,
                                        context->mode_request_id);
