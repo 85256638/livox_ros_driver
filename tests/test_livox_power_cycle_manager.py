@@ -64,6 +64,9 @@ class _RelayState:
         repeat_version_handshake=False,
         fragment_status_tail=False,
         omit_status_tail=False,
+        persistent_requests=False,
+        omit_a1_ack=False,
+        close_after_off=False,
     ):
         self.mask = mask
         self.status_checksum = status_checksum
@@ -71,48 +74,69 @@ class _RelayState:
         self.repeat_version_handshake = repeat_version_handshake
         self.fragment_status_tail = fragment_status_tail
         self.omit_status_tail = omit_status_tail
+        self.persistent_requests = persistent_requests
+        self.omit_a1_ack = omit_a1_ack
+        self.close_after_off = close_after_off
+        self.connection_count = 0
+        self.commands = []
         self.lock = threading.Lock()
 
 
 class _RelayHandler(socketserver.BaseRequestHandler):
     def handle(self):
-        data = self.request.recv(64)
-        if len(data) < 3 or data[:2] != b"\xCC\xDD":
-            return
         state = self.server.relay_state
-        if state.version_handshake:
-            self.request.sendall(b"v1.0")
+        with state.lock:
+            state.connection_count += 1
+        version_pending = state.version_handshake
+        while True:
             data = self.request.recv(64)
             if len(data) < 3 or data[:2] != b"\xCC\xDD":
                 return
-            if state.repeat_version_handshake:
+            if version_pending:
                 self.request.sendall(b"v1.0")
+                data = self.request.recv(64)
+                if len(data) < 3 or data[:2] != b"\xCC\xDD":
+                    return
+                if state.repeat_version_handshake:
+                    self.request.sendall(b"v1.0")
+                    return
+                version_pending = False
+            with state.lock:
+                state.commands.append(data[2])
+            if data[2] == 0xB0:
+                with state.lock:
+                    mask = state.mask
+                    status_checksum = state.status_checksum
+                body = bytes((0xB0, 1)) + mask.to_bytes(2, "big") + b"\x0D"
+                checksum = manager._double_checksum(body)
+                if callable(status_checksum):
+                    checksum = status_checksum(body)
+                elif status_checksum is not None:
+                    checksum = status_checksum
+                response = b"\xAA\xBB" + body + checksum
+                if state.fragment_status_tail:
+                    self.request.sendall(response[:-1])
+                    time.sleep(0.01)
+                    self.request.sendall(response[-1:])
+                elif state.omit_status_tail:
+                    self.request.sendall(response[:-1])
+                else:
+                    self.request.sendall(response)
+            elif data[2] == 0xA1 and len(data) >= 10:
+                control = int.from_bytes(data[4:6], "big")
+                enabled = int.from_bytes(data[6:8], "big")
+                with state.lock:
+                    state.mask = (state.mask & ~enabled) | (control & enabled)
+                    close_after_off = state.close_after_off and control == 0
+                    if close_after_off:
+                        state.close_after_off = False
+                    omit_a1_ack = state.omit_a1_ack
+                if close_after_off:
+                    return
+                if not omit_a1_ack:
+                    self.request.sendall(b"OK!")
+            if not state.persistent_requests:
                 return
-        if data[2] == 0xB0:
-            with state.lock:
-                mask = state.mask
-                status_checksum = state.status_checksum
-            body = bytes((0xB0, 1)) + mask.to_bytes(2, "big") + b"\x0D"
-            checksum = manager._double_checksum(body)
-            if callable(status_checksum):
-                checksum = status_checksum(body)
-            elif status_checksum is not None:
-                checksum = status_checksum
-            response = b"\xAA\xBB" + body + checksum
-            if state.fragment_status_tail:
-                self.request.sendall(response[:-1])
-                time.sleep(0.01)
-                self.request.sendall(response[-1:])
-            elif state.omit_status_tail:
-                self.request.sendall(response[:-1])
-            else:
-                self.request.sendall(response)
-        elif data[2] == 0xA1 and len(data) >= 10:
-            control = int.from_bytes(data[4:6], "big")
-            enabled = int.from_bytes(data[6:8], "big")
-            with state.lock:
-                state.mask = (state.mask & ~enabled) | (control & enabled)
-            self.request.sendall(b"OK!")
 
 
 class _RelayServer(socketserver.ThreadingTCPServer):
@@ -133,6 +157,9 @@ class _RunningRelay:
         repeat_version_handshake=False,
         fragment_status_tail=False,
         omit_status_tail=False,
+        persistent_requests=False,
+        omit_a1_ack=False,
+        close_after_off=False,
     ):
         self.state = _RelayState(
             mask,
@@ -141,6 +168,9 @@ class _RunningRelay:
             repeat_version_handshake,
             fragment_status_tail,
             omit_status_tail,
+            persistent_requests,
+            omit_a1_ack,
+            close_after_off,
         )
         self.server = _RelayServer(self.state)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -424,6 +454,20 @@ class ConfigTests(unittest.TestCase):
             manager._policy_from_json({"off_seconds": 10}).off_seconds,
             10.0,
         )
+
+    def test_connection_refused_recovery_policy_defaults_and_overrides(self):
+        default = manager._policy_from_json({})
+        self.assertEqual(default.connection_refused_retry_seconds, 1.0)
+        self.assertEqual(default.connection_refused_deadline_seconds, 3.0)
+
+        configured = manager._policy_from_json(
+            {
+                "connection_refused_retry_seconds": 1.5,
+                "connection_refused_deadline_seconds": 6,
+            }
+        )
+        self.assertEqual(configured.connection_refused_retry_seconds, 1.5)
+        self.assertEqual(configured.connection_refused_deadline_seconds, 6.0)
 
     def test_off_seconds_rejects_values_below_five(self):
         for value in (4, 4.9):
@@ -1364,6 +1408,173 @@ class LegacyRelayClientTests(unittest.TestCase):
             self.assertEqual(client.query()[0], (False, False, False, False))
             client.ensure_state(True)
             self.assertEqual(client.query()[0], (True, True, True, True))
+
+    def test_transaction_reuses_one_connection_for_off_hold_and_on(self):
+        with _RunningRelay(
+            version_handshake=True,
+            omit_status_tail=True,
+            persistent_requests=True,
+        ) as relay:
+            client = manager.CorxLegacyTcpClient(
+                _group(relay.port, channels=(1, 2, 3, 4)),
+                _policy(connect_timeout_seconds=1, command_timeout_seconds=1),
+            )
+            client.begin_transaction()
+            try:
+                client.ensure_state(False)
+                time.sleep(0.05)
+                client.ensure_state(True)
+            finally:
+                client.end_transaction()
+
+            self.assertEqual(relay.state.mask, 0x0F)
+            self.assertEqual(relay.state.connection_count, 1)
+            self.assertEqual(
+                relay.state.commands,
+                [0xB0, 0xA1, 0xB0, 0xB0, 0xA1, 0xB0],
+            )
+
+    def test_transaction_keeps_connection_when_a1_ack_is_omitted(self):
+        with _RunningRelay(
+            version_handshake=True,
+            omit_status_tail=True,
+            persistent_requests=True,
+            omit_a1_ack=True,
+        ) as relay:
+            client = manager.CorxLegacyTcpClient(
+                _group(relay.port, channels=(1, 2, 3, 4)),
+                _policy(
+                    connect_timeout_seconds=1,
+                    command_timeout_seconds=0.05,
+                ),
+            )
+            client.begin_transaction()
+            try:
+                client.ensure_state(False)
+                client.ensure_state(True)
+            finally:
+                client.end_transaction()
+
+            self.assertEqual(relay.state.mask, 0x0F)
+            self.assertEqual(relay.state.connection_count, 1)
+
+    def test_transaction_reconnects_with_b0_after_peer_closes_post_off(self):
+        with _RunningRelay(
+            version_handshake=True,
+            omit_status_tail=True,
+            persistent_requests=True,
+            close_after_off=True,
+        ) as relay:
+            client = manager.CorxLegacyTcpClient(
+                _group(relay.port, channels=(1, 2, 3, 4)),
+                _policy(connect_timeout_seconds=1, command_timeout_seconds=1),
+            )
+            client.begin_transaction()
+            try:
+                with self.assertRaisesRegex(
+                    manager.RelayProtocolError, "closed the persistent"
+                ):
+                    client.ensure_state(False, retries=1)
+                client.ensure_state(True, retries=2)
+            finally:
+                client.end_transaction()
+
+            self.assertEqual(relay.state.mask, 0x0F)
+            self.assertEqual(relay.state.connection_count, 2)
+            self.assertEqual(
+                relay.state.commands,
+                [0xB0, 0xA1, 0xB0, 0xA1, 0xB0],
+            )
+
+    def test_connection_refused_during_off_confirmation_is_retried(self):
+        with _RunningRelay(
+            version_handshake=True,
+            omit_status_tail=True,
+        ) as relay:
+            real_create_connection = manager.socket.create_connection
+            connection_count = 0
+
+            def intermittently_refused(*args, **kwargs):
+                nonlocal connection_count
+                connection_count += 1
+                # Initial B0 and A1 succeed.  The field controller then
+                # rejects two confirmation connects before listening again.
+                if connection_count in (3, 4):
+                    raise ConnectionRefusedError(
+                        manager.errno.ECONNREFUSED, "Connection refused"
+                    )
+                return real_create_connection(*args, **kwargs)
+
+            client = manager.CorxLegacyTcpClient(
+                _group(relay.port, channels=(1, 2, 3, 4)),
+                _policy(
+                    connect_timeout_seconds=1,
+                    connection_refused_retry_seconds=1,
+                    connection_refused_deadline_seconds=3,
+                    command_timeout_seconds=1,
+                    command_retries=1,
+                ),
+            )
+            with mock.patch.object(
+                manager.socket,
+                "create_connection",
+                side_effect=intermittently_refused,
+            ), mock.patch.object(manager.time, "sleep") as sleep:
+                warning = client.ensure_state(False)
+
+            self.assertEqual(connection_count, 5)
+            self.assertIn("connection refused 2 time(s)", warning)
+            self.assertIn("v1.0 handshake", warning)
+            self.assertIn("omitted second checksum byte", warning)
+            self.assertEqual(relay.state.mask, 0)
+            self.assertEqual(
+                [call.args[0] for call in sleep.call_args_list],
+                [0.2, 1, 1],
+            )
+
+    def test_connection_refused_retries_stop_at_deadline(self):
+        client = manager.CorxLegacyTcpClient(
+            _group(),
+            _policy(
+                connect_timeout_seconds=1,
+                connection_refused_retry_seconds=1,
+                connection_refused_deadline_seconds=3,
+            ),
+        )
+        clock = [0.0]
+
+        def monotonic():
+            return clock[0]
+
+        def sleep(delay):
+            clock[0] += delay
+
+        refused = ConnectionRefusedError(
+            manager.errno.ECONNREFUSED, "Connection refused"
+        )
+        with mock.patch.object(
+            manager.socket, "create_connection", side_effect=refused
+        ) as connect, mock.patch.object(
+            manager.time, "monotonic", side_effect=monotonic
+        ), mock.patch.object(manager.time, "sleep", side_effect=sleep):
+            with self.assertRaises(ConnectionRefusedError):
+                client._connect()
+
+        self.assertEqual(connect.call_count, 4)
+        self.assertEqual(clock[0], 3.0)
+
+    def test_unrelated_socket_errors_are_not_retried(self):
+        client = manager.CorxLegacyTcpClient(_group(), manager.Policy())
+        unreachable = OSError(manager.errno.ENETUNREACH, "Network unreachable")
+        with mock.patch.object(
+            manager.socket, "create_connection", side_effect=unreachable
+        ) as connect, mock.patch.object(manager.time, "sleep") as sleep:
+            with self.assertRaises(OSError) as caught:
+                client._connect()
+
+        self.assertEqual(caught.exception.errno, manager.errno.ENETUNREACH)
+        connect.assert_called_once()
+        sleep.assert_not_called()
 
     def test_v1_handshake_resends_once_and_accumulates_8_plus_1_status(self):
         def field_checksum(body):
@@ -2404,10 +2615,15 @@ class _FakeRelay:
     states = [True, True, True, True]
     transitions = []
     snapshots = []
+    instances = 0
+    transaction_starts = 0
+    transaction_ends = 0
     lock = threading.Lock()
 
     def __init__(self, target, policy):
         self.target = target
+        with self.lock:
+            _FakeRelay.instances += 1
 
     @classmethod
     def reset(cls, on=True):
@@ -2415,6 +2631,17 @@ class _FakeRelay:
             cls.states = [on, True, True, True]
             cls.transitions = []
             cls.snapshots = []
+            _FakeRelay.instances = 0
+            _FakeRelay.transaction_starts = 0
+            _FakeRelay.transaction_ends = 0
+
+    def begin_transaction(self):
+        with self.lock:
+            _FakeRelay.transaction_starts += 1
+
+    def end_transaction(self):
+        with self.lock:
+            _FakeRelay.transaction_ends += 1
 
     def query(self):
         with self.lock:
@@ -3348,6 +3575,9 @@ class CoreTests(unittest.TestCase):
                 _FakeRelay.snapshots,
                 [(False, False, False, False), (True, True, True, True)],
             )
+            self.assertEqual(_FakeRelay.instances, 1)
+            self.assertEqual(_FakeRelay.transaction_starts, 1)
+            self.assertEqual(_FakeRelay.transaction_ends, 1)
             self.assertFalse(manager.StateStore(config.state_db).obligations())
 
     def test_wake_dropout_triggers_one_shared_cycle_and_group_recovery(self):

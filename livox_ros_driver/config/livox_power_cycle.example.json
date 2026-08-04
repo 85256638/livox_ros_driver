@@ -18,6 +18,8 @@
     "event_max_age_seconds": 600,
     "status_stale_seconds": 5,
     "connect_timeout_seconds": 3,
+    "connection_refused_retry_seconds": 1,
+    "connection_refused_deadline_seconds": 3,
     "command_timeout_seconds": 3,
     "command_retries": 3,
     "restore_retries": 5,

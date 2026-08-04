@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from contextlib import contextmanager
+import errno
 import hashlib
 import ipaddress
 import json
@@ -138,6 +139,8 @@ class Policy:
     event_max_age_seconds: float = 600.0
     status_stale_seconds: float = 5.0
     connect_timeout_seconds: float = 3.0
+    connection_refused_retry_seconds: float = 1.0
+    connection_refused_deadline_seconds: float = 3.0
     command_timeout_seconds: float = 3.0
     command_retries: int = 3
     restore_retries: int = 5
@@ -1036,6 +1039,8 @@ def _policy_from_json(data: Mapping[str, Any]) -> Policy:
             "event_max_age_seconds",
             "status_stale_seconds",
             "connect_timeout_seconds",
+            "connection_refused_retry_seconds",
+            "connection_refused_deadline_seconds",
             "command_timeout_seconds",
             "command_retries",
             "restore_retries",
@@ -1082,6 +1087,20 @@ def _policy_from_json(data: Mapping[str, Any]) -> Policy:
         ),
         connect_timeout_seconds=_number(
             data, "connect_timeout_seconds", default=3, minimum=0.2, maximum=5
+        ),
+        connection_refused_retry_seconds=_number(
+            data,
+            "connection_refused_retry_seconds",
+            default=1,
+            minimum=0.2,
+            maximum=5,
+        ),
+        connection_refused_deadline_seconds=_number(
+            data,
+            "connection_refused_deadline_seconds",
+            default=3,
+            minimum=1,
+            maximum=15,
         ),
         command_timeout_seconds=_number(
             data, "command_timeout_seconds", default=3, minimum=0.2, maximum=5
@@ -2485,6 +2504,8 @@ class CorxLegacyTcpClient:
         self.target = target
         self.policy = policy
         self._pending_protocol_warnings: List[str] = []
+        self._transaction_active = False
+        self._transaction_socket: Optional[socket.socket] = None
 
     def _record_protocol_warning(self, warning: str) -> None:
         if warning not in self._pending_protocol_warnings:
@@ -2517,78 +2538,164 @@ class CorxLegacyTcpClient:
             return False
         return frame[7] == _double_checksum(frame[2:7])[0]
 
-    def _exchange(self, payload: bytes, expect: str) -> bytes:
-        deadline = time.monotonic() + self.policy.command_timeout_seconds
-        with socket.create_connection(
-            (self.target.host, self.target.port),
-            timeout=self.policy.connect_timeout_seconds,
-        ) as sock:
-            sock.settimeout(self.policy.command_timeout_seconds)
-            sock.sendall(payload)
-            buffer = bytearray()
-            version_seen = False
-            resent_after_version = False
-            status_tail_deadline: Optional[float] = None
-            while time.monotonic() < deadline:
-                remaining = deadline - time.monotonic()
-                if status_tail_deadline is not None:
-                    remaining = min(
-                        remaining,
-                        max(0.0, status_tail_deadline - time.monotonic()),
-                    )
-                if remaining <= 0:
-                    break
-                sock.settimeout(remaining)
-                try:
-                    chunk = sock.recv(4096)
-                except socket.timeout:
-                    start = buffer.find(_LEGACY_STATUS_HEADER)
-                    if start >= 0 and self._verified_single_checksum_status(
-                        bytes(buffer[start : start + 8])
-                    ):
-                        return bytes(buffer[start : start + 8])
-                    break
-                if not chunk:
-                    break
-                buffer.extend(chunk)
+    @staticmethod
+    def _is_connection_refused(exc: OSError) -> bool:
+        # Linux reports ECONNREFUSED=111 for the field controller's TCP RST.
+        # Keep the Windows value for offline validation/tests of the same
+        # configuration without broadening retries to unrelated network errors.
+        return getattr(exc, "errno", None) in (errno.ECONNREFUSED, 10061)
 
-                # Field-captured CX-5104E-L units can answer the first command
-                # on each new TCP connection with the exact ASCII registration
-                # banner ``v1.0``. The command must then be repeated once on
-                # the same connection. B0 is read-only and A1 explicitly sets
-                # a state, so this narrowly scoped repeat is idempotent.
-                if buffer.startswith(_LEGACY_VERSION_BANNER):
-                    if version_seen:
-                        raise RelayProtocolError(
-                            "relay repeated v1.0 handshake after command resend"
-                        )
-                    del buffer[: len(_LEGACY_VERSION_BANNER)]
-                    version_seen = True
+    def _connect(self) -> socket.socket:
+        """Connect through the relay's measured short listener gaps.
+
+        The field CX-5104E-L remains ICMP-reachable while port 50000
+        intermittently answers SYN with RST for roughly half a second.  Retry
+        only that explicit refusal at a one-second cadence and keep the whole
+        recovery bounded.  Timeouts, routing failures and all other socket
+        errors retain their original fail-closed behavior.
+        """
+
+        started = time.monotonic()
+        deadline = started + self.policy.connection_refused_deadline_seconds
+        refusal_count = 0
+        while True:
+            try:
+                sock = socket.create_connection(
+                    (self.target.host, self.target.port),
+                    timeout=self.policy.connect_timeout_seconds,
+                )
+                if refusal_count:
                     self._record_protocol_warning(
-                        "accepted relay v1.0 handshake; command resent once"
+                        "relay TCP connection refused %d time(s); recovered "
+                        "with %.3gs retry interval"
+                        % (
+                            refusal_count,
+                            self.policy.connection_refused_retry_seconds,
+                        )
                     )
-                if expect == "ack" and b"OK!" in buffer:
-                    return b"OK!"
+                return sock
+            except OSError as exc:
+                if not self._is_connection_refused(exc):
+                    raise
+                refusal_count += 1
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(
+                    min(
+                        self.policy.connection_refused_retry_seconds,
+                        remaining,
+                    )
+                )
+
+    def begin_transaction(self) -> None:
+        """Reuse one TCP session for one bounded physical recovery transaction."""
+
+        if self._transaction_active:
+            raise RelayProtocolError("relay TCP transaction is already active")
+        self._transaction_active = True
+
+    def _drop_transaction_socket(self) -> None:
+        sock = self._transaction_socket
+        self._transaction_socket = None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def end_transaction(self) -> None:
+        self._drop_transaction_socket()
+        self._transaction_active = False
+
+    def _acquire_socket(self) -> Tuple[socket.socket, bool]:
+        if not self._transaction_active:
+            return self._connect(), True
+        if self._transaction_socket is None:
+            self._transaction_socket = self._connect()
+        return self._transaction_socket, False
+
+    def _exchange_on_socket(
+        self, sock: socket.socket, payload: bytes, expect: str
+    ) -> bytes:
+        deadline = time.monotonic() + self.policy.command_timeout_seconds
+        sock.settimeout(self.policy.command_timeout_seconds)
+        sock.sendall(payload)
+        buffer = bytearray()
+        version_seen = False
+        resent_after_version = False
+        status_tail_deadline: Optional[float] = None
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if status_tail_deadline is not None:
+                remaining = min(
+                    remaining,
+                    max(0.0, status_tail_deadline - time.monotonic()),
+                )
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
                 start = buffer.find(_LEGACY_STATUS_HEADER)
-                if start >= 0 and len(buffer) >= start + 9:
-                    return bytes(buffer[start : start + 9])
-                if (
-                    start >= 0
-                    and len(buffer) == start + 8
-                    and self._verified_single_checksum_status(
-                        bytes(buffer[start : start + 8])
-                    )
-                    and status_tail_deadline is None
+                if start >= 0 and self._verified_single_checksum_status(
+                    bytes(buffer[start : start + 8])
                 ):
-                    status_tail_deadline = min(
-                        deadline,
-                        time.monotonic() + _LEGACY_STATUS_TAIL_GRACE_SECONDS,
+                    return bytes(buffer[start : start + 8])
+                break
+            if not chunk:
+                start = buffer.find(_LEGACY_STATUS_HEADER)
+                if start >= 0 and self._verified_single_checksum_status(
+                    bytes(buffer[start : start + 8])
+                ):
+                    # Some relay firmware closes a short query connection
+                    # immediately after its verified eight-byte B0 response.
+                    # The complete status frame remains authoritative.
+                    return bytes(buffer[start : start + 8])
+                raise ConnectionResetError(
+                    errno.ECONNRESET,
+                    "relay closed the persistent TCP connection",
+                )
+            buffer.extend(chunk)
+
+            # Field-captured CX-5104E-L units can answer the first command on
+            # each new TCP connection with the exact ASCII registration banner
+            # ``v1.0``. The command must then be repeated once on the same
+            # connection. B0 is read-only and A1 explicitly sets a state, so
+            # this narrowly scoped repeat is idempotent.
+            if buffer.startswith(_LEGACY_VERSION_BANNER):
+                if version_seen:
+                    raise RelayProtocolError(
+                        "relay repeated v1.0 handshake after command resend"
                     )
-                if version_seen and not resent_after_version and not buffer:
-                    sock.sendall(payload)
-                    resent_after_version = True
-                if len(buffer) > 8192:
-                    raise RelayProtocolError("relay response exceeded 8192 bytes")
+                del buffer[: len(_LEGACY_VERSION_BANNER)]
+                version_seen = True
+                self._record_protocol_warning(
+                    "accepted relay v1.0 handshake; command resent once"
+                )
+            if expect == "ack" and b"OK!" in buffer:
+                return b"OK!"
+            start = buffer.find(_LEGACY_STATUS_HEADER)
+            if start >= 0 and len(buffer) >= start + 9:
+                return bytes(buffer[start : start + 9])
+            if (
+                start >= 0
+                and len(buffer) == start + 8
+                and self._verified_single_checksum_status(
+                    bytes(buffer[start : start + 8])
+                )
+                and status_tail_deadline is None
+            ):
+                status_tail_deadline = min(
+                    deadline,
+                    time.monotonic() + _LEGACY_STATUS_TAIL_GRACE_SECONDS,
+                )
+            if version_seen and not resent_after_version and not buffer:
+                sock.sendall(payload)
+                resent_after_version = True
+            if len(buffer) > 8192:
+                raise RelayProtocolError("relay response exceeded 8192 bytes")
         partial = bytes(buffer)
         start = partial.find(_LEGACY_STATUS_HEADER)
         if start >= 0 and self._verified_single_checksum_status(
@@ -2599,6 +2706,32 @@ class CorxLegacyTcpClient:
             "relay did not return a complete %s response; partial=%s"
             % (expect, partial.hex(" ") if partial else "<empty>")
         )
+
+    def _exchange(self, payload: bytes, expect: str) -> bytes:
+        sock: Optional[socket.socket] = None
+        close_after = False
+        try:
+            sock, close_after = self._acquire_socket()
+            return self._exchange_on_socket(sock, payload, expect)
+        except TimeoutError:
+            # An A1 ACK may legitimately be omitted; retain that live session
+            # so the authoritative B0 can follow on the same connection. A B0
+            # timeout cannot establish a trustworthy stream boundary.
+            if expect != "ack":
+                self._drop_transaction_socket()
+            raise
+        except (OSError, RelayProtocolError):
+            # A later retry always begins with B0 state discovery before any
+            # idempotent A1 set, so replacing a broken transaction socket does
+            # not blindly repeat an ambiguous state-changing command.
+            self._drop_transaction_socket()
+            raise
+        finally:
+            if close_after and sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
     def query(self) -> Tuple[Tuple[bool, bool, bool, bool], Optional[str]]:
         frame = self._exchange(self._query_frame(), "status")
@@ -3482,8 +3615,13 @@ class PowerCycleManagerCore:
         on_archived = False
         phase_error = ""
         non_target_error = ""
+        transaction_started = False
 
         try:
+            begin_transaction = getattr(relay, "begin_transaction", None)
+            if callable(begin_transaction):
+                begin_transaction()
+                transaction_started = True
             self._emit(
                 "POWER_OFF_COMMAND",
                 request,
@@ -3532,9 +3670,12 @@ class PowerCycleManagerCore:
             self._emit("POWER_OFF_FAILED", request, "ERROR", str(exc))
         finally:
             try:
-                # Use a fresh TCP client so restoration does not depend on the
-                # socket used before/during the off interval.
-                restore = self.relay_factory(target, policy)
+                # The field CX-5104E-L has been verified with B0/A1/B0 across
+                # one connection and a 5-second OFF hold. Reuse that bounded
+                # transaction session for ON. If the peer closed it, the
+                # client discards the broken socket; ensure_state begins its
+                # retry with a fresh B0 before sending another idempotent A1.
+                restore = relay
                 warning = restore.ensure_state(
                     True,
                     retries=policy.restore_retries,
@@ -3578,6 +3719,18 @@ class PowerCycleManagerCore:
                     "%s; persistent ON obligation retained" % exc,
                 )
             finally:
+                if transaction_started:
+                    end_transaction = getattr(relay, "end_transaction", None)
+                    if callable(end_transaction):
+                        try:
+                            end_transaction()
+                        except Exception as exc:
+                            self._emit(
+                                "RELAY_SESSION_CLOSE_FAILED",
+                                request,
+                                "WARN",
+                                str(exc),
+                            )
                 self._stop_driver_intent_keepalive(
                     intent_keepalive_stop, intent_keepalive_thread
                 )
