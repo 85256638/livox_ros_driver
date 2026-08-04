@@ -18,6 +18,8 @@ SITE_JSON = "livox_ros_driver/config/livox_lidar_config_multi.json"
 SITE_LAUNCH = "livox_ros_driver/launch/livox_lidar_multi.launch"
 RELAY_CHILD = "livox_ros_driver/launch/livox_power_cycle.launch"
 MARKER = "LIVOX_RELAY_LAUNCH_INTEGRATION"
+MONITOR_MARKER = "LIVOX_MONITOR_LAYOUT_V1"
+MONITOR_LAYOUT_VALUE = "--layout $(arg monitor_layout)"
 DROPIN = (
     "/etc/systemd/system/livox-ros-driver.service.d/"
     "20-livox-power-cycle-safety.conf"
@@ -75,15 +77,38 @@ def _run(command, cwd=None, check=True, **kwargs):
     )
 
 
-def _launch(monitor="true", relay=False, marker=True, valid_xml=True):
+def _launch(
+    monitor="true",
+    relay=False,
+    marker=True,
+    valid_xml=True,
+    monitor_node=True,
+    monitor_layout=None,
+    monitor_layout_default="compact",
+    monitor_args=None,
+):
+    if monitor_layout is None:
+        monitor_layout = relay and monitor_node
     lines = [
         "<launch>",
         '  <arg name="monitor" default="%s"/>' % monitor,
-        '  <param name="unchanged_1" value="1"/>',
-        '  <param name="unchanged_2" value="2"/>',
-        '  <param name="unchanged_3" value="3"/>',
-        '  <param name="unchanged_4" value="4"/>',
     ]
+    if monitor_layout:
+        lines.extend(
+            [
+                "  <!-- %s -->" % MONITOR_MARKER,
+                '  <arg name="monitor_layout" default="%s"/>'
+                % monitor_layout_default,
+            ]
+        )
+    lines.extend(
+        [
+            '  <param name="unchanged_1" value="1"/>',
+            '  <param name="unchanged_2" value="2"/>',
+            '  <param name="unchanged_3" value="3"/>',
+            '  <param name="unchanged_4" value="4"/>',
+        ]
+    )
     if relay:
         lines.extend(
             [
@@ -102,6 +127,17 @@ def _launch(monitor="true", relay=False, marker=True, valid_xml=True):
     lines.append(
         '  <node name="livox_driver" pkg="livox_ros_driver" type="livox_ros_driver_node"/>'
     )
+    if monitor_node:
+        if monitor_args is None and monitor_layout:
+            monitor_args = MONITOR_LAYOUT_VALUE
+        args_attribute = (
+            ' args="%s"' % monitor_args if monitor_args is not None else ""
+        )
+        lines.append(
+            '  <node if="$(arg monitor)" name="livox_stats_monitor" '
+            'pkg="livox_ros_driver" type="livox_stats_monitor.py"%s/>'
+            % args_attribute
+        )
     if valid_xml:
         lines.append("</launch>")
     return ("\n".join(lines) + "\n").encode("utf-8")
@@ -259,6 +295,9 @@ python_validator() {
             self.assertIn('name="monitor" default="false"', merged)
             self.assertEqual(merged.count(MARKER), 1)
             self.assertEqual(merged.count('name="relay_power_cycle_enable"'), 1)
+            self.assertEqual(merged.count(MONITOR_MARKER), 1)
+            self.assertEqual(merged.count('name="monitor_layout"'), 1)
+            self.assertIn(MONITOR_LAYOUT_VALUE, merged)
             self.assertEqual(
                 merged.count('value="$(arg relay_power_cycle_enable)"'), 1
             )
@@ -283,6 +322,9 @@ python_validator() {
             self.assertIn('name="monitor" default="local"', merged)
             self.assertEqual(merged.count(MARKER), 1)
             self.assertEqual(merged.count("livox_power_cycle.launch"), 1)
+            self.assertEqual(merged.count(MONITOR_MARKER), 1)
+            self.assertEqual(merged.count('name="monitor_layout"'), 1)
+            self.assertIn(MONITOR_LAYOUT_VALUE, merged)
             self.assertNotIn("<<<<<<<", merged)
             candidate = backup / "candidate" / SITE_LAUNCH
             self.assertTrue(candidate.is_file())
@@ -542,6 +584,8 @@ class UpdaterEmbeddedValidationTests(unittest.TestCase):
     def test_exact_embedded_python_accepts_only_valid_unique_integration(self):
         valid = self._validate(_launch(relay=True))
         self.assertEqual(valid.returncode, 0, valid.stderr)
+        headless = self._validate(_launch(relay=True, monitor_node=False))
+        self.assertEqual(headless.returncode, 0, headless.stderr)
         shipped = _launch(relay=True)
         for name, payload in {
             "missing-marker": _launch(relay=True, marker=False),
@@ -568,6 +612,26 @@ class UpdaterEmbeddedValidationTests(unittest.TestCase):
             "inline-legacy-manager": shipped.replace(
                 b"</launch>",
                 b'  <node name="livox_power_cycle_manager" pkg="livox_ros_driver" type="livox_power_cycle_manager.py"/>\n</launch>',
+                1,
+            ),
+            "missing-monitor-marker": shipped.replace(
+                ("  <!-- %s -->\n" % MONITOR_MARKER).encode("utf-8"),
+                b"",
+                1,
+            ),
+            "missing-monitor-layout-arg": shipped.replace(
+                b'  <arg name="monitor_layout" default="compact"/>\n',
+                b"",
+                1,
+            ),
+            "invalid-monitor-layout-default": shipped.replace(
+                b'name="monitor_layout" default="compact"',
+                b'name="monitor_layout" default="giant"',
+                1,
+            ),
+            "monitor-does-not-consume-layout": shipped.replace(
+                b' args="--layout $(arg monitor_layout)"',
+                b"",
                 1,
             ),
         }.items():

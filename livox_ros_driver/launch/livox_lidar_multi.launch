@@ -14,6 +14,8 @@
     <arg name="imu_bag" default="false"/>
     <arg name="max_distance" default="25.0"/>
     <arg name="monitor" default="true"/>   <!-- auto-open the stats dashboard in its own terminal window; set false on headless/SSH hosts -->
+    <!-- LIVOX_MONITOR_LAYOUT_V1: fixed-height compact default with explicit diagnostic fallbacks. -->
+    <arg name="monitor_layout" default="compact"/>   <!-- compact: fixed-height live view; full: all diagnostics; history: one-shot history -->
     <arg name="auto_recover" default="false"/>   <!-- true: auto-recover a Normal-but-no-data lidar (restart sampling, then reboot) -->
     <arg name="health_log" default="false"/>   <!-- true: write CSV health logs (edge-triggered events + periodic snapshot) for long-run trend/forensics -->
     <arg name="health_log_dir" default=""/>   <!-- output dir; empty = node working dir (~/.ros). Must already exist -->
@@ -75,12 +77,12 @@
          Needs a desktop / gnome-terminal (X11 DISPLAY). Enable with monitor:=true.
          Kept in a separate window so its in-place redraw never mixes with the
          driver's scrolling logs.
-         The window geometry is fixed at 140 cols x 30 rows: the main table is
-         128 cols wide, while the extra height reduces scrolling when several
-         LiDARs have Handshake SDK-event history. Exception-heavy histories may
-         still need manual scrolling (see the geometry option below). -->
+         The default compact layout is fixed-height and fits the 140x30 window
+         without scrolling for a four-LiDAR site. Full diagnostics remain
+         available with monitor_layout:=full. -->
     <node if="$(arg monitor)" name="livox_stats_monitor" pkg="livox_ros_driver"
           type="livox_stats_monitor.py" output="screen"
+          args="--layout $(arg monitor_layout)"
           launch-prefix="gnome-terminal --geometry=140x30 --wait --"/>
 
     <!-- Optional: Enable RViz -->

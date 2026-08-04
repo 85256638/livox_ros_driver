@@ -11,6 +11,7 @@
 #   # or, after a catkin build with the install rule:
 #   rosrun livox_ros_driver livox_stats_monitor.py
 #
+import argparse
 import json
 import math
 import os
@@ -41,6 +42,8 @@ _source_received_mono = {
     "power_status": None,
     "power_heartbeat": None,
 }
+_layout = "compact"
+_history_shutdown_requested = False
 
 _WIRE_SCHEMA_VERSION = 1
 _DRIVER_STALE_SECONDS = 5.0  # Driver publishes at 1 Hz.
@@ -55,6 +58,8 @@ _BROADCAST_CODE_RE = re.compile(r"^[A-Za-z0-9]{15}$")
 _POWER_GROUP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _STATE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _SEVERITIES = {"INFO", "WARN", "ERROR", "CRITICAL"}
+_SEVERITY_RANK = {"INFO": 0, "WARN": 1, "ERROR": 2, "CRITICAL": 3}
+_LAYOUTS = ("compact", "full", "history")
 
 
 def _finite_number(value):
@@ -359,7 +364,488 @@ def _append_relay_history(lines, history, error):
             )
 
 
-def _compose_dashboard(
+def _split_driver_sections(stats_text):
+    """Split the Driver's human-readable snapshot into named sections."""
+    sections = {}
+    order = []
+    preamble = []
+    current = None
+    for line in (stats_text or "").rstrip("\n").splitlines():
+        if line.startswith("==================== "):
+            current = line.strip().strip("=").strip()
+            if current not in sections:
+                sections[current] = []
+                order.append(current)
+            continue
+        if current is None:
+            preamble.append(line)
+        else:
+            sections[current].append(line)
+    return preamble, sections, order
+
+
+def _fit_cell(value, width):
+    text = _safe_inline(str(value))
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return text[: width - 1] + "~"
+
+
+def _parse_device_rows(lines):
+    rows = []
+    for line in lines:
+        fields = line.split()
+        if (
+            len(fields) >= 8
+            and fields[0].isdigit()
+            and _BROADCAST_CODE_RE.fullmatch(fields[1]) is not None
+        ):
+            rows.append(
+                {
+                    "id": fields[0],
+                    "broadcast_code": fields[1],
+                    "state": fields[2],
+                    "assess": fields[3],
+                    "points": fields[4],
+                    "hardware": fields[5],
+                    "connected": fields[6],
+                    "disconnects": fields[7],
+                }
+            )
+    return rows
+
+
+def _parse_recent_rows(lines):
+    rows = {}
+    for line in lines:
+        fields = line.split()
+        if (
+            len(fields) >= 5
+            and fields[0].isdigit()
+            and _BROADCAST_CODE_RE.fullmatch(fields[1]) is not None
+        ):
+            rows[fields[1]] = {
+                "loss": fields[2],
+                "queue_drop": fields[3],
+                "handshake": fields[4],
+            }
+    return rows
+
+
+def _parse_measurement_rows(lines):
+    rows = {}
+    current = None
+    for line in lines:
+        header = re.match(r"^\s*L(\d+)\s+([A-Za-z0-9]{15})\s*$", line)
+        if header:
+            current = {
+                "id": header.group(1),
+                "broadcast_code": header.group(2),
+                "session": "--",
+                "error_reboots": "--",
+                "point_cloud": "--",
+                "last_recovery": "--",
+                "first_data": "",
+                "next": "--",
+            }
+            rows[current["broadcast_code"]] = current
+            continue
+        if current is None:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("MEASUREMENT SESSION:"):
+            current["session"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("ERROR REBOOTS:"):
+            current["error_reboots"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("POINT-CLOUD:"):
+            current["point_cloud"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("LAST RECOVERY:"):
+            current["last_recovery"] = stripped.split(":", 1)[1].strip()
+        elif "first data returned=" in stripped:
+            current["first_data"] = stripped
+        elif stripped.startswith("NEXT ESCALATION:"):
+            current["next"] = stripped.split(":", 1)[1].strip()
+    return rows
+
+
+def _parse_alert_rows(lines):
+    rows = {}
+    for line in lines:
+        match = re.match(
+            r"^\s*\[(CRIT|ALERT|RECOVER)\]\s+L(\d+)\s+"
+            r"([A-Za-z0-9]{15})\s+(.*)$",
+            line,
+        )
+        if not match:
+            continue
+        rows.setdefault(match.group(3), []).append(
+            "[%s] %s" % (match.group(1), _safe_inline(match.group(4)))
+        )
+    return rows
+
+
+def _parse_history_blocks(lines):
+    blocks = {}
+    current = None
+    for line in lines:
+        header = re.match(r"^\s*L(\d+)\s+([A-Za-z0-9]{15}):\s*$", line)
+        if header:
+            current = {
+                "id": header.group(1),
+                "broadcast_code": header.group(2),
+                "lines": [],
+            }
+            blocks[current["broadcast_code"]] = current
+            continue
+        if current is not None and line.strip():
+            current["lines"].append(line.strip())
+    return blocks
+
+
+def _history_summary(block):
+    if not block:
+        return ""
+    text = "\n".join(block.get("lines", []))
+    tokens = []
+    patterns = (
+        ("disc", r"disconnect episodes=(\d+)"),
+        ("pc", r"point-cloud outages=(\d+)"),
+        ("hs", r"handshake failure episodes: stuck=(\d+)"),
+        ("wake", r"wake dropout episodes=(\d+)"),
+        ("normal", r"normal-dropout episodes=(\d+)"),
+        ("power", r"POWER_CYCLE_REQUIRED: episodes=(\d+)"),
+        ("fault", r"hardware fault episodes=(\d+)"),
+        ("reboot", r"automatic reboot actions=(\d+)"),
+        ("mode", r"mode failures: total=(\d+)"),
+        ("relay", r"planned shared power cycles=(\d+)"),
+    )
+    for label, pattern in patterns:
+        match = re.search(pattern, text)
+        if match and int(match.group(1)) != 0:
+            tokens.append("%s=%s" % (label, match.group(1)))
+    if "point-cloud outages=" in text and "current=ACTIVE" in text:
+        tokens.append("pc=ACTIVE")
+    return "hist " + ",".join(tokens) if tokens else "history present"
+
+
+def _compact_measurement(row):
+    if not row:
+        return {
+            "session": "--",
+            "error": "--",
+            "point": "--",
+            "last": "--",
+            "next": "--",
+        }
+    session = row.get("session", "--").split()[0]
+    error_match = re.search(r"\b\d+/\d+\b", row.get("error_reboots", ""))
+    error = error_match.group(0) if error_match else "--"
+    point = row.get("point_cloud", "--").split(";", 1)[0].strip()
+    last_text = row.get("last_recovery", "--")
+    if last_text.startswith("none"):
+        last = "--"
+    else:
+        last = last_text.split()[0] if last_text else "--"
+        first_match = re.search(
+            r"first data returned=\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})",
+            row.get("first_data", ""),
+        )
+        if first_match and last != "--":
+            last = "%s@%s" % (last, first_match.group(1))
+    next_text = row.get("next", "")
+    reboot_match = re.search(r"soft reboot (\d+/\d+)", next_text)
+    if "already active" in next_text and "POWER_CYCLE_REQUIRED" in next_text:
+        next_action = "POWER ACTIVE"
+    elif "POWER_CYCLE_REQUIRED" in next_text:
+        next_action = "POWER next"
+    elif "starts a session" in next_text:
+        next_action = "start->1/3"
+    elif reboot_match:
+        next_action = "soft %s" % reboot_match.group(1)
+    else:
+        next_action = next_text or "--"
+    return {
+        "session": session,
+        "error": error,
+        "point": point,
+        "last": last,
+        "next": next_action,
+    }
+
+
+def _software_summary(sections):
+    line = next(
+        (
+            item.strip()
+            for item in sections.get("SOFTWARE", [])
+            if "Driver commit=" in item
+        ),
+        "",
+    )
+    driver = re.search(r"Driver commit=([^\s]+)", line)
+    sdk = re.search(r"paired SDK commit=([^\s]+)", line)
+    compatibility = re.search(r"compatibility=([^\s]+)", line)
+    return {
+        "driver": (driver.group(1)[:7] if driver else "unknown"),
+        "sdk": (sdk.group(1)[:7] if sdk else "unknown"),
+        "compatibility": compatibility.group(1) if compatibility else "--",
+    }
+
+
+def _manager_compact_summary(rows, now_mono):
+    manager = next(
+        (
+            row
+            for row in rows
+            if not row["power_group"] and not row["broadcast_code"]
+        ),
+        None,
+    )
+    if manager is None:
+        return {
+            "state": "NOT_SEEN",
+            "age": "--",
+            "detail": "manager disabled, starting, or failed",
+        }
+    age = _elapsed_seconds(manager["_received_mono"], now_mono)
+    if age is None or age > _MANAGER_STALE_SECONDS:
+        return {
+            "state": "STALE",
+            "age": _age_text_from_seconds(age),
+            "detail": "heartbeat missing severity=CRITICAL",
+        }
+    detail = _safe_inline(manager.get("detail", ""))
+    mode = re.search(r"\bmode=([A-Za-z0-9_-]+)", detail)
+    state = mode.group(1).upper() if mode else manager["state"]
+    return {
+        "state": state,
+        "age": _age_text_from_seconds(age),
+        "detail": detail or manager["state"],
+    }
+
+
+def _compact_power_lines(rows, now_mono):
+    manager = _manager_compact_summary(rows, now_mono)
+    lines = [
+        _fit_cell(
+            "POWER-MGR: state=%s age=%s %s"
+            % (manager["state"], manager["age"], manager["detail"]),
+            138,
+        )
+    ]
+    events = [
+        row
+        for row in rows
+        if row["power_group"] or row["broadcast_code"]
+    ]
+    if not events:
+        lines.append("POWER-EVENT: none")
+        return lines
+    events.sort(
+        key=lambda item: (
+            _SEVERITY_RANK.get(item["severity"], -1),
+            item["_received_mono"],
+        ),
+        reverse=True,
+    )
+    event = events[0]
+    age = _age_text_from_seconds(
+        _elapsed_seconds(event["_received_mono"], now_mono)
+    )
+    group = event["power_group"] or "UNMAPPED"
+    relay = ",".join(str(item) for item in event["relay_channels"]) or "-"
+    event_line = (
+        "POWER-EVENT: group=%s state=%s severity=%s age=%s trigger=%s relay=%s"
+        % (
+            group,
+            event["state"],
+            event["severity"],
+            age,
+            event["broadcast_code"] or "-",
+            relay,
+        )
+    )
+    if len(events) > 1:
+        event_line += " +%d more" % (len(events) - 1)
+    lines.append(_fit_cell(event_line, 138))
+    return lines
+
+
+def _compact_relay_line(history, error):
+    if error:
+        return _fit_cell("RELAY: unavailable: %s" % error, 138)
+    if not history:
+        return "RELAY: last cycle=none"
+    item = history[0]
+    return _fit_cell(
+        "RELAY: last=%s reason=%s outcome=%s OFF=%s ON=%s trigger=%s"
+        % (
+            _wall_time_text(item["started_at"]),
+            item["reason"],
+            item["outcome"],
+            "YES" if item["off_confirmed_at"] is not None else "--",
+            "YES" if item["on_confirmed_at"] is not None else "--",
+            item["trigger"],
+        ),
+        138,
+    )
+
+
+def _compose_compact_dashboard(
+    stats_text,
+    stats_received_mono,
+    rows,
+    now_mono,
+    relay_history=(),
+    relay_history_error=None,
+):
+    driver_age = _elapsed_seconds(stats_received_mono, now_mono)
+    if stats_received_mono is None:
+        driver_state = "WAITING"
+    elif driver_age is None or driver_age > _DRIVER_STALE_SECONDS:
+        driver_state = "STALE"
+    else:
+        driver_state = "LIVE"
+
+    _preamble, sections, _order = _split_driver_sections(stats_text)
+    devices = _parse_device_rows(sections.get("CURRENT DEVICES", []))
+    recent = _parse_recent_rows(sections.get("RECENT 60 SECONDS", []))
+    measurement = _parse_measurement_rows(
+        sections.get("MEASUREMENT RECOVERY", [])
+    )
+    alerts = _parse_alert_rows(sections.get("CURRENT ALERTS", []))
+    history = _parse_history_blocks(sections.get("PROCESS HISTORY", []))
+    software = _software_summary(sections)
+    manager = _manager_compact_summary(rows, now_mono)
+    alert_count = sum(len(items) for items in alerts.values())
+
+    lines = [
+        _fit_cell(
+            "LIVOX | Driver=%s(%s) | PowerMgr=%s(%s) | Driver=%s SDK=%s %s "
+            "| devices=%d alerts=%d"
+            % (
+                driver_state,
+                _age_text_from_seconds(driver_age),
+                manager["state"],
+                manager["age"],
+                software["driver"],
+                software["sdk"],
+                software["compatibility"],
+                len(devices),
+                alert_count,
+            ),
+            138,
+        ),
+        "==================== CURRENT DEVICES ==================",
+        "ID   broadcast_code   CURRENT               ASSESS       points/s  HW          connected  disc",
+    ]
+    if not devices:
+        lines.append("--   waiting for a valid Driver snapshot")
+    for device in devices:
+        lines.append(
+            "{:<3}  {:<15}  {:<20}  {:<10}  {:>8}  {:<10}  {:>9}  {:>4}".format(
+                _fit_cell(device["id"], 3),
+                _fit_cell(device["broadcast_code"], 15),
+                _fit_cell(device["state"], 20),
+                _fit_cell(device["assess"], 10),
+                _fit_cell(device["points"], 8),
+                _fit_cell(device["hardware"], 10),
+                _fit_cell(device["connected"], 9),
+                _fit_cell(device["disconnects"], 4),
+            )
+        )
+
+    lines.extend(
+        [
+            "==================== RECOVERY / RECENT =================",
+            "ID   net_loss  queue_drop  handshake  session   Error    point-cloud   last-recovery       next-error",
+        ]
+    )
+    for device in devices:
+        code = device["broadcast_code"]
+        recent_row = recent.get(
+            code, {"loss": "--", "queue_drop": "--", "handshake": "--"}
+        )
+        recovery = _compact_measurement(measurement.get(code))
+        lines.append(
+            "{:<3}  {:>8}  {:>10}  {:>9}  {:<8}  {:>7}  {:<12}  {:<18}  {:<12}".format(
+                _fit_cell(device["id"], 3),
+                _fit_cell(recent_row["loss"], 8),
+                _fit_cell(recent_row["queue_drop"], 10),
+                _fit_cell(recent_row["handshake"], 9),
+                _fit_cell(recovery["session"], 8),
+                _fit_cell(recovery["error"], 7),
+                _fit_cell(recovery["point"], 12),
+                _fit_cell(recovery["last"], 18),
+                _fit_cell(recovery["next"], 12),
+            )
+        )
+
+    lines.extend(
+        [
+            "==================== ACTION / HISTORY ==================",
+            "ID   broadcast_code   current action / process history",
+        ]
+    )
+    seen_codes = set()
+    for device in devices:
+        code = device["broadcast_code"]
+        seen_codes.add(code)
+        action_parts = list(alerts.get(code, []))
+        summary = _history_summary(history.get(code))
+        if summary:
+            action_parts.append(summary)
+        action = " | ".join(action_parts) if action_parts else "none"
+        lines.append(
+            "{:<3}  {:<15}  {}".format(
+                _fit_cell(device["id"], 3),
+                code,
+                _fit_cell(action, 112),
+            )
+        )
+    for code, alert_rows in alerts.items():
+        if code in seen_codes:
+            continue
+        lines.append(
+            "---  {:<15}  {}".format(code, _fit_cell(" | ".join(alert_rows), 112))
+        )
+
+    lines.extend(_compact_power_lines(rows, now_mono))
+    lines.extend(
+        [
+            _compact_relay_line(relay_history, relay_history_error),
+            "ASSESS: ACTIVE=fault RECOVERING=repair IDLE=low-power "
+            "OBSERVE=<10m STABLE=>=10m WATCH/UNSTABLE=trend",
+            "RECOVERY: last=duration@first-data; handshake=SDK attempts/60s; "
+            "details: --layout full; one-shot history: --layout history",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _history_stats_text(stats_text):
+    _preamble, sections, _order = _split_driver_sections(stats_text)
+    selected = []
+    for name in (
+        "SOFTWARE",
+        "CURRENT ALERTS",
+        "MEASUREMENT RECOVERY",
+        "PROCESS HISTORY",
+    ):
+        selected.append("==================== %s ====================" % name)
+        content = sections.get(name, [])
+        if content:
+            selected.extend(content)
+        elif name == "PROCESS HISTORY":
+            selected.append("  none in this Driver process")
+        else:
+            selected.append("  unavailable")
+    return "\n".join(selected) + "\n"
+
+
+def _compose_full_dashboard(
     stats_text,
     stats_received_mono,
     rows,
@@ -487,6 +973,38 @@ def _compose_dashboard(
     return "\n".join(lines) + "\n"
 
 
+def _compose_dashboard(
+    stats_text,
+    stats_received_mono,
+    rows,
+    now_mono,
+    relay_history=(),
+    relay_history_error=None,
+    layout="compact",
+):
+    if layout not in _LAYOUTS:
+        raise ValueError("unknown dashboard layout: %s" % layout)
+    if layout == "compact":
+        return _compose_compact_dashboard(
+            stats_text,
+            stats_received_mono,
+            rows,
+            now_mono,
+            relay_history,
+            relay_history_error,
+        )
+    if layout == "history":
+        stats_text = _history_stats_text(stats_text)
+    return _compose_full_dashboard(
+        stats_text,
+        stats_received_mono,
+        rows,
+        now_mono,
+        relay_history,
+        relay_history_error,
+    )
+
+
 def _render():
     with _render_lock:
         now_mono = time.monotonic()
@@ -502,6 +1020,7 @@ def _render():
             now_mono,
             relay_history,
             relay_history_error,
+            layout=_layout,
         )
         # ESC[2J = clear screen, ESC[H = cursor to home (top-left)
         sys.stdout.write("\033[2J\033[H")
@@ -510,7 +1029,7 @@ def _render():
 
 
 def cb(msg):
-    global _stats_text, _stats_received_mono
+    global _stats_text, _stats_received_mono, _history_shutdown_requested
     data = getattr(msg, "data", None)
     if not isinstance(data, str) or not data or len(data) > _MAX_STATS_BYTES:
         return False
@@ -520,6 +1039,14 @@ def cb(msg):
         _stats_received_mono = received_mono
         _source_received_mono["driver_stats"] = received_mono
     _render()
+    if (
+        _layout == "history"
+        and not _history_shutdown_requested
+        and rospy is not None
+        and hasattr(rospy, "signal_shutdown")
+    ):
+        _history_shutdown_requested = True
+        rospy.signal_shutdown("one-shot history rendered")
     return True
 
 
@@ -553,11 +1080,38 @@ def _refresh_cb(_event):
     _render()
 
 
-def main():
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Livox fixed-height operations dashboard"
+    )
+    parser.add_argument(
+        "--layout",
+        choices=_LAYOUTS,
+        default="compact",
+        help=(
+            "compact=fixed-height live view (default); full=all diagnostics; "
+            "history=one-shot recovery/process/relay history"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    global _layout, _history_shutdown_requested
     if rospy is None or String is None:
         raise RuntimeError(
             "ROS Python modules unavailable; source the ROS environment first"
         )
+    if argv is None:
+        ros_argv = (
+            rospy.myargv(argv=sys.argv)
+            if hasattr(rospy, "myargv")
+            else [sys.argv[0]]
+        )
+        argv = ros_argv[1:]
+    args = _parse_args(argv)
+    _layout = args.layout
+    _history_shutdown_requested = False
     rospy.init_node("livox_stats_monitor", anonymous=True)
     rospy.Subscriber("livox/lidar_stats", String, cb, queue_size=1)
     rospy.Subscriber(

@@ -545,6 +545,44 @@ if children.index(relay_include) > children.index(driver_nodes[0]):
     raise SystemExit(
         "livox_power_cycle.launch include must appear before livox_driver"
     )
+
+monitor_nodes = [
+    node for node in root.findall("node")
+    if node.get("name") == "livox_stats_monitor"
+    or node.get("type") == "livox_stats_monitor.py"
+]
+if len(monitor_nodes) > 1:
+    raise SystemExit(
+        "launch must contain at most one direct livox_stats_monitor node"
+    )
+if monitor_nodes:
+    monitor_marker = "LIVOX_MONITOR_LAYOUT_V1"
+    monitor_args = [
+        node for node in root.findall("arg")
+        if node.get("name") == "monitor_layout"
+    ]
+    if text.count(monitor_marker) != 1:
+        raise SystemExit(
+            "launch with stats monitor must contain marker %s exactly once"
+            % monitor_marker
+        )
+    if len(monitor_args) != 1:
+        raise SystemExit(
+            "launch with stats monitor must contain arg monitor_layout exactly once"
+        )
+    if monitor_args[0].get("default") not in ("compact", "full", "history"):
+        raise SystemExit(
+            "monitor_layout default must be compact, full, or history"
+        )
+    monitor_node_args = monitor_nodes[0].get("args", "")
+    expected_layout = "--layout $(arg monitor_layout)"
+    if (
+        monitor_node_args.split().count("--layout") != 1
+        or expected_layout not in monitor_node_args
+    ):
+        raise SystemExit(
+            "livox_stats_monitor must consume --layout $(arg monitor_layout) exactly once"
+        )
 PY
 }
 
@@ -702,7 +740,7 @@ restore_site_config() {
                   validate_relay_launch_integration "${candidate_source}"; then
                 desired_source="${candidate_source}"
                 launch_merge_applied=1
-                log "文本三方合并结果无效；已改用严格结构化合并，仅向现场 launch 注入固定继电器参数/include。"
+                log "文本三方合并结果无效；已改用严格结构化合并，注入固定继电器参数/include，并在现场存在stats monitor时补入compact布局开关。"
               else
                 launch_merge_failure=1
               fi
@@ -716,7 +754,7 @@ restore_site_config() {
                 validate_relay_launch_integration "${candidate_source}"; then
               desired_source="${candidate_source}"
               launch_merge_applied=1
-              log "已使用严格结构化后备合并：现场 launch 保持主体，仅注入固定继电器参数/include。"
+              log "已使用严格结构化后备合并：现场 launch 保持主体，注入固定继电器参数/include，并在现场存在stats monitor时补入compact布局开关。"
             else
               launch_merge_failure=1
             fi

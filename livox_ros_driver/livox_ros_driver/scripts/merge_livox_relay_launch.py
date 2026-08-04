@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Inject the stable relay include into an otherwise site-owned launch file.
+"""Inject stable relay and compact-monitor hooks into a site-owned launch.
 
 This is a deliberately narrow fallback for a textual three-way merge conflict.
-It preserves the local file byte-for-byte except for two fixed insertions and
-refuses files which already contain any relay-manager integration.
+It preserves site parameters/remaps byte-for-byte except for bounded fixed
+insertions and refuses ambiguous relay or monitor integrations.
 """
 
 from __future__ import annotations
@@ -20,6 +20,10 @@ from pathlib import Path
 
 MARKER = "LIVOX_RELAY_LAUNCH_INTEGRATION"
 RELAY_CHILD = "$(find livox_ros_driver)/launch/livox_power_cycle.launch"
+MONITOR_MARKER = "LIVOX_MONITOR_LAYOUT_V1"
+MONITOR_LAYOUT_ARG = "monitor_layout"
+MONITOR_LAYOUT_VALUE = "--layout $(arg monitor_layout)"
+MONITOR_LAYOUTS = {"compact", "full", "history"}
 MAX_LAUNCH_BYTES = 1024 * 1024
 
 
@@ -88,6 +92,154 @@ def _validate_integrated(text: str) -> None:
     if children.index(includes[0]) > children.index(drivers[0]):
         raise MergeError("relay include must appear before livox_driver")
 
+    monitor_nodes = [
+        node
+        for node in root.findall("node")
+        if node.get("name") == "livox_stats_monitor"
+        or node.get("type") == "livox_stats_monitor.py"
+    ]
+    if len(monitor_nodes) > 1:
+        raise MergeError("launch contains multiple direct stats monitor nodes")
+    if monitor_nodes:
+        monitor_args = [
+            node
+            for node in root.findall("arg")
+            if node.get("name") == MONITOR_LAYOUT_ARG
+        ]
+        if text.count(MONITOR_MARKER) != 1:
+            raise MergeError("monitor layout marker must occur exactly once")
+        if len(monitor_args) != 1 or monitor_args[0].get("default") not in MONITOR_LAYOUTS:
+            raise MergeError("monitor_layout arg is missing or invalid")
+        node_args = monitor_nodes[0].get("args", "")
+        if node_args.split().count("--layout") != 1 or MONITOR_LAYOUT_VALUE not in node_args:
+            raise MergeError("stats monitor must consume monitor_layout exactly once")
+
+
+def _root_arg_lines(text: str, root: ET.Element):
+    root_args = root.findall("arg")
+    if not root_args:
+        raise MergeError("local launch has no direct root arguments")
+    arg_lines = list(
+        re.finditer(
+            r"(?m)^(?P<indent>[ \t]*)<arg\b[^>\r\n]*/>[^\S\r\n]*"
+            r"(?:<!--[^\r\n]*-->)?[^\S\r\n]*(?:\r?\n|$)",
+            text,
+        )
+    )
+    if len(arg_lines) != len(root_args):
+        raise MergeError(
+            "root arg layout is ambiguous; expected %d single-line args, found %d"
+            % (len(root_args), len(arg_lines))
+        )
+    return root_args, arg_lines
+
+
+def _inject_monitor_layout(text: str, root: ET.Element, newline: str) -> str:
+    monitor_nodes = [
+        node
+        for node in root.findall("node")
+        if node.get("name") == "livox_stats_monitor"
+        or node.get("type") == "livox_stats_monitor.py"
+    ]
+    if not monitor_nodes:
+        return text
+    if len(monitor_nodes) != 1:
+        raise MergeError("local launch must contain at most one stats monitor node")
+
+    root_args, arg_lines = _root_arg_lines(text, root)
+    layout_args = [
+        node for node in root_args if node.get("name") == MONITOR_LAYOUT_ARG
+    ]
+    marker_count = text.count(MONITOR_MARKER)
+    if len(layout_args) > 1:
+        raise MergeError("local launch contains duplicate monitor_layout args")
+    if not layout_args:
+        if marker_count:
+            raise MergeError("monitor layout marker exists without its arg")
+        monitor_indexes = [
+            index
+            for index, node in enumerate(root_args)
+            if node.get("name") == "monitor"
+        ]
+        insert_index = monitor_indexes[0] if monitor_indexes else len(root_args) - 1
+        match = arg_lines[insert_index]
+        indent = match.group("indent")
+        block = (
+            indent
+            + "<!-- "
+            + MONITOR_MARKER
+            + ": fixed-height compact default with explicit diagnostic fallbacks. -->"
+            + newline
+            + indent
+            + '<arg name="monitor_layout" default="compact"/>'
+            + "   <!-- compact/full/history -->"
+            + newline
+        )
+        text = text[: match.end()] + block + text[match.end() :]
+    else:
+        if layout_args[0].get("default") not in MONITOR_LAYOUTS:
+            raise MergeError("existing monitor_layout default is invalid")
+        if marker_count > 1:
+            raise MergeError("monitor layout marker is duplicated")
+        if marker_count == 0:
+            layout_index = root_args.index(layout_args[0])
+            match = arg_lines[layout_index]
+            marker = (
+                match.group("indent")
+                + "<!-- "
+                + MONITOR_MARKER
+                + " -->"
+                + newline
+            )
+            text = text[: match.start()] + marker + text[match.start() :]
+
+    updated_root = _parse(text, "monitor-integrated launch")
+    updated_nodes = [
+        node
+        for node in updated_root.findall("node")
+        if node.get("name") == "livox_stats_monitor"
+        or node.get("type") == "livox_stats_monitor.py"
+    ]
+    if len(updated_nodes) != 1:
+        raise MergeError("cannot uniquely locate stats monitor after arg insertion")
+    existing_args = updated_nodes[0].get("args")
+    if existing_args is not None and "--layout" in existing_args:
+        if existing_args.split().count("--layout") != 1 or MONITOR_LAYOUT_VALUE not in existing_args:
+            raise MergeError("existing stats monitor layout args are ambiguous")
+        return text
+
+    monitor_start = re.search(
+        r"(?ms)^(?P<indent>[ \t]*)<node\b(?=[^>]*\bname\s*=\s*"
+        r"[\"']livox_stats_monitor[\"'])[^>]*>",
+        text,
+    )
+    if monitor_start is None:
+        raise MergeError("cannot locate stats monitor node in source text")
+    opening = monitor_start.group(0)
+    args_match = re.search(r"\bargs\s*=\s*([\"'])(.*?)\1", opening, re.S)
+    if args_match is not None:
+        existing = args_match.group(2).strip()
+        replacement = (existing + " " + MONITOR_LAYOUT_VALUE).strip()
+        opening = (
+            opening[: args_match.start(2)]
+            + replacement
+            + opening[args_match.end(2) :]
+        )
+    else:
+        close_index = opening.rfind("/>")
+        if close_index < 0:
+            close_index = opening.rfind(">")
+        if close_index < 0:
+            raise MergeError("stats monitor node has no closing bracket")
+        opening = (
+            opening[:close_index]
+            + ' args="'
+            + MONITOR_LAYOUT_VALUE
+            + '"'
+            + opening[close_index:]
+        )
+    return text[: monitor_start.start()] + opening + text[monitor_start.end() :]
+
 
 def merge(local_path: Path, output_path: Path) -> None:
     if local_path.is_symlink() or not local_path.is_file():
@@ -103,22 +255,10 @@ def merge(local_path: Path, output_path: Path) -> None:
     root = _parse(text, "local launch")
     _assert_unintegrated(root, text)
 
-    root_args = root.findall("arg")
-    if not root_args:
-        raise MergeError("local launch has no direct root arguments")
     newline = "\r\n" if "\r\n" in text else "\n"
-    arg_lines = list(
-        re.finditer(
-            r"(?m)^(?P<indent>[ \t]*)<arg\b[^>\r\n]*/>[^\S\r\n]*"
-            r"(?:<!--[^\r\n]*-->)?[^\S\r\n]*(?:\r?\n|$)",
-            text,
-        )
-    )
-    if len(arg_lines) != len(root_args):
-        raise MergeError(
-            "root arg layout is ambiguous; expected %d single-line args, found %d"
-            % (len(root_args), len(arg_lines))
-        )
+    text = _inject_monitor_layout(text, root, newline)
+    root = _parse(text, "monitor-integrated local launch")
+    _root_args, arg_lines = _root_arg_lines(text, root)
     arg_indent = arg_lines[-1].group("indent")
     arg_insert = (
         arg_indent

@@ -17,6 +17,12 @@ SCRIPT = (
     / "scripts"
     / "livox_stats_monitor.py"
 )
+LAUNCH = (
+    Path(__file__).resolve().parents[1]
+    / "livox_ros_driver"
+    / "launch"
+    / "livox_lidar_multi.launch"
+).read_text(encoding="utf-8")
 SPEC = importlib.util.spec_from_file_location("livox_stats_monitor_tested", SCRIPT)
 MONITOR = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MONITOR
@@ -48,6 +54,65 @@ def message(payload):
     else:
         data = json.dumps(payload, separators=(",", ":"))
     return SimpleNamespace(data=data)
+
+
+DRIVER_STATS = """===== Livox LiDAR Status (1 Hz) =====
+==================== SOFTWARE ====================
+  (versions embedded in this running binary)
+  Driver commit=9fa2371a606e ROS=2.6.0 | paired SDK commit=e45774c5d4f2 SDK=2.3.0 | compatibility=PINNED
+==================== CURRENT ALERTS ==============
+  [RECOVER] L2 3WEDH7600111081 DATA_VERIFYING
+    point-cloud: lost=2026-08-04 22:08:39.100; first data=2026-08-04 22:09:22.700; confirming continuous stream for another 1.2s
+==================== CURRENT DEVICES =============
+ID  broadcast_code   CURRENT               ASSESS      points/s  HW            connected    disc
+0   3WEDH5900101321  NORMAL                STABLE          2504  OK                12m13s       0
+1   3WEDH7600109791  NORMAL                WATCH           2504  OK                12m13s       1
+2   3WEDH7600111081  DATA_VERIFYING        RECOVERING      2504  OK                 1m03s       1
+3   1HDDH3200101851  POWER_SAVING          IDLE               0  OK                12m13s       0
+==================== RECENT 60 SECONDS ===========
+  (rolling window; samples expire after 60s)
+ID  broadcast_code    packet_loss  queue_drops  handshake_timeouts
+0   3WEDH5900101321         0.00%            0                   0
+1   3WEDH7600109791         0.10%            0                   1
+2   3WEDH7600111081         0.00%            0                   0
+3   1HDDH3200101851            --            0                   0
+==================== ASSESSMENT GUIDE ============
+  ACTIVE=current fault; RECOVERING=automatic recovery in progress; IDLE=intentional low-power
+==================== MEASUREMENT RECOVERY =========
+  (Error budget is per measurement)
+  L0 3WEDH5900101321
+    MEASUREMENT SESSION: IDLE
+    ERROR REBOOTS: 0/3
+    POINT-CLOUD: HEALTHY; completed outages=0
+    LAST RECOVERY: none in this Driver process
+    NEXT ESCALATION: PowerSaving->Normal starts a session; first 3s Error -> soft reboot 1/3
+  L1 3WEDH7600109791
+    MEASUREMENT SESSION: ACTIVE (explicit id=7)
+    ERROR REBOOTS: 1/3
+    POINT-CLOUD: HEALTHY; completed outages=1
+    LAST RECOVERY: 43.6s (duration ends at first data)
+      lost at=2026-08-04 22:07:49.100; first data returned=2026-08-04 22:08:32.700; confirmed healthy=2026-08-04 22:08:35.700
+    NEXT ESCALATION: next 3s Error -> soft reboot 2/3
+  L2 3WEDH7600111081
+    MEASUREMENT SESSION: ACTIVE (explicit id=8)
+    ERROR REBOOTS: 1/3
+    POINT-CLOUD: VERIFYING; completed outages=0; lost at=2026-08-04 22:08:39.100
+    LAST RECOVERY: none in this Driver process
+    NEXT ESCALATION: next 3s Error -> soft reboot 2/3
+  L3 1HDDH3200101851
+    MEASUREMENT SESSION: IDLE
+    ERROR REBOOTS: 0/3
+    POINT-CLOUD: NOT_EXPECTED; completed outages=0
+    LAST RECOVERY: none in this Driver process
+    NEXT ESCALATION: PowerSaving->Normal starts a session; first 3s Error -> soft reboot 1/3
+==================== PROCESS HISTORY =============
+  (Driver process; resets on restart; not current alarms)
+  L1 3WEDH7600109791:
+    link: disconnect episodes=1; outage duration=1s; current link up=12m13s
+    point-cloud outages=1
+    hardware fault episodes=1; tags=motor+sys; last=2026-08-04 22:07:49
+    automatic reboot actions=1, last=2026-08-04 22:07:52
+"""
 
 
 class MonitorStateTest(unittest.TestCase):
@@ -115,7 +180,9 @@ class MonitorStateTest(unittest.TestCase):
             self.assertEqual(before_sources, MONITOR._source_received_mono)
             rows = [dict(value) for value in MONITOR._power_status.values()]
         # The still-valid cached row remains renderable after every bad input.
-        rendered = MONITOR._compose_dashboard("driver\n", 19.0, rows, 20.0)
+        rendered = MONITOR._compose_dashboard(
+            "driver\n", 19.0, rows, 20.0, layout="full"
+        )
         self.assertIn("MANAGER_HEARTBEAT", rendered)
 
     def test_invalid_driver_message_does_not_replace_last_good_snapshot(self):
@@ -169,7 +236,9 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(
             MONITOR._power_row_key(row), "unmapped:1WEDH5900100001"
         )
-        rendered = MONITOR._compose_dashboard("driver\n", 100.0, [row], 101.0)
+        rendered = MONITOR._compose_dashboard(
+            "driver\n", 100.0, [row], 101.0, layout="full"
+        )
         self.assertIn("UNMAPPED  trigger=1WEDH5900100001", rendered)
         self.assertNotIn("  MANAGER   NOW=UNMAPPED", rendered)
         self.assertIn("NOW=UNMAPPED", rendered)
@@ -188,12 +257,131 @@ class MonitorStateTest(unittest.TestCase):
             message(payload).data, 100.0, "power_status"
         )
         self.assertIsNotNone(row)
-        rendered = MONITOR._compose_dashboard("driver\n", 100.0, [row], 101.0)
+        rendered = MONITOR._compose_dashboard(
+            "driver\n", 100.0, [row], 101.0, layout="full"
+        )
         self.assertIn("relay=1,2,3,4", rendered)
 
+    def test_compact_default_fits_one_screen_and_keeps_actionable_data(self):
+        manager = MONITOR._decode_power_payload(
+            message(
+                valid_payload(
+                    detail="mode=armed worker=alive queue=0 obligations=0"
+                )
+            ).data,
+            100.0,
+            "power_heartbeat",
+        )
+        rendered = MONITOR._compose_dashboard(
+            DRIVER_STATS, 100.0, [manager], 101.0
+        )
+        rendered_lines = rendered.rstrip().splitlines()
+        self.assertEqual(len(rendered_lines), 24)
+        self.assertLessEqual(max(len(line) for line in rendered_lines), 140)
+        self.assertIn("Driver=9fa2371 SDK=e45774c PINNED", rendered)
+        self.assertIn("PowerMgr=ARMED(1s)", rendered)
+        self.assertIn("==================== CURRENT DEVICES", rendered)
+        self.assertIn("==================== RECOVERY / RECENT", rendered)
+        self.assertIn("==================== ACTION / HISTORY", rendered)
+        self.assertIn("DATA_VERIFYING", rendered)
+        self.assertIn("[RECOVER] DATA_VERIFYING", rendered)
+        self.assertIn("43.6s@22:08:32", rendered)
+        self.assertIn("hist disc=1,pc=1,fault=1,reboot=1", rendered)
+        self.assertIn("POWER-MGR: state=ARMED", rendered)
+        self.assertIn("POWER-EVENT: none", rendered)
+        self.assertNotIn("==================== ASSESSMENT GUIDE", rendered)
+        self.assertNotIn("MEASUREMENT SESSION:", rendered)
+        self.assertNotIn("==================== RELAY HISTORY", rendered)
+
+    def test_compact_power_event_never_hides_trigger_or_relay_channels(self):
+        manager = MONITOR._decode_power_payload(
+            message(
+                valid_payload(
+                    detail="mode=armed worker=alive queue=0 obligations=0"
+                )
+            ).data,
+            100.0,
+            "power_heartbeat",
+        )
+        event = MONITOR._decode_power_payload(
+            message(
+                valid_payload(
+                    state="POWER_OFF_CONFIRMED",
+                    severity="WARN",
+                    event_id="event-1",
+                    broadcast_code="3WEDH7600111081",
+                    power_group="pit2",
+                    members=[
+                        "3WEDH5900101321",
+                        "3WEDH7600109791",
+                        "3WEDH7600111081",
+                        "1HDDH3200101851",
+                    ],
+                    relay_channels=[4, 2, 1, 3],
+                )
+            ).data,
+            100.0,
+            "power_status",
+        )
+        rendered = MONITOR._compose_dashboard(
+            DRIVER_STATS, 100.0, [manager, event], 101.0
+        )
+        self.assertIn("POWER-EVENT: group=pit2", rendered)
+        self.assertIn("state=POWER_OFF_CONFIRMED", rendered)
+        self.assertIn("trigger=3WEDH7600111081", rendered)
+        self.assertIn("relay=1,2,3,4", rendered)
+
+    def test_full_and_history_layouts_remain_available(self):
+        full = MONITOR._compose_dashboard(
+            DRIVER_STATS, 100.0, [], 101.0, layout="full"
+        )
+        history = MONITOR._compose_dashboard(
+            DRIVER_STATS, 100.0, [], 101.0, layout="history"
+        )
+        self.assertIn("==================== DATA SOURCE", full)
+        self.assertIn("==================== CURRENT DEVICES", full)
+        self.assertIn("==================== PROCESS HISTORY", history)
+        self.assertIn("point-cloud outages=1", history)
+        self.assertIn("==================== MEASUREMENT RECOVERY", history)
+        self.assertNotIn("==================== CURRENT DEVICES", history)
+        self.assertNotIn("==================== RECENT 60 SECONDS", history)
+
+    def test_history_callback_renders_once_then_requests_shutdown(self):
+        fake_rospy = SimpleNamespace(signal_shutdown=mock.Mock())
+        original_layout = MONITOR._layout
+        try:
+            MONITOR._layout = "history"
+            MONITOR._history_shutdown_requested = False
+            with mock.patch.object(MONITOR, "rospy", fake_rospy), mock.patch.object(
+                MONITOR.time, "monotonic", return_value=50.0
+            ), mock.patch.object(MONITOR, "_render") as render:
+                self.assertTrue(MONITOR.cb(SimpleNamespace(data=DRIVER_STATS)))
+                self.assertTrue(MONITOR.cb(SimpleNamespace(data=DRIVER_STATS)))
+            self.assertEqual(2, render.call_count)
+            fake_rospy.signal_shutdown.assert_called_once_with(
+                "one-shot history rendered"
+            )
+        finally:
+            MONITOR._layout = original_layout
+            MONITOR._history_shutdown_requested = False
+
+    def test_launch_defaults_to_compact_layout(self):
+        self.assertIn('<arg name="monitor_layout" default="compact"/>', LAUNCH)
+        self.assertIn('args="--layout $(arg monitor_layout)"', LAUNCH)
+
+    def test_invalid_layout_is_rejected(self):
+        with self.assertRaises(ValueError):
+            MONITOR._compose_dashboard(
+                DRIVER_STATS, 100.0, [], 101.0, layout="sideways"
+            )
+
     def test_driver_stale_and_age_are_based_on_local_monotonic_receive_time(self):
-        live = MONITOR._compose_dashboard("driver\n", 100.0, [], 104.9)
-        stale = MONITOR._compose_dashboard("driver\n", 100.0, [], 106.0)
+        live = MONITOR._compose_dashboard(
+            "driver\n", 100.0, [], 104.9, layout="full"
+        )
+        stale = MONITOR._compose_dashboard(
+            "driver\n", 100.0, [], 106.0, layout="full"
+        )
         self.assertIn("==================== DATA SOURCE", live)
         self.assertIn("LIVE=realtime", live)
         self.assertIn("NOW=LIVE", live)
@@ -207,8 +395,12 @@ class MonitorStateTest(unittest.TestCase):
         row = MONITOR._decode_power_payload(
             message(future_stamp).data, 200.0, "power_heartbeat"
         )
-        fresh = MONITOR._compose_dashboard("driver\n", 229.9, [row], 229.9)
-        stale = MONITOR._compose_dashboard("driver\n", 200.0, [row], 231.0)
+        fresh = MONITOR._compose_dashboard(
+            "driver\n", 229.9, [row], 229.9, layout="full"
+        )
+        stale = MONITOR._compose_dashboard(
+            "driver\n", 200.0, [row], 231.0, layout="full"
+        )
         self.assertIn("==================== POWER RECOVERY", fresh)
         self.assertIn("NOW=MANAGER_HEARTBEAT", fresh)
         self.assertIn("POWER-MGR NOW=MANAGER_HEARTBEAT", fresh)
@@ -224,7 +416,9 @@ class MonitorStateTest(unittest.TestCase):
             10.0,
             "power_heartbeat",
         )
-        rendered = MONITOR._compose_dashboard("old stats\n", 10.0, [row], 50.0)
+        rendered = MONITOR._compose_dashboard(
+            "old stats\n", 10.0, [row], 50.0, layout="full"
+        )
         self.assertIn("NOW=DRIVER_STALE", rendered)
         self.assertIn("NOW=MANAGER_STALE", rendered)
         self.assertIn("driver_age=40s", rendered)
@@ -269,7 +463,7 @@ class MonitorStateTest(unittest.TestCase):
             self.assertIsNone(error)
             self.assertEqual([6, 5, 4, 3, 2], [item["id"] for item in history])
             rendered = MONITOR._compose_dashboard(
-                "driver\n", 100.0, [], 101.0, history, error
+                "driver\n", 100.0, [], 101.0, history, error, layout="full"
             )
             self.assertIn("==================== RELAY HISTORY", rendered)
             self.assertIn("reason=NORMAL_DROPOUT", rendered)
@@ -284,7 +478,7 @@ class MonitorStateTest(unittest.TestCase):
             self.assertEqual([], history)
             self.assertIsNone(error)
             rendered = MONITOR._compose_dashboard(
-                "driver\n", 100.0, [], 101.0, history, error
+                "driver\n", 100.0, [], 101.0, history, error, layout="full"
             )
             self.assertIn("no relay cycle has been recorded", rendered)
 
@@ -298,7 +492,7 @@ class MonitorStateTest(unittest.TestCase):
             self.assertEqual([], history)
             self.assertIsNotNone(error)
             rendered = MONITOR._compose_dashboard(
-                "driver\n", 100.0, [], 101.0, history, error
+                "driver\n", 100.0, [], 101.0, history, error, layout="full"
             )
             self.assertIn("RELAY HISTORY", rendered)
             self.assertIn("unavailable:", rendered)
