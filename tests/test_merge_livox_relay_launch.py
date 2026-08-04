@@ -56,6 +56,31 @@ def _launch(
     return newline.join(lines)
 
 
+def _integrated_launch(relay_default="true", **kwargs):
+    source = _launch(**kwargs)
+    newline = "\r\n" if "\r\n" in source else "\n"
+    health_arg = '    <arg name="health_log" default="true"/>'
+    source = source.replace(
+        health_arg,
+        health_arg
+        + newline
+        + '    <arg name="relay_power_cycle_enable" default="%s"/>'
+        % relay_default,
+        1,
+    )
+    driver = '    <node name="livox_driver" pkg="livox_ros_driver"'
+    relay_block = newline.join(
+        [
+            "    <!-- %s -->" % merger.MARKER,
+            '    <include file="%s">' % merger.RELAY_CHILD,
+            '        <arg name="enable" value="$(arg relay_power_cycle_enable)"/>',
+            "    </include>",
+            driver,
+        ]
+    )
+    return source.replace(driver, relay_block, 1)
+
+
 class StructuralLaunchMergeTests(unittest.TestCase):
     def test_preserves_site_content_and_injects_one_safe_integration(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -147,6 +172,32 @@ class StructuralLaunchMergeTests(unittest.TestCase):
                 if node.get("name") == "monitor_layout"
             )
             self.assertEqual(layout.get("default"), "full")
+
+    def test_existing_integrated_site_preserves_armed_relay_and_adds_compact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "site.launch"
+            output = Path(tmp) / "candidate.launch"
+            local.write_text(_integrated_launch(), encoding="utf-8")
+            merger.merge(local, output)
+            merged = output.read_text(encoding="utf-8")
+            self.assertEqual(merged.count(merger.MARKER), 1)
+            self.assertEqual(merged.count(merger.RELAY_CHILD), 1)
+            self.assertEqual(merged.count(merger.MONITOR_MARKER), 1)
+            self.assertEqual(merged.count('name="monitor_layout"'), 1)
+            self.assertIn('to="/site/lidar_1"', merged)
+            root = ET.parse(output).getroot()
+            relay_arg = next(
+                node
+                for node in root.findall("arg")
+                if node.get("name") == "relay_power_cycle_enable"
+            )
+            self.assertEqual(relay_arg.get("default"), "true")
+            monitor = next(
+                node
+                for node in root.findall("node")
+                if node.get("name") == "livox_stats_monitor"
+            )
+            self.assertEqual(monitor.get("args"), merger.MONITOR_LAYOUT_VALUE)
 
     def test_headless_launch_does_not_gain_monitor_arguments(self):
         with tempfile.TemporaryDirectory() as tmp:

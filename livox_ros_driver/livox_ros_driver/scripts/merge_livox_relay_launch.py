@@ -41,57 +41,90 @@ def _parse(text: str, scope: str) -> ET.Element:
     return root
 
 
-def _assert_unintegrated(root: ET.Element, text: str) -> None:
-    if MARKER in text:
-        raise MergeError("local launch already contains the relay marker")
-    if any(
-        node.get("name") == "relay_power_cycle_enable"
-        for node in root.findall("arg")
-    ):
-        raise MergeError("local launch already defines relay_power_cycle_enable")
-    if any("power_cycle" in node.get("file", "").lower() for node in root.iter("include")):
-        raise MergeError("local launch already contains a power-cycle include")
-    if any(
-        node.get("type") == "livox_power_cycle_manager.py"
-        or node.get("name") == "livox_power_cycle_manager"
-        for node in root.iter("node")
-    ):
-        raise MergeError("local launch already contains a relay manager node")
+def _has_relay_artifacts(root: ET.Element, text: str) -> bool:
+    return (
+        MARKER in text
+        or any(
+            node.get("name") == "relay_power_cycle_enable"
+            for node in root.findall("arg")
+        )
+        or any(
+            "power_cycle" in node.get("file", "").lower()
+            for node in root.iter("include")
+        )
+        or any(
+            node.get("type") == "livox_power_cycle_manager.py"
+            or node.get("name") == "livox_power_cycle_manager"
+            for node in root.iter("node")
+        )
+    )
 
 
-def _validate_integrated(text: str) -> None:
-    root = _parse(text, "merged launch")
+def _validate_relay_integration(
+    text: str, scope: str, require_safe_default: bool = False
+) -> ET.Element:
+    root = _parse(text, scope)
     if text.count(MARKER) != 1:
-        raise MergeError("merged launch must contain exactly one relay marker")
+        raise MergeError("%s must contain exactly one relay marker" % scope)
     relay_args = [
         node
         for node in root.findall("arg")
         if node.get("name") == "relay_power_cycle_enable"
     ]
-    if len(relay_args) != 1 or relay_args[0].get("default") != "false":
-        raise MergeError("merged relay enable arg is not the fixed safe default")
+    if len(relay_args) != 1:
+        raise MergeError(
+            "%s must contain exactly one relay_power_cycle_enable arg" % scope
+        )
+    relay_default = relay_args[0].get("default", "").strip().lower()
+    if relay_default not in {"true", "false"}:
+        raise MergeError(
+            "%s relay enable default must be literal true or false" % scope
+        )
+    if require_safe_default and relay_default != "false":
+        raise MergeError("new relay integration must use the fixed safe false default")
     includes = [
         node
         for node in root.findall("include")
         if node.get("file") == RELAY_CHILD
     ]
     if len(includes) != 1:
-        raise MergeError("merged launch must contain exactly one relay include")
+        raise MergeError("%s must contain exactly one direct relay include" % scope)
+    power_cycle_includes = [
+        node
+        for node in root.iter("include")
+        if "power_cycle" in node.get("file", "").lower()
+    ]
+    if (
+        len(power_cycle_includes) != 1
+        or power_cycle_includes[0] is not includes[0]
+    ):
+        raise MergeError(
+            "%s contains a second or nonstandard power-cycle include" % scope
+        )
+    if any(
+        node.get("type") == "livox_power_cycle_manager.py"
+        or node.get("name") == "livox_power_cycle_manager"
+        for node in root.iter("node")
+    ):
+        raise MergeError("%s contains a legacy inline relay manager" % scope)
     child_args = includes[0].findall("arg")
     if len(child_args) != 1 or child_args[0].attrib != {
         "name": "enable",
         "value": "$(arg relay_power_cycle_enable)",
     }:
-        raise MergeError("merged relay include has unexpected child arguments")
+        raise MergeError("%s relay include has unexpected child arguments" % scope)
     drivers = [
         node for node in root.findall("node") if node.get("name") == "livox_driver"
     ]
     if len(drivers) != 1:
-        raise MergeError("local launch must contain exactly one direct livox_driver node")
+        raise MergeError("%s must contain exactly one direct livox_driver node" % scope)
     children = list(root)
     if children.index(includes[0]) > children.index(drivers[0]):
         raise MergeError("relay include must appear before livox_driver")
+    return root
 
+
+def _validate_monitor_integration(root: ET.Element, text: str) -> None:
     monitor_nodes = [
         node
         for node in root.findall("node")
@@ -108,11 +141,28 @@ def _validate_integrated(text: str) -> None:
         ]
         if text.count(MONITOR_MARKER) != 1:
             raise MergeError("monitor layout marker must occur exactly once")
-        if len(monitor_args) != 1 or monitor_args[0].get("default") not in MONITOR_LAYOUTS:
+        if (
+            len(monitor_args) != 1
+            or monitor_args[0].get("default") not in MONITOR_LAYOUTS
+        ):
             raise MergeError("monitor_layout arg is missing or invalid")
         node_args = monitor_nodes[0].get("args", "")
-        if node_args.split().count("--layout") != 1 or MONITOR_LAYOUT_VALUE not in node_args:
+        if (
+            node_args.split().count("--layout") != 1
+            or MONITOR_LAYOUT_VALUE not in node_args
+        ):
             raise MergeError("stats monitor must consume monitor_layout exactly once")
+
+
+def _validate_integrated(
+    text: str, require_safe_relay_default: bool = False
+) -> None:
+    root = _validate_relay_integration(
+        text,
+        "merged launch",
+        require_safe_default=require_safe_relay_default,
+    )
+    _validate_monitor_integration(root, text)
 
 
 def _root_arg_lines(text: str, root: ET.Element):
@@ -126,12 +176,19 @@ def _root_arg_lines(text: str, root: ET.Element):
             text,
         )
     )
-    if len(arg_lines) != len(root_args):
+    by_indent = {}
+    for match in arg_lines:
+        by_indent.setdefault(match.group("indent"), []).append(match)
+    candidates = [
+        matches for matches in by_indent.values() if len(matches) == len(root_args)
+    ]
+    if len(candidates) != 1:
         raise MergeError(
-            "root arg layout is ambiguous; expected %d single-line args, found %d"
+            "root arg layout is ambiguous; expected %d direct single-line args, "
+            "found %d single-line arg elements across all depths"
             % (len(root_args), len(arg_lines))
         )
-    return root_args, arg_lines
+    return root_args, candidates[0]
 
 
 def _inject_monitor_layout(text: str, root: ET.Element, newline: str) -> str:
@@ -204,7 +261,10 @@ def _inject_monitor_layout(text: str, root: ET.Element, newline: str) -> str:
         raise MergeError("cannot uniquely locate stats monitor after arg insertion")
     existing_args = updated_nodes[0].get("args")
     if existing_args is not None and "--layout" in existing_args:
-        if existing_args.split().count("--layout") != 1 or MONITOR_LAYOUT_VALUE not in existing_args:
+        if (
+            existing_args.split().count("--layout") != 1
+            or MONITOR_LAYOUT_VALUE not in existing_args
+        ):
             raise MergeError("existing stats monitor layout args are ambiguous")
         return text
 
@@ -253,54 +313,65 @@ def merge(local_path: Path, output_path: Path) -> None:
     except UnicodeDecodeError as exc:
         raise MergeError("local launch is not UTF-8: %s" % exc) from exc
     root = _parse(text, "local launch")
-    _assert_unintegrated(root, text)
+    if any(
+        node.get("type") == "livox_power_cycle_manager.py"
+        or node.get("name") == "livox_power_cycle_manager"
+        for node in root.iter("node")
+    ):
+        raise MergeError("local launch already contains a relay manager node")
+    relay_already_integrated = _has_relay_artifacts(root, text)
+    if relay_already_integrated:
+        _validate_relay_integration(text, "local launch")
 
     newline = "\r\n" if "\r\n" in text else "\n"
     text = _inject_monitor_layout(text, root, newline)
-    root = _parse(text, "monitor-integrated local launch")
-    _root_args, arg_lines = _root_arg_lines(text, root)
-    arg_indent = arg_lines[-1].group("indent")
-    arg_insert = (
-        arg_indent
-        + '<arg name="relay_power_cycle_enable" default="false"/>'
-        + "   <!-- true: enable automatic shared-relay OFF/ON -->"
-        + newline
-    )
-    text = text[: arg_lines[-1].end()] + arg_insert + text[arg_lines[-1].end() :]
+    if not relay_already_integrated:
+        root = _parse(text, "monitor-integrated local launch")
+        _root_args, arg_lines = _root_arg_lines(text, root)
+        arg_indent = arg_lines[-1].group("indent")
+        arg_insert = (
+            arg_indent
+            + '<arg name="relay_power_cycle_enable" default="false"/>'
+            + "   <!-- true: enable automatic shared-relay OFF/ON -->"
+            + newline
+        )
+        text = text[: arg_lines[-1].end()] + arg_insert + text[arg_lines[-1].end() :]
 
-    driver_start = re.search(
-        r"(?ms)^(?P<indent>[ \t]*)<node\b(?=[^>]*\bname\s*=\s*"
-        r"[\"']livox_driver[\"'])[^>]*>",
-        text,
+        driver_start = re.search(
+            r"(?ms)^(?P<indent>[ \t]*)<node\b(?=[^>]*\bname\s*=\s*"
+            r"[\"']livox_driver[\"'])[^>]*>",
+            text,
+        )
+        if driver_start is None:
+            raise MergeError("cannot locate the direct livox_driver node in source text")
+        indent = driver_start.group("indent")
+        child_indent = indent + "    "
+        include_block = (
+            indent
+            + "<!-- "
+            + MARKER
+            + " -->"
+            + newline
+            + indent
+            + '<include file="'
+            + RELAY_CHILD
+            + '">'
+            + newline
+            + child_indent
+            + '<arg name="enable" value="$(arg relay_power_cycle_enable)"/>'
+            + newline
+            + indent
+            + "</include>"
+            + newline
+            + indent
+            + "<!-- End stable relay power-cycle include. -->"
+            + newline
+            + newline
+        )
+        text = text[: driver_start.start()] + include_block + text[driver_start.start() :]
+    _validate_integrated(
+        text, require_safe_relay_default=not relay_already_integrated
     )
-    if driver_start is None:
-        raise MergeError("cannot locate the direct livox_driver node in source text")
-    indent = driver_start.group("indent")
-    child_indent = indent + "    "
-    include_block = (
-        indent
-        + "<!-- "
-        + MARKER
-        + " -->"
-        + newline
-        + indent
-        + '<include file="'
-        + RELAY_CHILD
-        + '">'
-        + newline
-        + child_indent
-        + '<arg name="enable" value="$(arg relay_power_cycle_enable)"/>'
-        + newline
-        + indent
-        + "</include>"
-        + newline
-        + indent
-        + "<!-- End stable relay power-cycle include. -->"
-        + newline
-        + newline
-    )
-    text = text[: driver_start.start()] + include_block + text[driver_start.start() :]
-    _validate_integrated(text)
 
     output_parent = output_path.parent
     if output_parent.is_symlink() or not output_parent.is_dir():

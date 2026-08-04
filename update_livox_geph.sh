@@ -740,7 +740,7 @@ restore_site_config() {
                   validate_relay_launch_integration "${candidate_source}"; then
                 desired_source="${candidate_source}"
                 launch_merge_applied=1
-                log "文本三方合并结果无效；已改用严格结构化合并，注入固定继电器参数/include，并在现场存在stats monitor时补入compact布局开关。"
+                log "文本三方合并结果无效；已改用严格结构化合并，保留已有合法继电器授权/集成或为未集成launch补入安全false结构，并在存在stats monitor时补入compact布局开关。"
               else
                 launch_merge_failure=1
               fi
@@ -754,7 +754,7 @@ restore_site_config() {
                 validate_relay_launch_integration "${candidate_source}"; then
               desired_source="${candidate_source}"
               launch_merge_applied=1
-              log "已使用严格结构化后备合并：现场 launch 保持主体，注入固定继电器参数/include，并在现场存在stats monitor时补入compact布局开关。"
+              log "已使用严格结构化后备合并：现场 launch 保持主体，保留已有合法继电器授权/集成或为未集成launch补入安全false结构，并在存在stats monitor时补入compact布局开关。"
             else
               launch_merge_failure=1
             fi

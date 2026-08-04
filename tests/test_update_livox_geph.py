@@ -176,6 +176,7 @@ class UpdaterSiteTransactionTests(unittest.TestCase):
         upstream_launch,
         local_launch=None,
         local_json=b'{\r\n  "site": "pit-4"\r\n}',
+        base_launch=None,
     ):
         repo = root / "driver"
         backup = root / "backup"
@@ -185,7 +186,8 @@ class UpdaterSiteTransactionTests(unittest.TestCase):
         json_path.parent.mkdir(parents=True)
         launch_path.parent.mkdir(parents=True)
         base_json = b'{\n  "site": "base"\n}\n'
-        base_launch = _launch()
+        if base_launch is None:
+            base_launch = _launch()
         json_path.write_bytes(base_json)
         launch_path.write_bytes(base_launch)
         merger = repo / "livox_ros_driver/livox_ros_driver/scripts/merge_livox_relay_launch.py"
@@ -328,6 +330,40 @@ python_validator() {
             self.assertNotIn("<<<<<<<", merged)
             candidate = backup / "candidate" / SITE_LAUNCH
             self.assertTrue(candidate.is_file())
+            self.assertIn("严格结构化后备合并", result.stderr)
+
+    def test_existing_armed_relay_launch_conflict_adds_compact_without_rearming(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base_launch = _launch(relay=True, monitor_layout=False)
+            local_launch = _launch(
+                monitor="local", relay=True, monitor_layout=False
+            ).replace(
+                b'name="relay_power_cycle_enable" default="false"',
+                b'name="relay_power_cycle_enable" default="true"',
+                1,
+            )
+            upstream_launch = _launch(monitor="upstream", relay=True)
+            repo, backup, pending, local_json, _ = self._prepare_transaction(
+                root,
+                upstream_launch,
+                local_launch=local_launch,
+                base_launch=base_launch,
+            )
+            result, sentinel = self._run_restore(root, repo, backup, pending)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(sentinel.is_file())
+            self.assertEqual((repo / SITE_JSON).read_bytes(), local_json)
+            merged = (repo / SITE_LAUNCH).read_text(encoding="utf-8")
+            self.assertEqual(merged.count(MARKER), 1)
+            self.assertEqual(merged.count("livox_power_cycle.launch"), 1)
+            self.assertEqual(merged.count(MONITOR_MARKER), 1)
+            self.assertEqual(merged.count('name="monitor_layout"'), 1)
+            self.assertIn(MONITOR_LAYOUT_VALUE, merged)
+            self.assertIn(
+                'name="relay_power_cycle_enable" default="true"', merged
+            )
+            self.assertNotIn("<<<<<<<", merged)
             self.assertIn("严格结构化后备合并", result.stderr)
 
     def test_structural_fallback_rejects_existing_inline_manager(self):
