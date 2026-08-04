@@ -41,6 +41,7 @@
 #include "lds.h"
 #include "livox_sdk.h"
 #include "measurement_session_policy.h"
+#include "point_cloud_outage_policy.h"
 #include "rapidjson/document.h"
 #include "timesync.h"
 
@@ -84,6 +85,7 @@ class LdsLidar : public Lds {
   void ObserveNormalPublishing(uint8_t handle, bool healthy,
                                uint64_t connection_generation,
                                const char *broadcast_code);
+  void RecordPointCloudPublished(uint8_t handle) override;
   void TickNormalDropoutRecovery(bool enable_recovery);
   static int64_t HandshakeBroadcastFreshNs() { return 3000000000LL; }
   static uint8_t HandshakeResetMaxAttempts() { return 1; }
@@ -241,6 +243,9 @@ class LdsLidar : public Lds {
     /** Error recovery belongs to one measurement session rather than one
      *  transient connection. Soft reboots and reconnects keep this budget. */
     MeasurementSessionState measurement_session;
+    /** Exact publication-plane outage/recovery timeline. This survives SDK
+     * disconnect/reconnect and excludes intentional low-power/group outages. */
+    PointCloudOutageState point_cloud_outage;
     /** Shared relay outages acknowledged before OFF are maintenance actions,
      *  not single-lidar instability. Keep them visible without incrementing
      *  disconnect/normal-dropout/power-escalation history. */
@@ -426,6 +431,8 @@ class LdsLidar : public Lds {
                                 bool *measurement_close_eligible = nullptr);
   void RecordMeasurementModeSuccess(uint8_t handle, LidarMode mode,
                                     bool close_was_eligible);
+  void MarkPointCloudUnexpectedStop(uint8_t handle);
+  void ExcludePointCloudOutageForPlannedMode(uint8_t handle);
   void MarkModeRequestDisconnected(uint8_t handle);
   livox_status SendModeChangeRequest(uint8_t handle, LidarMode mode,
                                      bool from_reconnect,

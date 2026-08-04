@@ -386,6 +386,19 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
       callback_identity_matches && s.planned_reboot_generation != 0 &&
       s.planned_reboot_generation == current_generation;
   if (planned_group_disconnect) {
+    /** Healthy companion lidars are intentionally interrupted by the shared
+     * relay and must not gain point-cloud outage history. If this lidar already
+     * had a real outage before the intent, preserve that triggering episode so
+     * its end-to-end recovery duration includes the relay repair. */
+    if (!s.point_cloud_outage.outage_active) {
+      ExcludePointCloudOutage(&s.point_cloud_outage);
+    }
+  } else {
+    BeginPointCloudOutage(&s.point_cloud_outage, now,
+                          static_cast<int64_t>(time(nullptr)) *
+                              INT64_C(1000000000));
+  }
+  if (planned_group_disconnect) {
     /** The relay manager obtained a Driver ACK before issuing OFF. This edge
      *  belongs to that shared maintenance action and must not make a healthy
      *  companion lidar look unstable or request another power cycle. */
@@ -1918,6 +1931,48 @@ void LdsLidar::RecordMeasurementModeSuccess(uint8_t handle, LidarMode mode,
   }
 }
 
+void LdsLidar::RecordPointCloudPublished(uint8_t handle) {
+  if (handle >= kMaxLidarCount) {
+    return;
+  }
+  const int64_t now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  const int64_t now_wall_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
+  lock_guard<mutex> lock(link_stat_lock_[handle]);
+  ObservePointCloudPublished(&link_stat_[handle].point_cloud_outage, now_ns,
+                             now_wall_ns);
+}
+
+void LdsLidar::MarkPointCloudUnexpectedStop(uint8_t handle) {
+  if (handle >= kMaxLidarCount) {
+    return;
+  }
+  const int64_t now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  const int64_t now_wall_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
+  lock_guard<mutex> lock(link_stat_lock_[handle]);
+  BeginPointCloudOutage(&link_stat_[handle].point_cloud_outage, now_ns,
+                        now_wall_ns);
+}
+
+void LdsLidar::ExcludePointCloudOutageForPlannedMode(uint8_t handle) {
+  if (handle >= kMaxLidarCount) {
+    return;
+  }
+  lock_guard<mutex> lock(link_stat_lock_[handle]);
+  ExcludePointCloudOutage(&link_stat_[handle].point_cloud_outage);
+}
+
 bool LdsLidar::IsModeTransitionActive(uint8_t handle) {
   if (handle >= kMaxLidarCount) {
     return false;
@@ -2181,6 +2236,7 @@ livox_status LdsLidar::SendModeChangeRequest(
       }
     }
     CancelWakeObservation(handle);
+    ExcludePointCloudOutageForPlannedMode(handle);
     return kStatusSuccess;
   }
   /** A sleep/standby request is safe only after this session completed its
@@ -2283,6 +2339,7 @@ livox_status LdsLidar::SendModeChangeRequest(
   if (cancel_wake_observation) {
     CancelWakeObservation(handle);
     ObserveNormalPublishing(handle, false, 0, nullptr);
+    ExcludePointCloudOutageForPlannedMode(handle);
   }
 
   if (!connected) {
@@ -2784,6 +2841,10 @@ void LdsLidar::OnDeviceChange(const DeviceInfo *info, DeviceEvent type) {
           (resumed_from_lowpower || active_normal_request_id != 0)) {
         p_lidar->connect_state = kConnectStateOn;
       }
+    }
+
+    if (info->state == kLidarStateError) {
+      g_lds_ldiar->MarkPointCloudUnexpectedStop(handle);
     }
 
     /** A Normal state event only completes a pending NORMAL request. It must

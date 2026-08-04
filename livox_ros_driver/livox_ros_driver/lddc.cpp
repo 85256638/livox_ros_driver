@@ -319,6 +319,9 @@ uint32_t Lddc::PublishPointcloud2(LidarDataQueue *queue, uint32_t packet_num,
           cloud);
     }
   }
+  if (published_packet != 0) {
+    lds_->RecordPointCloudPublished(handle);
+  }
   if (!lidar->data_is_pubulished) {
     lidar->data_is_pubulished = true;
   }
@@ -447,6 +450,9 @@ uint32_t Lddc::PublishPointcloudData(LidarDataQueue *queue, uint32_t packet_num,
       bag_->write(p_publisher->getTopic(), ros::Time(timestamp / 1000000000.0),
           cloud);
     }
+  }
+  if (published_packet != 0) {
+    lds_->RecordPointCloudPublished(handle);
   }
   if (!lidar->data_is_pubulished) {
     lidar->data_is_pubulished = true;
@@ -599,6 +605,10 @@ uint32_t Lddc::PublishCustomPointcloud(LidarDataQueue *queue,
       bag_->write(p_publisher->getTopic(), ros::Time(timestamp / 1000000000.0),
           livox_msg);
     }
+  }
+
+  if (published_packet != 0) {
+    lds_->RecordPointCloudPublished(handle);
   }
 
   if (!lidar->data_is_pubulished) {

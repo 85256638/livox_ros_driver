@@ -462,6 +462,10 @@ class Lds {
   void CleanRequestExit() { request_exit_.store(false); }
   bool IsRequestExit() { return request_exit_.load(); }
   virtual void PrepareExit(void);
+  /** Called by Lddc immediately after a real point-cloud message is emitted.
+   * Raw-lidar sources override this to timestamp publication-plane recovery;
+   * file/hub sources intentionally keep the no-op base implementation. */
+  virtual void RecordPointCloudPublished(uint8_t handle) { (void)handle; }
   void UpdateLidarInfoByEthPacket(LidarDevice *p_lidar, \
       LivoxEthPacket* eth_packet);
   uint8_t lidar_count_;                 /**< Lidar access handle. */

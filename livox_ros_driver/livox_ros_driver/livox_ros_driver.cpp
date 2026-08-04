@@ -725,6 +725,22 @@ static std::string FmtWall(int64_t t) {
   return std::string(buf);
 }
 
+/** Format a wall-clock nanosecond timestamp with millisecond precision. */
+static std::string FmtWallNs(int64_t wall_ns) {
+  if (wall_ns <= 0) {
+    return "--";
+  }
+  time_t seconds = static_cast<time_t>(wall_ns / 1000000000LL);
+  const long long millis = (wall_ns % 1000000000LL) / 1000000LL;
+  struct tm tmv;
+  localtime_r(&seconds, &tmv);
+  char base[24];
+  strftime(base, sizeof(base), "%Y-%m-%d %H:%M:%S", &tmv);
+  char result[32];
+  snprintf(result, sizeof(result), "%s.%03lld", base, millis);
+  return std::string(result);
+}
+
 /** Format a steady-clock duration (ns) as a short human string. */
 static std::string FmtDur(int64_t ns) {
   if (ns < 0) ns = 0;
@@ -736,6 +752,29 @@ static std::string FmtDur(int64_t ns) {
     snprintf(buf, sizeof(buf), "%lldm%llds", s / 60, s % 60);
   } else {
     snprintf(buf, sizeof(buf), "%lldh%lldm", s / 3600, (s % 3600) / 60);
+  }
+  return std::string(buf);
+}
+
+/** Recovery timelines retain tenths of a second; the older compact duration
+ * formatter intentionally truncates to whole seconds for uptime cells. */
+static std::string FmtPreciseDur(int64_t ns) {
+  if (ns < 0) {
+    ns = 0;
+  }
+  const double seconds = ns / 1000000000.0;
+  char buf[32];
+  if (seconds < 60.0) {
+    snprintf(buf, sizeof(buf), "%.1fs", seconds);
+  } else if (seconds < 3600.0) {
+    const long long minutes = static_cast<long long>(seconds) / 60;
+    snprintf(buf, sizeof(buf), "%lldm%.1fs", minutes,
+             seconds - minutes * 60.0);
+  } else {
+    const long long hours = static_cast<long long>(seconds) / 3600;
+    const long long minutes =
+        (static_cast<long long>(seconds) % 3600) / 60;
+    snprintf(buf, sizeof(buf), "%lldh%lldm", hours, minutes);
   }
   return std::string(buf);
 }
@@ -820,7 +859,14 @@ void StatsTimerCb(const ros::TimerEvent &) {
   std::vector<bool> startup_healthy(startup_trackers.size(), false);
   std::vector<bool> startup_dashboard_row(startup_trackers.size(), false);
 
-  int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+  const int64_t now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  const int64_t now_wall_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
 
   /** Snapshot pacing for the persistent health log: one row per lidar every
    *  snapshot_period_s (this timer ticks at 1 Hz). Events are logged elsewhere,
@@ -838,6 +884,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
   std::ostringstream recent_table;
   std::ostringstream active_alerts;
   std::ostringstream process_history;
+  std::ostringstream measurement_recovery;
   static const char kCurrentRowFormat[] =
       "%-2.2s  %-15.15s  %-20.20s  %-10.10s  %8.8s  %-10.10s  %11.11s  %6.6s\n";
   static const char kRecentRowFormat[] =
@@ -854,6 +901,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
   recent_table << recent_header;
   bool any_active_alert = false;
   bool any_process_history = false;
+  bool any_measurement_recovery = false;
   uint32_t known_count = 0;
   for (uint8_t h = 0; h < kMaxLidarCount; h++) {
     /** Counters are written by the ingest/publish threads under data_lock_.
@@ -955,6 +1003,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
     char line[256];
     bool publishing_now = false;
     bool transition_active = false;
+    bool expected_point_stream = false;
     uint64_t row_recv = 0;
     const char *row_state = "?";
     if (watchdog_connected) {
@@ -989,6 +1038,9 @@ void StatsTimerCb(const ros::TimerEvent &) {
       bool should_stream = (info.state == kLidarStateNormal) &&
                            !transition_active &&
                            (connect_state != kConnectStateConfig);
+      expected_point_stream =
+          info.state == kLidarStateNormal &&
+          connect_state == kConnectStateSampling && !transition_active;
       bool configuring = (info.state == kLidarStateNormal) &&
                           (connect_state == kConnectStateConfig);
       if (configuring) {
@@ -1318,6 +1370,33 @@ void StatsTimerCb(const ros::TimerEvent &) {
     g_read_lidar->ObserveNormalPublishing(
         h, normal_healthy, connection_generation,
         watchdog_connected ? info.broadcast_code : nullptr);
+    PointCloudOutageTickResult point_outage_result;
+    {
+      std::lock_guard<std::mutex> lock(g_read_lidar->link_stat_lock_[h]);
+      LdsLidar::LinkStat &live = g_read_lidar->link_stat_[h];
+      PointCloudOutageTickInput input;
+      input.expected_stream = watchdog_connected && expected_point_stream;
+      input.intentional_idle =
+          watchdog_connected &&
+          (info.state == kLidarStatePowerSaving ||
+           info.state == kLidarStateStandBy);
+      input.planned_mode_transition = transition_active;
+      input.planned_group_power_cycle =
+          live.planned_group_power_cycle_active &&
+          live.planned_group_power_cycle_deadline_ns >= now_ns;
+      input.now_ns = now_ns;
+      input.now_wall_ns = now_wall_ns;
+      point_outage_result =
+          TickPointCloudOutage(&live.point_cloud_outage, input);
+      ls = live;
+    }
+    if (point_outage_result.recovery_confirmed_edge) {
+      hlog.LogPointCloudRecovery(
+          h, last_bcode[h], point_outage_result.outage_started_wall_ns,
+          point_outage_result.first_publish_wall_ns,
+          point_outage_result.recovery_confirmed_wall_ns,
+          point_outage_result.duration_ns);
+    }
     const char *startup_identity =
         ls.broadcast_code[0] != '\0'
             ? ls.broadcast_code
@@ -1440,6 +1519,13 @@ void StatsTimerCb(const ros::TimerEvent &) {
         }
       }
     }
+    const bool point_data_verifying =
+        ls.point_cloud_outage.outage_active &&
+        ls.point_cloud_outage.recovery_first_publish_ns != 0 &&
+        display_state == "NORMAL";
+    if (point_data_verifying) {
+      display_state = "DATA_VERIFYING";
+    }
 
     DashboardCounters dashboard_counters;
     dashboard_counters.received_packets = st.receive_packet_count;
@@ -1507,6 +1593,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
     live_signals.incident_active = current_incident;
     live_signals.recovery_active =
         display_state == "BROADCAST_ONLY" ||
+        point_data_verifying ||
         (display_state == "CONFIG" && !config_exhausted) ||
         display_state == "INIT" ||
         (display_state == "NORMAL" && !publishing_now);
@@ -1541,12 +1628,90 @@ void StatsTimerCb(const ros::TimerEvent &) {
              hs60_cell.c_str());
     recent_table << line;
 
-    if (current_incident) {
+    any_measurement_recovery = true;
+    const MeasurementSessionState &measurement = ls.measurement_session;
+    const PointCloudOutageState &point_outage = ls.point_cloud_outage;
+    const char *measurement_state =
+        !measurement.active ? "IDLE" : measurement.paused ? "PAUSED" : "ACTIVE";
+    const char *point_state =
+        point_outage.outage_active
+            ? (point_outage.recovery_first_publish_ns != 0 ? "VERIFYING"
+                                                            : "OUTAGE")
+            : point_outage.stream_armed ? "HEALTHY" : "NOT_EXPECTED";
+    measurement_recovery << "  L" << static_cast<unsigned>(h) << " "
+                         << dashboard_bcode << "\n"
+                         << "    MEASUREMENT SESSION: " << measurement_state;
+    if (measurement.active) {
+      measurement_recovery
+          << " (" << (measurement.implicit ? "implicit" : "explicit")
+          << " id=" << measurement.session_id << ")";
+    }
+    measurement_recovery
+        << "\n    ERROR REBOOTS: "
+        << static_cast<unsigned>(measurement.error_reboot_attempts) << "/"
+        << kErrorRebootMaxAttempts << "\n"
+        << "    POINT-CLOUD: " << point_state
+        << "; completed outages=" << point_outage.completed_outage_count;
+    if (point_outage.outage_active) {
+      measurement_recovery
+          << "; lost at=" << FmtWallNs(point_outage.outage_started_wall_ns)
+          << "; elapsed="
+          << FmtPreciseDur(now_ns - point_outage.outage_started_ns);
+      if (point_outage.recovery_first_publish_ns != 0) {
+        measurement_recovery
+            << "; first data="
+            << FmtWallNs(point_outage.recovery_first_publish_wall_ns)
+            << " (awaiting 3s confirmation)";
+      }
+    }
+    measurement_recovery << "\n    LAST RECOVERY: ";
+    if (point_outage.last_recovery_valid) {
+      measurement_recovery
+          << FmtPreciseDur(point_outage.last_outage_duration_ns)
+          << " (duration ends at first data)\n"
+          << "      lost at="
+          << FmtWallNs(point_outage.last_outage_started_wall_ns)
+          << "; first data returned="
+          << FmtWallNs(point_outage.last_first_publish_wall_ns)
+          << "; confirmed healthy="
+          << FmtWallNs(point_outage.last_recovery_confirmed_wall_ns);
+    } else {
+      measurement_recovery << "none in this Driver process";
+    }
+    measurement_recovery << "\n    NEXT ESCALATION: ";
+    if (measurement.error_power_cycle_required) {
+      measurement_recovery
+          << "POWER_CYCLE_REQUIRED already active (Error budget 3/3)";
+    } else if (!measurement.active) {
+      measurement_recovery
+          << "PowerSaving->Normal starts a session; first 3s Error -> soft "
+             "reboot 1/3";
+    } else if (measurement.error_reboot_attempts <
+               kErrorRebootMaxAttempts) {
+      measurement_recovery
+          << (measurement.paused
+                  ? "next Normal resumes retained budget; next 3s Error -> "
+                  : "next 3s Error -> ")
+          << "soft reboot "
+          << static_cast<unsigned>(measurement.error_reboot_attempts + 1)
+          << "/" << kErrorRebootMaxAttempts;
+    } else {
+      measurement_recovery
+          << "next 3s Error -> POWER_CYCLE_REQUIRED "
+             "reason=ERROR_REBOOT_EXHAUSTED";
+    }
+    measurement_recovery << "\n";
+
+    if (current_incident || point_data_verifying) {
       any_active_alert = true;
       const bool critical =
           display_state == "POWER_CYCLE_REQUIRED" ||
           (display_state == "STARTUP_MISSING" && g_auto_recover);
-      active_alerts << "  " << (critical ? "[CRIT]" : "[ALERT]") << " L"
+      active_alerts << "  "
+                    << (critical ? "[CRIT]"
+                                 : point_data_verifying ? "[RECOVER]"
+                                                        : "[ALERT]")
+                    << " L"
                     << static_cast<unsigned>(h) << " " << dashboard_bcode
                     << " " << display_state;
       if (critical) {
@@ -1682,6 +1847,29 @@ void StatsTimerCb(const ros::TimerEvent &) {
       if (dashboard_connected && health_tags != "OK") {
         active_alerts << "    hardware: " << health_tags << "\n";
       }
+      if (ls.point_cloud_outage.outage_active) {
+        active_alerts
+            << "    point-cloud: lost="
+            << FmtWallNs(ls.point_cloud_outage.outage_started_wall_ns);
+        if (ls.point_cloud_outage.recovery_first_publish_ns != 0) {
+          const int64_t verify_age =
+              now_ns - ls.point_cloud_outage.recovery_first_publish_ns;
+          const double remaining =
+              verify_age >= 3000000000LL
+                  ? 0.0
+                  : (3000000000LL - verify_age) / 1000000000.0;
+          char remaining_text[16];
+          snprintf(remaining_text, sizeof(remaining_text), "%.1f", remaining);
+          active_alerts
+              << "; first data="
+              << FmtWallNs(
+                     ls.point_cloud_outage.recovery_first_publish_wall_ns)
+              << "; confirming continuous stream for another "
+              << remaining_text << "s\n";
+        } else {
+          active_alerts << "; waiting for first point-cloud batch\n";
+        }
+      }
       if (ls.handshake_event_valid && handshake_incident) {
         active_alerts << "    last SDK event: "
                       << HandshakeEventStr(ls.last_handshake_event)
@@ -1689,6 +1877,9 @@ void StatsTimerCb(const ros::TimerEvent &) {
       }
     }
 
+    const bool point_cloud_history =
+        ls.point_cloud_outage.completed_outage_count != 0 ||
+        ls.point_cloud_outage.outage_active;
     const bool handshake_history =
         ls.handshake_reset_count != 0 ||
         ls.handshake_reset_fail_count != 0 ||
@@ -1710,7 +1901,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
         ls.disconnect_count != 0 || ls.temp_change_count != 0 ||
         ls.fault_count != 0 || ls.recover_reboot_count != 0 ||
         ls.mode_fail_count != 0 || handshake_history || wake_history ||
-        normal_dropout_history || hard_power_history ||
+        normal_dropout_history || hard_power_history || point_cloud_history ||
         ls.planned_group_power_cycle_count != 0;
     if (has_history) {
       any_process_history = true;
@@ -1721,6 +1912,45 @@ void StatsTimerCb(const ros::TimerEvent &) {
                         << ls.disconnect_count << "; outage duration="
                         << outage_duration << "; current link up=" << link_up
                         << "\n";
+      }
+      if (point_cloud_history) {
+        process_history
+            << "    point-cloud outages="
+            << ls.point_cloud_outage.completed_outage_count;
+        if (ls.point_cloud_outage.outage_active) {
+          process_history
+              << "; current=ACTIVE; lost at="
+              << FmtWallNs(
+                     ls.point_cloud_outage.outage_started_wall_ns)
+              << "; elapsed="
+              << FmtPreciseDur(
+                     now_ns - ls.point_cloud_outage.outage_started_ns);
+          if (ls.point_cloud_outage.recovery_first_publish_ns != 0) {
+            process_history
+                << "; first data candidate="
+                << FmtWallNs(
+                       ls.point_cloud_outage.recovery_first_publish_wall_ns)
+                << " (confirming)";
+          }
+        }
+        process_history << "\n";
+        if (ls.point_cloud_outage.last_recovery_valid) {
+          process_history
+              << "      last outage="
+              << FmtPreciseDur(
+                     ls.point_cloud_outage.last_outage_duration_ns)
+              << "; lost at="
+              << FmtWallNs(
+                     ls.point_cloud_outage.last_outage_started_wall_ns)
+              << "\n"
+              << "      first data returned="
+              << FmtWallNs(
+                     ls.point_cloud_outage.last_first_publish_wall_ns)
+              << "; confirmed healthy="
+              << FmtWallNs(
+                     ls.point_cloud_outage.last_recovery_confirmed_wall_ns)
+              << "\n";
+        }
       }
       if (ls.planned_group_power_cycle_count != 0) {
         process_history << "    planned shared power cycles="
@@ -1918,6 +2148,12 @@ void StatsTimerCb(const ros::TimerEvent &) {
         "IDLE=intentional low-power\n"
      << "  STABLE/OBSERVE/WATCH/UNSTABLE combine the rolling 60s metrics with "
         "repeated events/actions in the last 10m\n";
+  if (any_measurement_recovery) {
+    ss << "==================== MEASUREMENT RECOVERY =========\n"
+       << "  (Error budget is per measurement; point-cloud recovery needs 3s "
+          "confirmation but duration ends at first returned data)\n"
+       << measurement_recovery.str();
+  }
   if (any_process_history) {
     ss << "==================== PROCESS HISTORY =============\n"
        << "  (Driver process; resets on restart; not current alarms)\n"

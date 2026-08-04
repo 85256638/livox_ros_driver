@@ -205,6 +205,7 @@ if(CATKIN_ENABLE_TESTING)
     dashboard_metrics_qc
     measurement_session_policy_qc
     normal_dropout_policy_qc
+    point_cloud_outage_policy_qc
     wake_dropout_policy_qc
     recovery_event_json_qc
     group_power_cycle_protocol_qc

@@ -13,6 +13,18 @@ HEADER = (
 DRIVER = (
     ROOT / "livox_ros_driver" / "livox_ros_driver" / "livox_ros_driver.cpp"
 ).read_text(encoding="utf-8")
+LDDC = (
+    ROOT / "livox_ros_driver" / "livox_ros_driver" / "lddc.cpp"
+).read_text(encoding="utf-8")
+HEALTH_LOGGER = (
+    ROOT / "livox_ros_driver" / "livox_ros_driver" / "health_logger.h"
+).read_text(encoding="utf-8")
+POINT_OUTAGE_POLICY = (
+    ROOT
+    / "livox_ros_driver"
+    / "livox_ros_driver"
+    / "point_cloud_outage_policy.h"
+).read_text(encoding="utf-8")
 WAKE_POLICY = (
     ROOT / "livox_ros_driver" / "livox_ros_driver" / "wake_dropout_policy.h"
 ).read_text(encoding="utf-8")
@@ -89,7 +101,7 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         self.assertIn("ls = live", publish)
 
         alerts = DRIVER[
-            DRIVER.index("if (current_incident)") :
+            DRIVER.index("if (current_incident || point_data_verifying)") :
             DRIVER.index("const bool handshake_history")
         ]
         self.assertIn("HandshakeResetPhaseStr(ls.handshake_reset_phase)", alerts)
@@ -158,7 +170,7 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         )
 
         alerts = stats[
-            stats.index("if (current_incident)") :
+            stats.index("if (current_incident || point_data_verifying)") :
             stats.index("const bool handshake_history")
         ]
         self.assertIn('display_state == "POWER_CYCLE_REQUIRED"', alerts)
@@ -302,6 +314,34 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         self.assertIn('"    mode failures: total="', stats)
         self.assertIn('<< "; last-mode="', stats)
 
+    def test_point_cloud_outage_uses_exact_publish_timeline(self):
+        self.assertIn("RecordPointCloudPublished(handle)", LDDC)
+        self.assertEqual(LDDC.count("RecordPointCloudPublished(handle)"), 3)
+        self.assertIn("ObservePointCloudPublished", CPP)
+        self.assertIn("BeginPointCloudOutage", CPP)
+        self.assertIn("ExcludePointCloudOutageForPlannedMode", CPP)
+        self.assertIn("recovery_first_publish_ns", POINT_OUTAGE_POLICY)
+        self.assertIn(
+            "recovery_confirm_ns = 3000000000LL", POINT_OUTAGE_POLICY
+        )
+        self.assertIn(
+            "result.duration_ns = state->recovery_first_publish_ns",
+            POINT_OUTAGE_POLICY,
+        )
+
+    def test_point_cloud_recovery_is_visible_and_persisted(self):
+        stats = DRIVER[DRIVER.index("void StatsTimerCb(") : DRIVER.index("int main(")]
+        self.assertIn("==================== MEASUREMENT RECOVERY", stats)
+        self.assertIn("MEASUREMENT SESSION:", stats)
+        self.assertIn("ERROR REBOOTS:", stats)
+        self.assertIn("LAST RECOVERY:", stats)
+        self.assertIn("NEXT ESCALATION:", stats)
+        self.assertIn('<< "    point-cloud outages="', stats)
+        self.assertIn('<< "      first data returned="', stats)
+        self.assertIn("LogPointCloudRecovery", stats)
+        self.assertIn('"POINTCLOUD_RECOVERED"', HEALTH_LOGGER)
+        self.assertIn("duration ends at first data", stats)
+
     def test_error_outranks_config_and_exhausted_config_is_active(self):
         stats = DRIVER[DRIVER.index("void StatsTimerCb(") : DRIVER.index("int main(")]
         self.assertIn("row_state = info.state == kLidarStateError", stats)
@@ -344,7 +384,7 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
             DRIVER.index("int main(")
         ]
         alerts = stats[
-            stats.index("if (current_incident)") :
+            stats.index("if (current_incident || point_data_verifying)") :
             stats.index("const bool handshake_history")
         ]
         self.assertIn('display_state == "POWER_CYCLE_REQUIRED" ||', alerts)

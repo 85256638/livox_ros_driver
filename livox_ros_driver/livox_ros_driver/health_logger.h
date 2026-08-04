@@ -18,6 +18,7 @@
 #ifndef LIVOX_ROS_DRIVER_HEALTH_LOGGER_H_
 #define LIVOX_ROS_DRIVER_HEALTH_LOGGER_H_
 
+#include <cstdint>
 #include <ctime>
 #include <cstdio>
 #include <fstream>
@@ -57,6 +58,32 @@ class HealthLogger {
     Write("events", "wall_time,handle,bcode,event,detail", row);
   }
 
+  /** Persist one confirmed publication-plane outage. Recovery confirmation is
+   * written now, while duration deliberately ends at first_data so the three
+   * verification seconds do not inflate the outage. */
+  void LogPointCloudRecovery(int handle, const char *bcode,
+                             int64_t lost_wall_ns,
+                             int64_t first_data_wall_ns,
+                             int64_t confirmed_wall_ns,
+                             int64_t duration_ns) {
+    if (!enabled_) {
+      return;
+    }
+    char lost[32];
+    char first[32];
+    char confirmed[32];
+    FormatWallNs(lost_wall_ns, lost, sizeof(lost));
+    FormatWallNs(first_data_wall_ns, first, sizeof(first));
+    FormatWallNs(confirmed_wall_ns, confirmed, sizeof(confirmed));
+    char detail[256];
+    snprintf(detail, sizeof(detail),
+             "duration=%.3fs; lost_at=%s; first_data_returned=%s; "
+             "confirmed_healthy=%s",
+             duration_ns > 0 ? duration_ns / 1000000000.0 : 0.0, lost,
+             first, confirmed);
+    LogEvent(handle, bcode, "POINTCLOUD_RECOVERED", detail);
+  }
+
   /** Append one snapshot row (per lidar, every snapshot_period_s). Carries
    *  cumulative counters so consecutive rows difference into per-interval
    *  totals without missing anything in between. */
@@ -90,6 +117,23 @@ class HealthLogger {
     struct tm tmv;
     localtime_r(&t, &tmv);
     strftime(buf, n, "%Y-%m-%d %H:%M:%S", &tmv);
+  }
+
+  static void FormatWallNs(int64_t wall_ns, char *buf, size_t n) {
+    if (buf == nullptr || n == 0) {
+      return;
+    }
+    if (wall_ns <= 0) {
+      snprintf(buf, n, "--");
+      return;
+    }
+    time_t seconds = static_cast<time_t>(wall_ns / 1000000000LL);
+    const long long millis = (wall_ns % 1000000000LL) / 1000000LL;
+    struct tm tmv;
+    localtime_r(&seconds, &tmv);
+    char base[24];
+    strftime(base, sizeof(base), "%Y-%m-%d %H:%M:%S", &tmv);
+    snprintf(buf, n, "%s.%03lld", base, millis);
   }
 
   void Write(const char *kind, const char *header, const char *row) {
