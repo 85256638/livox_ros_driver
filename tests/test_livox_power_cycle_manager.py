@@ -2534,6 +2534,87 @@ class StoreTests(unittest.TestCase):
             )
             self.assertFalse(reopened.current_alerts())
 
+    def test_schema_v6_archives_stale_cooldown_alarm_without_deleting_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite3"
+            store = manager.StateStore(str(path))
+            target = _group()
+            request = manager.PowerCycleRequest.from_state(_required_state())
+            store.start_event(request, target.group_id, target.power_key, 60)
+            db = sqlite3.connect(str(path))
+            try:
+                db.execute("DROP TABLE power_alarms")
+                db.execute(
+                    "CREATE TABLE power_alarms (power_key TEXT PRIMARY KEY,"
+                    "event_id TEXT NOT NULL,trigger_bcode TEXT NOT NULL,"
+                    "group_id TEXT NOT NULL,state TEXT NOT NULL,detail TEXT NOT NULL,"
+                    "updated_at REAL NOT NULL)"
+                )
+                db.execute(
+                    "INSERT INTO power_alarms VALUES(?,?,?,?,?,?,?)",
+                    (
+                        target.power_key,
+                        request.event_id,
+                        request.broadcast_code,
+                        target.group_id,
+                        "SUPPRESSED_COOLDOWN",
+                        "physical power endpoint cooldown has 1768s remaining",
+                        time.time(),
+                    ),
+                )
+                db.execute("PRAGMA user_version=6")
+                db.commit()
+            finally:
+                db.close()
+
+            migrated = manager.StateStore(str(path))
+            self.assertFalse(migrated.current_alerts())
+            db = sqlite3.connect(str(path))
+            try:
+                status = db.execute(
+                    "SELECT status FROM power_events WHERE event_id=?",
+                    (request.event_id,),
+                ).fetchone()[0]
+                columns = tuple(
+                    row[1]
+                    for row in db.execute("PRAGMA table_info(power_alarms)")
+                )
+            finally:
+                db.close()
+            self.assertEqual(status, "PROCESSING")
+            self.assertEqual(columns[-1], "severity")
+
+    def test_restart_replays_original_alarm_severity_and_event_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite3"
+            target = _group()
+            request = manager.PowerCycleRequest.from_state(_required_state())
+            store = manager.StateStore(str(path))
+            store.start_event(request, target.group_id, target.power_key, 60)
+            store.finish_event(
+                request.event_id,
+                "TARGET_DISABLED",
+                "disabled by site policy",
+                severity="WARN",
+            )
+            persisted = store.current_alerts()[0]
+            statuses = []
+            core = manager.PowerCycleManagerCore(
+                _config(path, target),
+                manager.StateStore(str(path)),
+                statuses.append,
+                relay_factory=_FakeRelay,
+            )
+            core.start()
+            core.stop()
+            replay = next(
+                row for row in statuses if row["state"] == "TARGET_DISABLED"
+            )
+            self.assertEqual(persisted[6], "WARN")
+            self.assertEqual(replay["severity"], "WARN")
+            self.assertEqual(replay["event_timestamp"], persisted[7])
+            self.assertTrue(replay["actionable"])
+
     def test_wake_alarm_survives_manager_restart_with_original_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.sqlite3"
@@ -4205,6 +4286,99 @@ class CoreTests(unittest.TestCase):
                 db.close()
             self.assertEqual(charged, 0)
             self.assertEqual(outcome, "POWER_CYCLE_FAILED")
+
+    def test_cooldown_defers_live_fault_then_archives_it_if_driver_recovers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            statuses = []
+            deferred = threading.Event()
+            resolved = threading.Event()
+
+            def emit(row):
+                statuses.append(dict(row))
+                if row["state"] == "DEFERRED_COOLDOWN":
+                    deferred.set()
+                if row["state"] == "STALE_OR_RECOVERED":
+                    resolved.set()
+
+            _FakeRelay.reset(on=True)
+            policy = _policy(
+                minimum_cycle_interval_seconds=60,
+                max_cycles_per_24_hours=3,
+            )
+            target = _group()
+            config = _config(Path(tmp) / "state.sqlite3", target, policy=policy)
+            store = manager.StateStore(config.state_db)
+            previous = manager.PowerCycleRequest.from_state(
+                _required_state(MEMBERS[0], episode_count=1)
+            )
+            previous_cycle, reason, _ = store.reserve_cycle(
+                previous, target, policy
+            )
+            self.assertEqual(reason, "ok")
+            store.finish_cycle(
+                int(previous_cycle), "RECOVERY_VERIFIED", "previous cycle done"
+            )
+
+            required = _required_state(MEMBERS[1], episode_count=2)
+            request = manager.PowerCycleRequest.from_state(required)
+            core = manager.PowerCycleManagerCore(
+                config, store, emit, relay_factory=_FakeRelay
+            )
+            core.start()
+            feeder = _trigger_group(core, required)
+            self.assertTrue(deferred.wait(2), statuses)
+            feeder.join(timeout=1)
+            self.assertNotIn(False, _FakeRelay.transitions)
+            deferred_row = next(
+                row for row in statuses if row["state"] == "DEFERRED_COOLDOWN"
+            )
+            self.assertEqual(deferred_row["severity"], "WARN")
+            self.assertTrue(deferred_row["actionable"])
+            self.assertGreater(deferred_row["eligible_at"], time.time())
+            self.assertFalse(store.current_alerts())
+
+            # A manager restart must not inflate severity or forget the live
+            # deferred event. The next required 1 Hz Driver frame republishes
+            # the same eligibility without touching OFF/ON.
+            core.stop()
+            core = manager.PowerCycleManagerCore(
+                config, store, emit, relay_factory=_FakeRelay
+            )
+            core.start()
+            replay_feeder = _trigger_group(core, required)
+            self.assertTrue(
+                _wait_until(
+                    lambda: sum(
+                        row["state"] == "DEFERRED_COOLDOWN"
+                        for row in statuses
+                    )
+                    >= 2
+                ),
+                statuses,
+            )
+            replay_feeder.join(timeout=1)
+            self.assertNotIn(False, _FakeRelay.transitions)
+
+            core.accept_state_payload(_healthy_state(request.broadcast_code))
+            self.assertTrue(resolved.wait(1), statuses)
+            core.stop()
+            history = next(
+                row
+                for row in statuses
+                if row["state"] == "STALE_OR_RECOVERED"
+                and row["event_id"] == request.event_id
+            )
+            self.assertFalse(history["actionable"])
+            self.assertEqual(history["severity"], "INFO")
+            db = sqlite3.connect(store.path)
+            try:
+                status = db.execute(
+                    "SELECT status FROM power_events WHERE event_id=?",
+                    (request.event_id,),
+                ).fetchone()[0]
+            finally:
+                db.close()
+            self.assertEqual(status, "STALE_OR_RECOVERED")
 
     def test_persisted_off_obligation_is_repaired_even_in_observe_mode(self):
         with tempfile.TemporaryDirectory() as tmp:

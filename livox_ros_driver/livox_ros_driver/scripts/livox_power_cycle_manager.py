@@ -42,7 +42,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 WIRE_SCHEMA_VERSION = 1
 CONFIG_SCHEMA_VERSION = 2
-STATE_DB_SCHEMA_VERSION = 6
+STATE_DB_SCHEMA_VERSION = 7
 REQUEST_TYPE = "POWER_CYCLE_REQUIRED"
 STATE_TYPE = "LIDAR_RECOVERY_STATE"
 STATUS_TYPE = "POWER_CYCLE_STATUS"
@@ -96,11 +96,29 @@ ACTIVE_ALARM_STATES = {
     "CYCLE_ALREADY_RECORDED",
     "RECOVERY_UNVERIFIED_AFTER_RESTART",
     "SUPPRESSED_DAILY_LIMIT",
-    "SUPPRESSED_COOLDOWN",
     "NON_TARGET_STATE_CHANGED",
     "DRIVER_INTENT_ACK_TIMEOUT",
     "DRIVER_INTENT_REJECTED",
 }
+RESOLVED_ALARM_STATES = {
+    "RECOVERY_VERIFIED",
+    "STALE_OR_RECOVERED",
+    "SUPPRESSED_COOLDOWN",  # schema <=6 compatibility only
+}
+ACTIVE_WORKFLOW_STATES = {
+    "DEFERRED_COOLDOWN",
+    "DRIVER_INTENT_ACKED",
+    "DRIVER_INTENT_ACK_RETRY",
+    "MANAGER_INTERNAL_ERROR",
+    "PERSISTED_ON_RETRY",
+    "POWER_OFF_COMMAND",
+    "POWER_OFF_CONFIRMED",
+    "POWER_OFF_FAILED",
+    "POWER_ON_CONFIRMED",
+    "PRECHECK_RETRY",
+    "QUEUE_FULL",
+}
+_ALARM_SEVERITIES = {"INFO", "WARN", "ERROR", "CRITICAL"}
 _BROADCAST_CODE_RE = re.compile(r"^[A-Za-z0-9]{15}$")
 _POWER_GROUP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _LEGACY_COMMAND_HEADER = b"\xCC\xDD"
@@ -1571,6 +1589,7 @@ class StateStore:
             "state",
             "detail",
             "updated_at",
+            "severity",
         ),
         "safety_clock": (
             "id",
@@ -1673,10 +1692,10 @@ class StateStore:
                 "unexpected table(s) in dedicated state database: %s"
                 % ",".join(sorted(unknown))
             )
-        if version not in {0, 2, 3, 4, 5, STATE_DB_SCHEMA_VERSION}:
+        if version not in {0, 2, 3, 4, 5, 6, STATE_DB_SCHEMA_VERSION}:
             raise StateStoreError(
                 "unsupported state database schema version %d "
-                "(expected 2, 3, 4, 5, or %d)"
+                "(expected 2, 3, 4, 5, 6, or %d)"
                 % (version, STATE_DB_SCHEMA_VERSION)
             )
         if version == 2:
@@ -1843,6 +1862,46 @@ class StateStore:
                     "RENAME TO power_obligations"
                 )
 
+        if version in {2, 3, 4, 5, 6} and "power_alarms" in tables:
+            expected_v6_alarm = tuple(
+                column
+                for column in self._EXPECTED_COLUMNS["power_alarms"]
+                if column != "severity"
+            )
+            actual_alarm = tuple(
+                str(row[1])
+                for row in db.execute(
+                    "PRAGMA table_info(power_alarms)"
+                ).fetchall()
+            )
+            expected_v7_alarm = self._EXPECTED_COLUMNS["power_alarms"]
+            if actual_alarm not in {expected_v6_alarm, expected_v7_alarm}:
+                raise StateStoreError(
+                    "state table power_alarms cannot be migrated to schema 7: %s"
+                    % ",".join(actual_alarm)
+                )
+            if actual_alarm == expected_v6_alarm:
+                db.execute(
+                    "ALTER TABLE power_alarms ADD COLUMN severity TEXT NOT NULL "
+                    "DEFAULT 'CRITICAL' CHECK(severity IN "
+                    "('INFO','WARN','ERROR','CRITICAL'))"
+                )
+            # Schema <=6 replayed every alarm as CRITICAL and incorrectly kept
+            # cooldown suppression forever. Preserve durable safety alarms,
+            # but infer their least-surprising original severity and archive
+            # obsolete cooldown rows instead of deleting the event history.
+            db.execute(
+                "UPDATE power_alarms SET severity=CASE state "
+                "WHEN 'TARGET_DISABLED' THEN 'WARN' "
+                "WHEN 'UNMAPPED' THEN 'ERROR' "
+                "WHEN 'PRECHECK_FAILED' THEN 'ERROR' "
+                "WHEN 'POWER_CYCLE_FAILED' THEN 'ERROR' "
+                "ELSE 'CRITICAL' END"
+            )
+            db.execute(
+                "DELETE FROM power_alarms WHERE state='SUPPRESSED_COOLDOWN'"
+            )
+
         schema_statements = (
             """
             CREATE TABLE IF NOT EXISTS power_events (
@@ -1928,7 +1987,9 @@ class StateStore:
               group_id TEXT NOT NULL,
               state TEXT NOT NULL,
               detail TEXT NOT NULL,
-              updated_at REAL NOT NULL
+              updated_at REAL NOT NULL,
+              severity TEXT NOT NULL
+                CHECK(severity IN ('INFO','WARN','ERROR','CRITICAL'))
             )
             """,
             """
@@ -2113,6 +2174,8 @@ class StateStore:
                     )
                     return False, int(attempts), "mapping_changed"
             retry_remaining = float(next_attempt) - now
+            if status == "DEFERRED_COOLDOWN" and retry_remaining > 0:
+                return False, int(attempts), "cooldown_wait"
             if status == "RETRY" and 0 < retry_remaining <= max(
                 retry_seconds * 2, 300
             ):
@@ -2154,7 +2217,10 @@ class StateStore:
         status: str,
         detail: str,
         now: float,
+        severity: str = "CRITICAL",
     ) -> None:
+        if severity not in _ALARM_SEVERITIES:
+            raise ValueError("invalid durable alarm severity: %s" % severity)
         row = db.execute(
             "SELECT trigger_bcode,group_id,power_key FROM power_events "
             "WHERE event_id=?",
@@ -2166,8 +2232,8 @@ class StateStore:
         if status in ACTIVE_ALARM_STATES:
             db.execute(
                 "INSERT OR REPLACE INTO power_alarms(power_key,event_id,"
-                "trigger_bcode,group_id,state,detail,updated_at) "
-                "VALUES(?,?,?,?,?,?,?)",
+                "trigger_bcode,group_id,state,detail,updated_at,severity) "
+                "VALUES(?,?,?,?,?,?,?,?)",
                 (
                     power_key,
                     event_id,
@@ -2176,14 +2242,21 @@ class StateStore:
                     status,
                     detail[:1000],
                     now,
+                    severity,
                 ),
             )
-        elif status == "RECOVERY_VERIFIED":
+        elif status in RESOLVED_ALARM_STATES:
             db.execute(
                 "DELETE FROM power_alarms WHERE power_key=?", (power_key,)
             )
 
-    def finish_event(self, event_id: str, status: str, detail: str) -> None:
+    def finish_event(
+        self,
+        event_id: str,
+        status: str,
+        detail: str,
+        severity: str = "CRITICAL",
+    ) -> None:
         if status not in TERMINAL_EVENT_STATES:
             raise ValueError("event status is not terminal: %s" % status)
         now = time.time()
@@ -2193,7 +2266,85 @@ class StateStore:
                 "WHERE event_id=?",
                 (status, now, detail[:1000], event_id),
             )
-            self._update_alarm(db, event_id, status, detail, now)
+            self._update_alarm(
+                db, event_id, status, detail, now, severity=severity
+            )
+
+    def defer_cooldown(
+        self, event_id: str, delay: float, detail: str
+    ) -> float:
+        """Persist an unresolved event without consuming another cycle.
+
+        Live 1 Hz Driver state re-offers the same event. Before ``eligible_at``
+        it remains deferred; afterwards the complete live precheck runs again.
+        A recovered Driver state can explicitly archive it via
+        ``resolve_deferred_for_trigger``.
+        """
+
+        if not math.isfinite(delay) or delay <= 0:
+            raise ValueError("cooldown delay must be positive")
+        now = time.time()
+        eligible_at = now + delay
+        with self._db() as db:
+            updated = db.execute(
+                "UPDATE power_events SET status='DEFERRED_COOLDOWN',"
+                "next_attempt=?,last_update=?,detail=? WHERE event_id=? "
+                "AND status='PROCESSING'",
+                (eligible_at, now, detail[:1000], event_id),
+            )
+            if updated.rowcount != 1:
+                raise StateStoreError(
+                    "cooldown event is no longer in PROCESSING state"
+                )
+        return eligible_at
+
+    def deferred_events_for_trigger(
+        self, broadcast_code: str
+    ) -> List[Tuple[str, str, str, float, float]]:
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT event_id,recovery_reason,detail,first_seen,next_attempt "
+                "FROM power_events WHERE trigger_bcode=? "
+                "AND status='DEFERRED_COOLDOWN' ORDER BY first_seen",
+                (broadcast_code,),
+            ).fetchall()
+        return [
+            (str(event_id), str(reason), str(detail), float(first), float(next_at))
+            for event_id, reason, detail, first, next_at in rows
+        ]
+
+    def deferred_event_info(
+        self, event_id: str
+    ) -> Optional[Tuple[str, float]]:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT detail,next_attempt FROM power_events "
+                "WHERE event_id=? AND status='DEFERRED_COOLDOWN'",
+                (event_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row[0]), float(row[1])
+
+    def resolve_deferred_event(self, event_id: str, detail: str) -> bool:
+        now = time.time()
+        with self._db() as db:
+            updated = db.execute(
+                "UPDATE power_events SET status='STALE_OR_RECOVERED',"
+                "next_attempt=0,last_update=?,detail=? WHERE event_id=? "
+                "AND status='DEFERRED_COOLDOWN'",
+                (now, detail[:1000], event_id),
+            )
+            if updated.rowcount:
+                self._update_alarm(
+                    db,
+                    event_id,
+                    "STALE_OR_RECOVERED",
+                    detail,
+                    now,
+                    severity="INFO",
+                )
+        return updated.rowcount == 1
 
     def cycle_limit(
         self, power_key: str, policy: Policy
@@ -2565,22 +2716,46 @@ class StateStore:
 
     def current_alerts(
         self,
-    ) -> List[Tuple[str, str, str, str, str, str]]:
+    ) -> List[Tuple[str, str, str, str, str, str, str, float, float]]:
         """Return the durable still-actionable alarm snapshot per endpoint."""
 
         with self._db() as db:
             rows = db.execute(
                 "SELECT a.event_id,a.trigger_bcode,a.group_id,a.state,a.detail,"
-                "e.recovery_reason FROM power_alarms AS a "
+                "e.recovery_reason,a.severity,e.first_seen,a.updated_at "
+                "FROM power_alarms AS a "
                 "LEFT JOIN power_events AS e ON e.event_id=a.event_id "
                 "ORDER BY a.updated_at"
             ).fetchall()
         result = []
-        for event_id, trigger, group_id, status, detail, reason in rows:
+        for (
+            event_id,
+            trigger,
+            group_id,
+            status,
+            detail,
+            reason,
+            severity,
+            first_seen,
+            updated_at,
+        ) in rows:
             if reason not in RECOVERY_REASONS:
                 raise StateStoreError(
                     "durable alarm has no valid recovery reason: %s"
                     % event_id
+                )
+            if severity not in _ALARM_SEVERITIES:
+                raise StateStoreError(
+                    "durable alarm has invalid severity: %s" % event_id
+                )
+            if (
+                not isinstance(first_seen, (int, float))
+                or not math.isfinite(float(first_seen))
+                or not isinstance(updated_at, (int, float))
+                or not math.isfinite(float(updated_at))
+            ):
+                raise StateStoreError(
+                    "durable alarm has invalid timestamps: %s" % event_id
                 )
             result.append(
                 (
@@ -2590,6 +2765,9 @@ class StateStore:
                     str(status),
                     str(detail),
                     str(reason),
+                    str(severity),
+                    float(first_seen),
+                    float(updated_at),
                 )
             )
         return result
@@ -3004,18 +3182,21 @@ class PowerCycleManagerCore:
             status,
             detail,
             recovery_reason,
+            severity,
+            first_seen,
+            _updated_at,
         ) in self.store.current_alerts():
             request = PowerCycleRequest(
                 event_id=event_id,
                 broadcast_code=trigger,
                 timestamp=time.time(),
-                detected_at=time.time(),
+                detected_at=first_seen,
                 driver_instance=0,
                 handle=255,
                 episode_count=1,
                 recovery_reason=recovery_reason,
             )
-            self._emit(status, request, "CRITICAL", detail)
+            self._emit(status, request, severity, detail)
             self._mark_completed(event_id)
         self._thread.start()
 
@@ -3083,6 +3264,39 @@ class PowerCycleManagerCore:
                 self._condition.notify_all()
         if request is not None:
             self._enqueue(request)
+        else:
+            # A cooldown-deferred event is not a permanent alarm. The live
+            # Driver state is authoritative: if the exact trigger no longer
+            # requires hard recovery, archive the deferred event immediately
+            # instead of leaving a stale POWER-EVENT on the dashboard.
+            for (
+                event_id,
+                recovery_reason,
+                _old_detail,
+                first_seen,
+                _eligible_at,
+            ) in self.store.deferred_events_for_trigger(code):
+                detail = (
+                    "cooldown-deferred fault recovered before another OFF; "
+                    "live Driver state=%s"
+                    % str(payload.get("display_state") or payload.get("state") or "IDLE")
+                )
+                if not self.store.resolve_deferred_event(event_id, detail):
+                    continue
+                resolved = PowerCycleRequest(
+                    event_id=event_id,
+                    broadcast_code=code,
+                    timestamp=time.time(),
+                    detected_at=first_seen,
+                    driver_instance=int(payload.get("driver_instance", 0)),
+                    handle=int(payload.get("handle", 255)),
+                    episode_count=1,
+                    recovery_reason=recovery_reason,
+                )
+                self._emit(
+                    "STALE_OR_RECOVERED", resolved, "INFO", detail
+                )
+                self._mark_completed(event_id)
 
     def accept_intent_ack_payload(self, payload: Mapping[str, Any]) -> None:
         if payload.get("schema_version") != WIRE_SCHEMA_VERSION:
@@ -3170,6 +3384,19 @@ class PowerCycleManagerCore:
                     allow_observed=self.config.mode == "armed",
                 )
                 if not ready:
+                    if reason == "cooldown_wait":
+                        deferred = self.store.deferred_event_info(
+                            request.event_id
+                        )
+                        if deferred is not None:
+                            detail, eligible_at = deferred
+                            self._emit(
+                                "DEFERRED_COOLDOWN",
+                                request,
+                                "WARN",
+                                detail,
+                                eligible_at=eligible_at,
+                            )
                     if reason in {"terminal", "observed", "mapping_changed"}:
                         self._mark_completed(request.event_id)
                     if reason == "mapping_changed":
@@ -3570,6 +3797,7 @@ class PowerCycleManagerCore:
                 self._terminal(
                     request,
                     "DRIVER_INTENT_ACK_TIMEOUT",
+                    "ERROR",
                     "manager shutdown interrupted Driver intent ACK retry",
                 )
                 return
@@ -3638,12 +3866,20 @@ class PowerCycleManagerCore:
             )
             self._cancel_driver_intent(request, target, intent_token)
             if reason == "cooldown":
-                self._terminal(
+                detail = (
+                    "physical power endpoint cooldown has %.0fs remaining; "
+                    "live fault will be revalidated at eligibility"
+                    % remaining
+                )
+                eligible_at = self.store.defer_cooldown(
+                    request.event_id, remaining, detail
+                )
+                self._emit(
+                    "DEFERRED_COOLDOWN",
                     request,
-                    "SUPPRESSED_COOLDOWN",
-                    "ERROR",
-                    "physical power endpoint cooldown has %.0fs remaining"
-                    % remaining,
+                    "WARN",
+                    detail,
+                    eligible_at=eligible_at,
                 )
             elif reason == "daily_limit":
                 self._terminal(
@@ -4101,7 +4337,9 @@ class PowerCycleManagerCore:
         severity: str,
         detail: str,
     ) -> None:
-        self.store.finish_event(request.event_id, state, detail)
+        self.store.finish_event(
+            request.event_id, state, detail, severity=severity
+        )
         self._mark_completed(request.event_id)
         self._emit(state, request, severity, detail)
 
@@ -4113,13 +4351,23 @@ class PowerCycleManagerCore:
         detail: str,
         target: Optional[PowerGroup] = None,
         recovery_reason: Optional[str] = None,
+        eligible_at: float = 0.0,
+        actionable: Optional[bool] = None,
     ) -> None:
         if target is None:
             target = self.config.group_for(request.broadcast_code)
+        if actionable is None:
+            actionable = (
+                state in ACTIVE_ALARM_STATES
+                or state in ACTIVE_WORKFLOW_STATES
+            )
         payload = {
             "schema_version": WIRE_SCHEMA_VERSION,
             "type": STATUS_TYPE,
             "timestamp": time.time(),
+            "event_timestamp": request.detected_at,
+            "eligible_at": eligible_at,
+            "actionable": actionable,
             "state": state,
             "severity": severity,
             "event_id": request.event_id,
