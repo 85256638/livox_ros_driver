@@ -110,6 +110,12 @@ class LdsLidar : public Lds {
    *  OFF command. Already-consumed disconnect markers remain historical. */
   void CancelPlannedGroupPowerCycle(const std::vector<std::string> &members,
                                     const std::string &token);
+
+  /** Read-only startup-supervision guard.  Unlike Consume..., this does not
+   * remove the marker and therefore also covers whitelist members which do
+   * not currently own an SDK handle. */
+  bool IsPlannedGroupPowerCycleActive(const std::string &broadcast_code,
+                                      int64_t now_ns);
   livox_status RequestLidarReboot(uint8_t handle, uint16_t timeout_ms = 100);
   /** Watchdog variant: reject if a planned mode request won the per-handle
    *  send race. Manual reboot remains an explicit override. */

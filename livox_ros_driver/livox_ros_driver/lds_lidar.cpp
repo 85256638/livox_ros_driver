@@ -834,6 +834,14 @@ void LdsLidar::CancelPlannedGroupPowerCycle(
   }
 }
 
+bool LdsLidar::IsPlannedGroupPowerCycleActive(
+    const std::string &broadcast_code, int64_t now_ns) {
+  lock_guard<mutex> lock(planned_group_power_cycle_lock_);
+  const auto row = planned_group_power_cycles_.find(broadcast_code);
+  return row != planned_group_power_cycles_.end() &&
+         row->second.expires_ns >= now_ns;
+}
+
 bool LdsLidar::ConsumePlannedGroupPowerCycle(const char *broadcast_code,
                                              std::string *token) {
   if (broadcast_code == nullptr || broadcast_code[0] == '\0') {

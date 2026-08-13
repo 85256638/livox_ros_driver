@@ -25,6 +25,12 @@ POINT_OUTAGE_POLICY = (
     / "livox_ros_driver"
     / "point_cloud_outage_policy.h"
 ).read_text(encoding="utf-8")
+STARTUP_MISSING_POLICY = (
+    ROOT
+    / "livox_ros_driver"
+    / "livox_ros_driver"
+    / "startup_missing_policy.h"
+).read_text(encoding="utf-8")
 WAKE_POLICY = (
     ROOT / "livox_ros_driver" / "livox_ros_driver" / "wake_dropout_policy.h"
 ).read_text(encoding="utf-8")
@@ -717,6 +723,14 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         ]
         self.assertIn("g_driver_instance_id, 255", startup_publish)
         self.assertIn('"STARTUP_MISSING"', startup_publish)
+        self.assertIn("tracker.ever_observed", stats)
+        self.assertIn("startup_present[i]", stats)
+        self.assertNotIn("ever_healthy", stats)
+        self.assertIn("if (observed_now)", STARTUP_MISSING_POLICY)
+        self.assertIn("state->ever_observed = true", STARTUP_MISSING_POLICY)
+        self.assertIn("if (state->ever_observed)", STARTUP_MISSING_POLICY)
+        self.assertIn("planned_group_power_cycle", STARTUP_MISSING_POLICY)
+        self.assertIn("IsPlannedGroupPowerCycleActive", HEADER)
 
 
 if __name__ == "__main__":

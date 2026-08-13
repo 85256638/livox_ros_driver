@@ -38,6 +38,7 @@
 #include "group_power_cycle_protocol.h"
 #include "health_logger.h"
 #include "recovery_event_json.h"
+#include "startup_missing_policy.h"
 #include "lddc.h"
 #include "lds_hub.h"
 #include "lds_lidar.h"
@@ -514,15 +515,8 @@ static void PublishPowerCycleRequest(uint8_t handle, const char *broadcast_code,
              broadcast_code);
 }
 
-struct StartupMissingTracker {
+struct StartupMissingTracker : public livox_ros_driver::StartupMissingPolicyState {
   std::string broadcast_code;
-  bool ever_healthy = false;
-  int64_t absent_since_ns = 0;
-  int64_t absent_since_wall_s = 0;
-  int64_t required_at_wall_s = 0;
-  uint32_t episode_count = 0;
-  bool active = false;
-  bool request_emitted = false;
 };
 
 static void PublishStartupRecoveryState(const StartupMissingTracker &tracker,
@@ -856,7 +850,6 @@ void StatsTimerCb(const ros::TimerEvent &) {
     startup_trackers_initialized = true;
   }
   std::vector<bool> startup_present(startup_trackers.size(), false);
-  std::vector<bool> startup_healthy(startup_trackers.size(), false);
   std::vector<bool> startup_dashboard_row(startup_trackers.size(), false);
 
   const int64_t now_ns =
@@ -1406,7 +1399,6 @@ void StatsTimerCb(const ros::TimerEvent &) {
         if (startup_trackers[i].broadcast_code == startup_identity) {
           startup_present[i] = startup_present[i] || watchdog_connected ||
                                broadcast_recent;
-          startup_healthy[i] = startup_healthy[i] || normal_healthy;
           startup_dashboard_row[i] = true;
         }
       }
@@ -2039,40 +2031,32 @@ void StatsTimerCb(const ros::TimerEvent &) {
 
   for (std::size_t i = 0; i < startup_trackers.size(); ++i) {
     StartupMissingTracker &tracker = startup_trackers[i];
-    if (startup_healthy[i]) {
-      tracker.ever_healthy = true;
-    }
-    if (startup_present[i]) {
-      if (tracker.active) {
+    const bool was_active = tracker.active;
+    const bool planned_group_power_cycle =
+        g_read_lidar->IsPlannedGroupPowerCycleActive(tracker.broadcast_code,
+                                                      now_ns);
+    const livox_ros_driver::StartupMissingPolicyDecision startup_decision =
+        livox_ros_driver::UpdateStartupMissingPolicy(
+            &tracker, startup_present[i], planned_group_power_cycle, now_ns,
+            static_cast<int64_t>(time(nullptr)), kStartupMissingGraceNs);
+    if (startup_decision.observed_now) {
+      if (was_active) {
         ROS_INFO("[LivoxRecover] configured lidar[%s] appeared; cancelling "
                  "STARTUP_MISSING",
                  tracker.broadcast_code.c_str());
       }
-      tracker.absent_since_ns = 0;
-      tracker.absent_since_wall_s = 0;
-      tracker.required_at_wall_s = 0;
-      tracker.active = false;
-      tracker.request_emitted = false;
       continue;
     }
-    /** Once a device has published healthily, its later failure belongs to the
-     *  generation-bound NORMAL_DROPOUT path, never to synthetic handle 255. */
-    if (tracker.ever_healthy) {
+    /** Once observed by connection or broadcast, every later failure belongs
+     *  to a real-handle runtime path, even if this process has only seen the
+     *  device in PowerSaving and it has never published Normal point data. */
+    if (tracker.ever_observed || startup_decision.planned_outage) {
       continue;
     }
-    if (tracker.absent_since_ns == 0) {
-      tracker.absent_since_ns = now_ns;
-      tracker.absent_since_wall_s = static_cast<int64_t>(time(nullptr));
-    }
-    if (now_ns < tracker.absent_since_ns ||
-        now_ns - tracker.absent_since_ns < kStartupMissingGraceNs) {
+    if (!startup_decision.required) {
       continue;
     }
-    if (!tracker.active) {
-      tracker.active = true;
-      tracker.request_emitted = false;
-      ++tracker.episode_count;
-      tracker.required_at_wall_s = static_cast<int64_t>(time(nullptr));
+    if (startup_decision.newly_required) {
       ROS_ERROR("[LivoxRecover] configured lidar[%s] STARTUP_MISSING after "
                 "30s startup grace%s",
                 tracker.broadcast_code.c_str(),
