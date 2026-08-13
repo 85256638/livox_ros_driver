@@ -60,6 +60,40 @@ _STATE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _SEVERITIES = {"INFO", "WARN", "ERROR", "CRITICAL"}
 _SEVERITY_RANK = {"INFO": 0, "WARN": 1, "ERROR": 2, "CRITICAL": 3}
 _LAYOUTS = ("compact", "full", "history")
+_LEGACY_ACTIONABLE_POWER_STATES = {
+    "UNMAPPED",
+    "TARGET_DISABLED",
+    "RECOVERY_TIMEOUT",
+    "PRECHECK_FAILED",
+    "MAPPING_MISMATCH",
+    "POWER_CYCLE_FAILED",
+    "POWER_ON_UNCONFIRMED",
+    "MAPPING_CHANGED",
+    "CYCLE_ALREADY_RECORDED",
+    "RECOVERY_UNVERIFIED_AFTER_RESTART",
+    "SUPPRESSED_DAILY_LIMIT",
+    "NON_TARGET_STATE_CHANGED",
+    "DRIVER_INTENT_ACK_TIMEOUT",
+    "DRIVER_INTENT_REJECTED",
+    "DEFERRED_COOLDOWN",
+    "POWER_OFF_COMMAND",
+    "POWER_OFF_CONFIRMED",
+    "POWER_ON_COMMAND",
+    "POWER_ON_CONFIRMED",
+    "WAITING_FOR_GROUP_RECOVERY",
+    "DRIVER_INTENT_ACKED",
+    "DRIVER_INTENT_ACK_RETRY",
+    "MANAGER_INTERNAL_ERROR",
+    "PERSISTED_ON_RETRY",
+    "POWER_OFF_FAILED",
+    "PRECHECK_RETRY",
+    "QUEUE_FULL",
+}
+_LEGACY_HISTORY_POWER_STATES = {
+    "RECOVERY_VERIFIED",
+    "STALE_OR_RECOVERED",
+    "SUPPRESSED_COOLDOWN",
+}
 
 
 def _finite_number(value):
@@ -114,6 +148,19 @@ def _decode_power_payload(data, received_mono, source):
     timestamp = _finite_number(payload.get("timestamp"))
     if timestamp is None or timestamp < 0:
         return None
+    event_timestamp = _finite_number(
+        payload.get("event_timestamp", timestamp)
+    )
+    eligible_at = _finite_number(
+        payload.get("eligible_at", payload.get("expires_at", 0.0))
+    )
+    actionable = payload.get("actionable")
+    if event_timestamp is None or event_timestamp < 0:
+        return None
+    if eligible_at is None or eligible_at < 0:
+        return None
+    if actionable is not None and not isinstance(actionable, bool):
+        return None
 
     state = _required_text(payload, "state", 64, allow_empty=False)
     severity = _required_text(payload, "severity", 16, allow_empty=False)
@@ -165,8 +212,19 @@ def _decode_power_payload(data, received_mono, source):
     }:
         return None
 
+    if actionable is None:
+        if not power_group and not broadcast_code:
+            actionable = False
+        elif state in _LEGACY_HISTORY_POWER_STATES:
+            actionable = False
+        else:
+            actionable = state in _LEGACY_ACTIONABLE_POWER_STATES
+
     row = {
         "timestamp": timestamp,
+        "event_timestamp": event_timestamp,
+        "eligible_at": eligible_at,
+        "actionable": actionable,
         "state": state,
         "severity": severity,
         "event_id": event_id,
@@ -186,9 +244,11 @@ def _power_row_key(row):
     power_group = row["power_group"]
     broadcast_code = row["broadcast_code"]
     if power_group:
-        return "group:%s" % power_group
+        kind = "current" if row.get("actionable") else "history"
+        return "group:%s:%s" % (power_group, kind)
     if broadcast_code:
-        return "unmapped:%s" % broadcast_code
+        kind = "current" if row.get("actionable") else "history"
+        return "unmapped:%s:%s" % (broadcast_code, kind)
     return "__manager__"
 
 
@@ -626,7 +686,52 @@ def _manager_compact_summary(rows, now_mono):
     }
 
 
-def _compact_power_lines(rows, now_mono):
+def _power_event_age(row, now_wall):
+    timestamp = _finite_number(row.get("event_timestamp"))
+    if timestamp is None or timestamp <= 0:
+        return None
+    age = now_wall - timestamp
+    if age < -2.0:
+        return None
+    return max(age, 0.0)
+
+
+def _power_timing_text(row, now_mono, now_wall):
+    event_age = _age_text_from_seconds(_power_event_age(row, now_wall))
+    rx_age = _age_text_from_seconds(
+        _elapsed_seconds(row.get("_received_mono"), now_mono)
+    )
+    timing = "event=%s rx=%s" % (event_age, rx_age)
+    eligible_at = _finite_number(row.get("eligible_at"))
+    if eligible_at is not None and eligible_at > 0:
+        remaining = max(eligible_at - now_wall, 0.0)
+        timing += " wait=%s" % _age_text_from_seconds(remaining)
+    return timing
+
+
+def _compact_power_event_line(prefix, event, now_mono, now_wall, extra=0):
+    group = event["power_group"] or "UNMAPPED"
+    relay = ",".join(str(item) for item in event["relay_channels"]) or "-"
+    event_line = (
+        "%s: group=%s state=%s sev=%s %s trigger=%s relay=%s"
+        % (
+            prefix,
+            group,
+            event["state"],
+            event["severity"],
+            _power_timing_text(event, now_mono, now_wall),
+            event["broadcast_code"] or "-",
+            relay,
+        )
+    )
+    if extra:
+        event_line += " +%d more" % extra
+    return _fit_cell(event_line, 138)
+
+
+def _compact_power_lines(rows, now_mono, now_wall=None):
+    if now_wall is None:
+        now_wall = time.time()
     manager = _manager_compact_summary(rows, now_mono)
     lines = [
         _fit_cell(
@@ -640,36 +745,40 @@ def _compact_power_lines(rows, now_mono):
         for row in rows
         if row["power_group"] or row["broadcast_code"]
     ]
-    if not events:
-        lines.append("POWER-EVENT: none")
-        return lines
-    events.sort(
+    current = [row for row in events if row.get("actionable")]
+    history = [row for row in events if not row.get("actionable")]
+    current.sort(
         key=lambda item: (
             _SEVERITY_RANK.get(item["severity"], -1),
+            item["event_timestamp"],
             item["_received_mono"],
         ),
         reverse=True,
     )
-    event = events[0]
-    age = _age_text_from_seconds(
-        _elapsed_seconds(event["_received_mono"], now_mono)
+    history.sort(
+        key=lambda item: (item["event_timestamp"], item["_received_mono"]),
+        reverse=True,
     )
-    group = event["power_group"] or "UNMAPPED"
-    relay = ",".join(str(item) for item in event["relay_channels"]) or "-"
-    event_line = (
-        "POWER-EVENT: group=%s state=%s severity=%s age=%s trigger=%s relay=%s"
-        % (
-            group,
-            event["state"],
-            event["severity"],
-            age,
-            event["broadcast_code"] or "-",
-            relay,
+    if not current:
+        lines.append("POWER-EVENT: none")
+    else:
+        lines.append(
+            _compact_power_event_line(
+                "POWER-EVENT", current[0], now_mono, now_wall, len(current) - 1
+            )
         )
-    )
-    if len(events) > 1:
-        event_line += " +%d more" % (len(events) - 1)
-    lines.append(_fit_cell(event_line, 138))
+    if not history:
+        lines.append("POWER-HISTORY: none")
+    else:
+        lines.append(
+            _compact_power_event_line(
+                "POWER-HISTORY",
+                history[0],
+                now_mono,
+                now_wall,
+                len(history) - 1,
+            )
+        )
     return lines
 
 
@@ -679,15 +788,23 @@ def _compact_relay_line(history, error):
     if not history:
         return "RELAY: last cycle=none"
     item = history[0]
+    outcome = item["outcome"]
+    result = {
+        "POWER_CYCLE_FAILED": "FAILED",
+        "RECOVERY_VERIFIED": "VERIFIED",
+        "RECOVERY_TIMEOUT": "TIMEOUT",
+        "POWER_ON_UNCONFIRMED": "ON_UNCONFIRMED",
+        "RECOVERY_UNVERIFIED_AFTER_RESTART": "UNVERIFIED",
+    }.get(outcome, outcome)
     return _fit_cell(
-        "RELAY: last=%s reason=%s outcome=%s OFF=%s ON=%s trigger=%s"
+        "RELAY: last=%s trigger=%s reason=%s result=%s interruption=%s final-power=%s"
         % (
             _wall_time_text(item["started_at"]),
-            item["reason"],
-            item["outcome"],
-            "YES" if item["off_confirmed_at"] is not None else "--",
-            "YES" if item["on_confirmed_at"] is not None else "--",
             item["trigger"],
+            item["reason"],
+            result,
+            "CONFIRMED" if item["off_confirmed_at"] is not None else "UNCONFIRMED",
+            "ON" if item["on_confirmed_at"] is not None else "UNCONFIRMED",
         ),
         138,
     )
@@ -719,12 +836,18 @@ def _compose_compact_dashboard(
     history = _parse_history_blocks(sections.get("PROCESS HISTORY", []))
     software = _software_summary(sections)
     manager = _manager_compact_summary(rows, now_mono)
-    alert_count = sum(len(items) for items in alerts.values())
+    driver_alert_count = sum(len(items) for items in alerts.values())
+    power_alert_count = sum(
+        1
+        for row in rows
+        if (row["power_group"] or row["broadcast_code"])
+        and row.get("actionable")
+    )
 
     lines = [
         _fit_cell(
             "LIVOX | Driver=%s(%s) | PowerMgr=%s(%s) | Driver=%s SDK=%s %s "
-            "| devices=%d alerts=%d"
+            "| devices=%d alerts=D%d/P%d"
             % (
                 driver_state,
                 _age_text_from_seconds(driver_age),
@@ -734,7 +857,8 @@ def _compose_compact_dashboard(
                 software["sdk"],
                 software["compatibility"],
                 len(devices),
-                alert_count,
+                driver_alert_count,
+                power_alert_count,
             ),
             138,
         ),
@@ -816,10 +940,8 @@ def _compose_compact_dashboard(
     lines.extend(
         [
             _compact_relay_line(relay_history, relay_history_error),
-            "ASSESS: ACTIVE=fault RECOVERING=repair IDLE=low-power "
-            "OBSERVE=<10m STABLE=>=10m WATCH/UNSTABLE=trend",
-            "RECOVERY: last=duration@first-data; handshake=SDK attempts/60s; "
-            "details: --layout full; one-shot history: --layout history",
+            "GUIDE: ACTIVE=fault RECOVERING=repair IDLE=low-power; "
+            "last=duration@first-data; full=--layout full history=--layout history",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -854,6 +976,7 @@ def _compose_full_dashboard(
     relay_history_error=None,
 ):
     """Pure formatter. All liveness ages use the caller's monotonic clock."""
+    now_wall = time.time()
     driver_age = _elapsed_seconds(stats_received_mono, now_mono)
     if stats_received_mono is None:
         driver_state = "WAITING"
@@ -932,6 +1055,9 @@ def _compose_full_dashboard(
             trigger = row["broadcast_code"] or "-"
             age = _elapsed_seconds(row["_received_mono"], now_mono)
             age_text = _age_text_from_seconds(age)
+            event_age_text = _age_text_from_seconds(
+                _power_event_age(row, now_wall)
+            )
             state = row["state"]
             severity = row["severity"]
             detail = row["detail"]
@@ -945,19 +1071,29 @@ def _compose_full_dashboard(
                     % (state, severity, age_text)
                 )
             elif not power_group:
-                lines.append("  UNMAPPED  trigger=%s" % trigger)
                 lines.append(
-                    "    NOW=%s  severity=%s  rx_age=%s"
-                    % (state, severity, age_text)
+                    "  UNMAPPED %s trigger=%s"
+                    % ("CURRENT" if row.get("actionable") else "HISTORY", trigger)
+                )
+                lines.append(
+                    "    NOW=%s  severity=%s  event_age=%s  rx_age=%s"
+                    % (state, severity, event_age_text, age_text)
                 )
             else:
-                lines.append("  GROUP %s" % power_group)
                 lines.append(
-                    "    NOW=%s  severity=%s  rx_age=%s  trigger=%s  members=%d  "
+                    "  GROUP %s %s"
+                    % (
+                        power_group,
+                        "CURRENT" if row.get("actionable") else "HISTORY",
+                    )
+                )
+                lines.append(
+                    "    NOW=%s  severity=%s  event_age=%s  rx_age=%s  trigger=%s  members=%d  "
                     "relay=%s"
                     % (
                         state,
                         severity,
+                        event_age_text,
                         age_text,
                         trigger,
                         len(row["members"]),
@@ -967,6 +1103,17 @@ def _compose_full_dashboard(
                         or "-",
                     )
                 )
+                eligible_at = _finite_number(row.get("eligible_at"))
+                if eligible_at is not None and eligible_at > 0:
+                    lines.append(
+                        "    cooldown_remaining=%s  eligible_at=%s"
+                        % (
+                            _age_text_from_seconds(
+                                max(eligible_at - now_wall, 0.0)
+                            ),
+                            _wall_time_text(eligible_at),
+                        )
+                    )
             _append_detail(lines, detail)
     _append_relay_history(lines, relay_history, relay_history_error)
     lines.extend(["", "(local refresh; liveness ages use monotonic time)"])
@@ -1059,6 +1206,18 @@ def _accept_power_message(msg, source):
         return False
     key = _power_row_key(row)
     with _lock:
+        if (
+            not row.get("actionable")
+            and row.get("state") in _LEGACY_HISTORY_POWER_STATES
+        ):
+            if row.get("power_group"):
+                _power_status.pop(
+                    "group:%s:current" % row["power_group"], None
+                )
+            elif row.get("broadcast_code"):
+                _power_status.pop(
+                    "unmapped:%s:current" % row["broadcast_code"], None
+                )
         _power_status[key] = row
         _source_received_mono[source] = received_mono
     _render()

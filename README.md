@@ -261,7 +261,7 @@ source devel/setup.bash
 > - 新版 CMake（≥3.27）若报 policy 版本错，再补 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`。
 > - ⚠️ **编译用的 `catkin_ws` 必须和下面 systemd 服务里 `source` 的是同一个目录**，否则你编译了、服务却跑的是另一份旧的，改动不生效还极难排查。
 
-危险恢复判据的5个C++ QC和Python manager测试已接入CMake/CTest；需要验收时执行这一行：
+危险恢复判据的8个C++ QC（含PowerSaving已见设备不得重复误判STARTUP_MISSING）和Python manager/看板测试已接入CMake/CTest；需要验收时执行这一行：
 
 ```bash
 cd "$HOME/catkin_ws" && catkin_make run_tests && catkin_test_results
@@ -409,7 +409,7 @@ rosservice call /livox_lidar_mode "{handle: 255, mode: 1}"
 | PowerSaving / Standby 下断线 | 15 秒检测到，重连后恢复 Normal 模式 |
 | 切换 Normal 时通信失败 | 自动等待重连后重试 |
 | 显式从 PowerSaving / Standby 唤醒后掉线且广播持续消失 | 仅在同一 broadcast code + connection generation 的 60 秒唤醒观察窗内归因；持续无广播 10 秒后进入 `WAKE_DROPOUT` |
-| Driver 启动后白名单成员始终无连接、无新鲜广播且从未健康发布 | 30 秒启动宽限后显示 `STARTUP_MISSING`；用合成 `handle=255` 持续发布恢复状态，`auto_recover=true` 时进入 `POWER_CYCLE_REQUIRED reason=STARTUP_MISSING` |
+| Driver 启动后白名单成员在本进程中从未出现过真实连接或新鲜广播 | 30 秒启动宽限后显示 `STARTUP_MISSING`；用合成 `handle=255` 持续发布恢复状态，`auto_recover=true` 时进入 `POWER_CYCLE_REQUIRED reason=STARTUP_MISSING`。一旦在 PowerSaving/StandBy 等任意模式真实出现过，后续掉线永久交给真实 handle 的运行期恢复路径，不能再被重复标成启动缺失 |
 | 未满足上述严格证据的瞬时/身份不明断线 | 保持 `DISCONNECTED` 并等待状态归属；不会仅凭一次 disconnect callback 触发继电器 |
 
 ### 远程重启
@@ -574,7 +574,7 @@ rosrun livox_ros_driver livox_stats_monitor.py --layout compact
 
 默认 `compact` 看板把4台实时状态、最近60秒指标、测量会话Error预算、点云恢复、当前动作、进程历史摘要、Power Manager和最近一次继电器cycle压缩到固定 **24 行**；140×30终端无需滚动。严重告警永远优先显示在对应雷达的 `ACTION / HISTORY` 行，历史详情不会挤动实时表格：
 ```
-LIVOX | Driver=LIVE(1s) | PowerMgr=ARMED(1s) | Driver=9fa2371 SDK=e45774c PINNED | devices=4 alerts=1
+LIVOX | Driver=LIVE(1s) | PowerMgr=ARMED(1s) | Driver=9fa2371 SDK=e45774c PINNED | devices=4 alerts=D1/P0
 ==================== CURRENT DEVICES ==================
 ID   broadcast_code   CURRENT               ASSESS       points/s  HW          connected  disc
 0    3WEDH5900101321  NORMAL                STABLE          2504  OK             12m13s     0
@@ -791,11 +791,12 @@ flowchart LR
 
 每次确认恢复还会立即向 `livox_events_YYYY-MM-DD.csv` 追加一行 `POINTCLOUD_RECOVERED`，`detail` 同时保存 `duration`、`lost_at`、`first_data_returned` 和 `confirmed_healthy`。这条记录不依赖看板进程，适合事后计算“故障发生到第一批点云恢复”的准确耗时；前提是 launch 已启用 `health_log:=true`，且自定义 `health_log_dir` 已存在。
 
-##### 第六层：compact的`POWER-MGR / POWER-EVENT / RELAY` / full的`POWER RECOVERY / RELAY HISTORY`
+##### 第六层：compact的`POWER-MGR / POWER-EVENT / POWER-HISTORY / RELAY` / full的`POWER RECOVERY / RELAY HISTORY`
 
-- compact的`POWER-MGR`固定显示授权模式、心跳年龄、worker、queue和obligations；`POWER-EVENT`显示当前最高严重度的group事件，绝不会截掉trigger或`relay=1,2,3,4`，其余事件用`+N more`提示。full的`POWER RECOVERY`继续显示全部manager/group detail。
+- 顶栏 `alerts=D#/P#` 分开统计 Driver 当前告警与 Power Manager 当前未解决事件，避免 Driver 为 0、继电器却仍有动作时误读成“没有告警”。
+- compact的`POWER-MGR`固定显示授权模式、心跳年龄、worker、queue和obligations；`POWER-EVENT`只显示当前未解决/正在处理的group事件，`POWER-HISTORY`显示最近一次已恢复、已过期或仅供审计的事件。两者区分故障发生年龄 `event`、本机最近收到消息年龄 `rx`；冷却等待还显示 `wait`。trigger与`relay=1,2,3,4`保持可见，其余事件用`+N more`提示。full的`POWER RECOVERY`继续显示全部manager/group detail，并给出完整 `event_age / rx_age / cooldown_remaining / eligible_at`。
 - compact的`RELAY`只显示最新一次cycle；full/history每次以只读方式查询 `~/.local/state/livox-power-cycle-manager/state.sqlite3`，按时间倒序显示最近5个持久化cycle。Driver、manager或看板重启后仍保留。
-- `OFF=--` 表示该cycle没有取得OFF确认，可能在OFF前安全取消或命令失败；`ON=--` 表示尚未取得ON确认，必须结合 `outcome/detail` 判断，不能理解为当前一定处于断电。当前必须补ON的义务仍由manager和systemd安全钩子负责。
+- compact不再使用容易误读的 `OFF=-- / ON=YES`：`interruption=UNCONFIRMED` 表示该cycle没有取得OFF确认（可能在OFF前安全取消或命令失败），`final-power=ON` 才表示已取得最终ON确认；`final-power=UNCONFIRMED` 必须结合 `result/detail` 判断，不能理解为当前一定处于断电。当前必须补ON的义务仍由manager和systemd安全钩子负责。
 - 数据库不存在时显示 `no relay cycle has been recorded`；数据库被占用、损坏或schema不兼容时显示 `unavailable`，但不会影响Driver、manager或其他看板板块。
 
 #### 关于温度与风扇（重要说明）
@@ -886,8 +887,9 @@ roslaunch livox_ros_driver livox_lidar_multi.launch auto_recover:=true
 
 **情况 G：Driver 启动时白名单成员缺失（`STARTUP_MISSING`）**：
 
-- 只监督 JSON/命令行白名单中的完整 broadcast code；Driver 启动后给每个成员 **30 秒**宽限。宽限内出现连接或新鲜广播立即停止计时
-- 到期仍无连接、无新鲜广播且从未健康发布时，用合成 `handle=255` 以 1 Hz 发布该 broadcast code 的实时状态；真实广播/连接一出现便立即撤销
+- 只监督 JSON/命令行白名单中的完整 broadcast code；Driver 启动后给每个成员 **30 秒**宽限。宽限内出现连接或新鲜广播会把该物理雷达永久标记为“本进程已见”，不要求进入 Normal 或发布点云
+- 只有本进程从未见过连接/新鲜广播且连续缺失满30秒，才用合成 `handle=255` 以 1 Hz 发布该 broadcast code 的实时状态；一旦曾在 PowerSaving/StandBy 中连接，后续 `PowerSaving→Normal` 掉线属于 `WAKE_DROPOUT`，不能再并行生成 `STARTUP_MISSING`
+- manager 已ACK的计划内共享断电会暂停并重置从未出现成员的启动宽限，四路OFF时间不能制造伴生 `STARTUP_MISSING`
 - `auto_recover=true` 时升级为 `POWER_CYCLE_REQUIRED reason=STARTUP_MISSING`；manager 仍执行更新帧复核、共享端点冷却和 24 小时熔断，因此不会因 Driver 重启形成无限断电循环
 
 ##### 4 号坑 2026-07-27 已确认时间线
@@ -1028,7 +1030,10 @@ flowchart TD
     ACK -->|是| M2{"ACK 后复核<br/>同一 episode + reason 仍成立？"}
     M2 -->|否| CANCEL0
     M2 -->|是| BUDGET{"预留持久化安全预算<br/>未触发 30 分钟冷却或 24h 3 次上限？"}
-    BUDGET -->|否| CANCEL0
+    BUDGET -->|30 分钟冷却| DEFER["DEFERRED_COOLDOWN / WARN<br/>保存 eligible_at；不发送 OFF/ON"]
+    DEFER -->|到期前 Driver 已恢复| ARCHIVE["STALE_OR_RECOVERED<br/>转入 POWER-HISTORY"]
+    DEFER -->|到期且同一 event_id 仍由实时状态证明故障| M1
+    BUDGET -->|24h 已达 3 次| SUP
     BUDGET -->|是| OBL["持久化 must-be-ON obligation<br/>确保进程中断后仍会补上电<br/>同时每秒刷新计划断电 intent"]
     OBL -->|写入失败| CANCEL["发布 CANCEL；不发送 OFF<br/>确认所选通道集合仍全部为 ON并取消本次循环<br/>释放首条 OFF 前未使用的安全预算"]
     OBL -->|成功| M3{"OFF 前最新 1 Hz 触发状态<br/>仍精确匹配本次 episode + reason + 证据？"}
@@ -1060,7 +1065,7 @@ flowchart TD
   classDef success fill:#dcfce7,stroke:#15803d,color:#14532d;
   classDef guard fill:#f3f4f6,stroke:#6b7280,color:#374151;
   class A,B,C,G,WS,WG,WC,WN,N0,ND,NN,SG,E0,EI,EHEALTH,ES,EWAIT,HOLD,PON normal;
-  class E,OBS,FAIL,WAIT,NET,WD,WOBS,NCONF,NOBS,SM,SOBS,EPAUSE,SUP,CANCEL0,CANCEL,TIMEOUT,REPAIR,RESTORED,ABORT warning;
+  class E,OBS,FAIL,WAIT,NET,WD,WOBS,NCONF,NOBS,SM,SOBS,EPAUSE,SUP,DEFER,ARCHIVE,CANCEL0,CANCEL,TIMEOUT,REPAIR,RESTORED,ABORT warning;
   class PCR,WPCR,NPCR,SPCR,EPCR,POFF danger;
   class OK,WOK,NOK,SOK,ECLEAR,DONE success;
   class D,H,AR,RESET,ACCEPT,COMPLETE,I,NOTE,WQ,WR,WAR,WARM,WBR,NARM,NDISC,NR,NBR,NAR,S0,SP,SAR,ER,EG,ECLOSE,M0,M1,INTENT,ACK,M2,BUDGET,OBL,M3,OFFQ,ONQ,RETRY,PHASE,VERIFY,LIMIT guard;
@@ -1093,8 +1098,9 @@ flowchart TD
 | 启动缺失时间 | 状态/动作 |
 |------|------|
 | Driver 启动后 0～30 秒 | 按白名单逐成员等待；出现连接或新鲜广播立即停止缺失计时 |
-| 满 30 秒仍无连接/新鲜广播且从未健康发布 | `STARTUP_MISSING`，持续发布合成 `handle=255` 状态；`auto_recover=true` 时升级同名 reason |
-| 后续任何广播或 Connect | 立即撤销合成状态和待 OFF 身份；由真实 handle 接管 |
+| 满 30 秒仍无连接/新鲜广播且本进程从未见过该设备 | `STARTUP_MISSING`，持续发布合成 `handle=255` 状态；`auto_recover=true` 时升级同名 reason |
+| 本进程任意时刻出现广播或 Connect（包括 PowerSaving） | 永久退出本次进程的启动缺失候选；以后由真实 handle 的 WAKE/NORMAL/HANDSHAKE 路径接管 |
+| manager 已ACK计划内共享断电 | 暂停并重置尚未出现成员的30秒计时，计划OFF时间不计入启动缺失 |
 
 | 测量会话内 Error | 状态/动作 |
 |------|------|
@@ -1132,6 +1138,8 @@ flowchart TD
 物理继电器预检查仍是独立只读短连接；只有在Driver门禁通过、周期预算已保留且must-be-ON义务已持久化后，manager才为实际恢复打开一个有界事务连接，并在该连接上完成 `B0 → A1 OFF → B0确认 → off_seconds → B0/A1 ON → B0确认`，ON确认并归档后立即关闭。一次正常完整恢复由原来的9次TCP建连降为2次（1次只读预检 + 1次实际事务），既减少继电器脆弱accept路径上的SYN次数，也不会在Manager整个生命周期独占端口。若事务连接被关闭或重置，旧socket立即丢弃；下一次重试必须先通过新连接B0发现真实状态，只有目标位仍不符合期望时才发送幂等A1，禁止盲目重复状态不明的OFF/ON。连接阶段若继电器端口明确返回 `ECONNREFUSED`，默认每1秒重连并在3秒边界内恢复；该瞬态不会快速耗尽状态确认重试，恢复后会留下协议WARN。只对远端拒绝连接使用该路径，连接超时、无路由、连接重置和协议错误不适用。收到精确ASCII `v1.0` 后在**同一个TCP连接**重发原命令一次。B0是只读命令；A1携带明确的目标状态和enable mask，重复同一帧不会反转输出。客户端随后持续累计TCP字节直到取得完整9字节B0、`OK!`或超时；现场捕获的“前8字节后补最后1字节”属于正常TCP分片。若短暂尾分片等待后第9字节仍不存在，只接受地址、`0D`、四路掩码和第一校验字节全部正确的8字节单校验帧，并打印兼容警告。第二次 `v1.0`、未知版本文本、错误第一校验或非法掩码仍严格失败，并在错误中附带partial十六进制，禁止凭未验证响应继续断电。现有生产JSON无需增加新字段；省略 `connection_refused_retry_seconds` 和 `connection_refused_deadline_seconds` 时自动使用1秒/3秒默认值。
 
 自动控制需要这些条件同时成立：Driver安全钩子已安装、launch的 `relay_power_cycle_enable=true`、JSON中目标电源组 `enabled=true`、本次事件的reason-specific状态复核通过，并且没有触发同一物理通道集合 **30分钟冷却**、**24小时3次上限**或继电器安全检查。它不订阅PLC/上位机许可topic；通过全部门禁后按有效 `off_seconds` 对整个选中集合执行OFF/恢复ON，再验收4台点云。
+
+遇到30分钟冷却时不再把事件终结为永久 `SUPPRESSED_COOLDOWN/CRITICAL`。manager保存为 `DEFERRED_COOLDOWN/WARN`，携带原始故障时间和 `eligible_at`，期间不发送OFF/ON：若Driver实时状态先恢复，立即归档为 `STALE_OR_RECOVERED`；到达可执行时间后，只有同一个 `event_id` 仍由Driver以1 Hz证明故障存在，才从继电器B0、Driver intent ACK和最终更新帧开始重新执行全部门禁。manager重启不会把WARN抬高成CRITICAL，也不会仅凭数据库里的旧事件延迟断电。24小时3次上限仍是需要人工处理的持久CRITICAL，不会自动绕过。
 
 launch 开关是日常唯一总开关：
 
@@ -1208,15 +1216,15 @@ sudo systemctl restart livox-ros-driver && systemctl is-active livox-ros-driver
 | 稳定身份 | SQLite持久绑定 `power_group` 与继电器IP/端口/地址/规范化通道集合；旧单通道identity原样兼容，新增多通道identity包含排序后的集合。改组名或改接端点/集合会fail closed，不能借改配置清空安全预算 |
 | 单写锁 | 除状态库单实例锁外，再按物理继电器端点持有固定的OS文件锁；同一主机、同一运行用户下，不同配置/数据库的第二个manager也不能同时写同一继电器；其他本机用户、GUI或另一主机不遵守该锁，须靠账户权限与防火墙只允许正式守护进程访问继电器端口 |
 | 断电后异常 | ON 无法确认时保留持久化 obligation，每 30 秒继续尝试并发出 CRITICAL；systemd 启动前先独立补 ON，配置损坏也不会跳过；补 ON 未完成前禁止任何新 OFF |
-| 告警存续 | 每个物理端点的活动 CRITICAL 独立存入 SQLite，重启后在 `MANAGER_READY` 之后重新发布；只有该端点后续完成 `RECOVERY_VERIFIED` 才自动清除 |
+| 告警存续 | 每个物理端点仍需人工处理的活动告警按原始 `WARN/ERROR/CRITICAL` 严重度、原始事件时间独立存入 SQLite，重启后原样重新发布；`RECOVERY_VERIFIED` 或实时状态确认 `STALE_OR_RECOVERED` 后清除。冷却等待不是永久告警，不会以CRITICAL回放 |
 
-配置和状态均在仓库外：更新 Driver 不会覆盖 `~/.config/livox/power_cycle.json`。生产安装把审计/去重数据库固定为 `~/.local/state/livox-power-cycle-manager/state.sqlite3`，配置中的 `state_db` 必须解析到同一路径。不要删除、替换或手工修改 SQLite，否则会丢失冷却预算和补上电义务；v2/v3 会保守补入旧原因字段，v4/v5 会在一个 `BEGIN IMMEDIATE` 事务内原子重建两张带 reason 约束的表并升级到 v6，从而允许五种原因。任一步失败会整体回滚；未知、损坏或 legacy 结构仍严格拒绝，不会静默重建。
+配置和状态均在仓库外：更新 Driver 不会覆盖 `~/.config/livox/power_cycle.json`。生产安装把审计/去重数据库固定为 `~/.local/state/livox-power-cycle-manager/state.sqlite3`，配置中的 `state_db` 必须解析到同一路径。不要删除、替换或手工修改 SQLite，否则会丢失冷却预算和补上电义务；v2/v3 会保守补入旧原因字段，v4/v5 会在一个 `BEGIN IMMEDIATE` 事务内原子重建两张带 reason 约束的表，v6→v7会给活动告警补入持久严重度并只归档旧版遗留的 `SUPPRESSED_COOLDOWN` 告警行，cycle、事件历史、冷却预算与补ON义务均保留。任一步失败会整体回滚；未知、损坏或 legacy 结构仍严格拒绝，不会静默重建。
 
 卸载同样不是直接删文件：先把 launch 开关改回 `false` 并安全停止 Driver，再执行 `bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" --uninstall`。脚本只接受 Driver 已处于 `inactive/failed`，独立补 ON 成功后才删除 Driver drop-in；任何一步失败都会保留安全钩子，现场 JSON 和 SQLite 始终保留。
 
 查看自动硬恢复的最近状态可继续使用同一看板。默认compact顶部用本机单调时钟显示`Driver=LIVE/STALE(age)`与`PowerMgr=ARMED/OBSERVE/STALE(age)`；超过5秒没有新`/livox/lidar_stats`会明确显示`Driver=STALE`，不会用旧表和新的渲染时间伪装成实时数据。脚本自身每秒刷新，因此Driver和manager同时停发时stale年龄仍会继续增长。
 
-`livox_stats_monitor.py --layout compact`把manager摘要固定成两行：`POWER-MGR`和`POWER-EVENT`；首帧前显示`NOT_SEEN`，心跳超过30秒显示`STALE`。`--layout full`保留原有完整`DATA SOURCE / POWER RECOVERY / RELAY HISTORY`，每个group继续显示`NOW/severity/rx_age/trigger/members/relay/detail`；`--layout history`收到第一帧Driver快照后只打印一次当前告警、测量恢复、进程历史、Power状态和最近5次relay cycle，然后自动退出。所有stale判定都用本机接收时刻，不信任消息内wall-clock。
+`livox_stats_monitor.py --layout compact`把manager摘要固定成三行：`POWER-MGR`、当前未解决的`POWER-EVENT`和最近已归档的`POWER-HISTORY`；首帧前显示`NOT_SEEN`，心跳超过30秒显示`STALE`。顶栏以`alerts=D#/P#`分开计数。`--layout full`保留原有完整`DATA SOURCE / POWER RECOVERY / RELAY HISTORY`，每个group显示`CURRENT/HISTORY、NOW、severity、event_age、rx_age、trigger、members、relay、detail`，冷却还显示`cooldown_remaining/eligible_at`；`--layout history`收到第一帧Driver快照后只打印一次当前告警、测量恢复、进程历史、Power状态和最近5次relay cycle，然后自动退出。Driver/manager存活判断仍只用本机单调接收时间；消息内wall-clock仅用于明确标注故障事件时间，不参与stale或继电器授权。
 
 ```bash
 rostopic echo /livox/power_cycle_status
@@ -1363,6 +1371,7 @@ git clone --branch 'network-relay-added' --single-branch https://github.com/8525
 | `livox_ros_driver/health_logger.h` | 健康CSV新增 `POINTCLOUD_RECOVERED` 事件及毫秒级 `lost_at/first_data_returned/confirmed_healthy` |
 | `livox_ros_driver/lddc.h/.cpp` | 距离过滤 + 读取端 UAF 加锁 + 三种点云输出格式在真实发布后记录统一时间戳 |
 | `livox_ros_driver/lds.h/.cpp` | 每雷达锁、丢包统计（仅异常打印）、`data_type` 硬化、写入端 UAF 加锁 |
+| `livox_ros_driver/startup_missing_policy.h` | 启动缺失单向身份门禁：任意模式真实连接/广播后永久退出候选，计划共享断电不计入30秒宽限 |
 | `livox_ros_driver/ldq.cpp` | 队列释放置空 + 操作空指针兜底 |
 | `timesync/timesync.h/.cpp` | TimeSync 初始化/停止幂等化；退出标志原子化；先 stop/join 再 SDK `Uninit()` |
 | `timesync/user_uart/user_uart.h/.cpp` | UART Open/Close/Read 串行；空闲读取有界返回；完整检查 termios/fcntl/read 错误 |

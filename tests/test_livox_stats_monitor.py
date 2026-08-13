@@ -157,6 +157,9 @@ class MonitorStateTest(unittest.TestCase):
             message(valid_payload(relay_channels=[0, 1])).data,
             message(valid_payload(relay_channels=[True])).data,
             message(valid_payload(detail={"bad": "type"})).data,
+            message(valid_payload(actionable="yes")).data,
+            message(valid_payload(event_timestamp="1234.5")).data,
+            message(valid_payload(eligible_at=-1)).data,
             "[" * 2000 + "]" * 2000,
             message(
                 valid_payload(
@@ -234,12 +237,13 @@ class MonitorStateTest(unittest.TestCase):
         )
         self.assertIsNotNone(row)
         self.assertEqual(
-            MONITOR._power_row_key(row), "unmapped:1WEDH5900100001"
+            MONITOR._power_row_key(row),
+            "unmapped:1WEDH5900100001:current",
         )
         rendered = MONITOR._compose_dashboard(
             "driver\n", 100.0, [row], 101.0, layout="full"
         )
-        self.assertIn("UNMAPPED  trigger=1WEDH5900100001", rendered)
+        self.assertIn("UNMAPPED CURRENT trigger=1WEDH5900100001", rendered)
         self.assertNotIn("  MANAGER   NOW=UNMAPPED", rendered)
         self.assertIn("NOW=UNMAPPED", rendered)
 
@@ -289,6 +293,8 @@ class MonitorStateTest(unittest.TestCase):
         self.assertIn("hist disc=1,pc=1,fault=1,reboot=1", rendered)
         self.assertIn("POWER-MGR: state=ARMED", rendered)
         self.assertIn("POWER-EVENT: none", rendered)
+        self.assertIn("POWER-HISTORY: none", rendered)
+        self.assertIn("alerts=D1/P0", rendered)
         self.assertNotIn("==================== ASSESSMENT GUIDE", rendered)
         self.assertNotIn("MEASUREMENT SESSION:", rendered)
         self.assertNotIn("==================== RELAY HISTORY", rendered)
@@ -330,6 +336,93 @@ class MonitorStateTest(unittest.TestCase):
         self.assertIn("state=POWER_OFF_CONFIRMED", rendered)
         self.assertIn("trigger=3WEDH7600111081", rendered)
         self.assertIn("relay=1,2,3,4", rendered)
+
+    def test_cooldown_is_current_deferred_work_not_a_permanent_critical_alarm(self):
+        manager = MONITOR._decode_power_payload(
+            message(
+                valid_payload(
+                    detail="mode=armed worker=alive queue=0 obligations=0"
+                )
+            ).data,
+            100.0,
+            "power_heartbeat",
+        )
+        cooldown = MONITOR._decode_power_payload(
+            message(
+                valid_payload(
+                    timestamp=2000.0,
+                    event_timestamp=1900.0,
+                    eligible_at=2300.0,
+                    actionable=True,
+                    state="DEFERRED_COOLDOWN",
+                    severity="WARN",
+                    event_id="event-cooldown",
+                    broadcast_code="1HDDH3200101851",
+                    power_group="pit-x-four-lidars",
+                    members=[
+                        "3WEDH5900101321",
+                        "3WEDH7600109791",
+                        "3WEDH7600111081",
+                        "1HDDH3200101851",
+                    ],
+                    relay_channels=[1, 2, 3, 4],
+                )
+            ).data,
+            100.0,
+            "power_status",
+        )
+        with mock.patch.object(MONITOR.time, "time", return_value=2000.0):
+            rendered = MONITOR._compose_dashboard(
+                DRIVER_STATS, 100.0, [manager, cooldown], 101.0
+            )
+        self.assertIn("alerts=D1/P1", rendered)
+        self.assertIn("state=DEFERRED_COOLDOWN sev=WARN", rendered)
+        self.assertIn("event=1m40s rx=1s wait=5m00s", rendered)
+        self.assertIn("trigger=1HDDH3200101851 relay=1,2,3,4", rendered)
+
+    def test_legacy_suppressed_cooldown_is_history_not_current_alarm(self):
+        row = MONITOR._decode_power_payload(
+            message(
+                valid_payload(
+                    state="SUPPRESSED_COOLDOWN",
+                    severity="CRITICAL",
+                    event_id="legacy-event",
+                    broadcast_code="1HDDH3200101851",
+                    power_group="pit-x-four-lidars",
+                    members=["1HDDH3200101851"],
+                    relay_channels=[1, 2, 3, 4],
+                )
+            ).data,
+            100.0,
+            "power_status",
+        )
+        self.assertFalse(row["actionable"])
+        rendered = MONITOR._compose_dashboard(
+            DRIVER_STATS, 100.0, [row], 101.0
+        )
+        self.assertIn("alerts=D1/P0", rendered)
+        self.assertIn("POWER-EVENT: none", rendered)
+        self.assertIn("POWER-HISTORY: group=pit-x-four-lidars", rendered)
+
+    def test_compact_relay_history_uses_unambiguous_power_wording(self):
+        line = MONITOR._compact_relay_line(
+            [
+                {
+                    "started_at": 1785812875.0,
+                    "reason": "WAKE_DROPOUT",
+                    "outcome": "POWER_CYCLE_FAILED",
+                    "off_confirmed_at": None,
+                    "on_confirmed_at": 1785812880.0,
+                    "trigger": "3WEDH5900101321",
+                }
+            ],
+            None,
+        )
+        self.assertIn("trigger=3WEDH5900101321", line)
+        self.assertIn("result=FAILED", line)
+        self.assertIn("interruption=UNCONFIRMED", line)
+        self.assertIn("final-power=ON", line)
+        self.assertNotIn("OFF=--", line)
 
     def test_full_and_history_layouts_remain_available(self):
         full = MONITOR._compose_dashboard(
