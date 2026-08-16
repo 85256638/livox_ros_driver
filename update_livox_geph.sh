@@ -583,6 +583,67 @@ if monitor_nodes:
         raise SystemExit(
             "livox_stats_monitor must consume --layout $(arg monitor_layout) exactly once"
         )
+
+network_marker = "LIVOX_NETWORK_HEALTH_V1"
+network_enable_args = [
+    node for node in root.findall("arg")
+    if node.get("name") == "network_health_enable"
+]
+network_config_args = [
+    node for node in root.findall("arg")
+    if node.get("name") == "network_health_config"
+]
+network_nodes = [
+    node for node in root.findall("node")
+    if node.get("name") == "livox_network_health_monitor"
+    or node.get("type") == "livox_network_health_monitor.py"
+]
+if text.count(network_marker) != 1:
+    raise SystemExit(
+        "launch must contain network health marker %s exactly once"
+        % network_marker
+    )
+if len(network_enable_args) != 1:
+    raise SystemExit(
+        "launch must contain arg network_health_enable exactly once"
+    )
+if network_enable_args[0].get("default", "").strip().lower() not in (
+    "true", "false"
+):
+    raise SystemExit(
+        "network_health_enable default must be literal true or false"
+    )
+if len(network_config_args) != 1:
+    raise SystemExit(
+        "launch must contain arg network_health_config exactly once"
+    )
+if network_config_args[0].get("default") != (
+    "$(env HOME)/.config/livox/network_health.json"
+):
+    raise SystemExit(
+        "network_health_config must use the fixed external config path"
+    )
+if len(network_nodes) != 1:
+    raise SystemExit(
+        "launch must contain direct network health node exactly once (found %d)"
+        % len(network_nodes)
+    )
+expected_network_node = dict(
+    (
+        ("if", "$(arg network_health_enable)"),
+        ("name", "livox_network_health_monitor"),
+        ("pkg", "livox_ros_driver"),
+        ("type", "livox_network_health_monitor.py"),
+        ("output", "screen"),
+        ("respawn", "true"),
+        ("respawn_delay", "5"),
+        ("args", "--config $(arg network_health_config)"),
+    )
+)
+if network_nodes[0].attrib != expected_network_node:
+    raise SystemExit("network health node has unexpected attributes")
+if children.index(network_nodes[0]) > children.index(driver_nodes[0]):
+    raise SystemExit("network health node must appear before livox_driver")
 PY
 }
 

@@ -97,6 +97,12 @@ class StructuralLaunchMergeTests(unittest.TestCase):
             self.assertEqual(merged.count('name="relay_power_cycle_enable"'), 1)
             self.assertEqual(merged.count(merger.MONITOR_MARKER), 1)
             self.assertEqual(merged.count('name="monitor_layout"'), 1)
+            self.assertEqual(merged.count(merger.NETWORK_HEALTH_MARKER), 1)
+            self.assertEqual(merged.count('name="network_health_enable"'), 1)
+            self.assertEqual(merged.count('name="network_health_config"'), 1)
+            self.assertEqual(
+                merged.count('name="%s"' % merger.NETWORK_HEALTH_NODE_NAME), 1
+            )
             root = ET.parse(output).getroot()
             layout = next(
                 node
@@ -184,6 +190,10 @@ class StructuralLaunchMergeTests(unittest.TestCase):
             self.assertEqual(merged.count(merger.RELAY_CHILD), 1)
             self.assertEqual(merged.count(merger.MONITOR_MARKER), 1)
             self.assertEqual(merged.count('name="monitor_layout"'), 1)
+            self.assertEqual(merged.count(merger.NETWORK_HEALTH_MARKER), 1)
+            self.assertEqual(
+                merged.count('name="%s"' % merger.NETWORK_HEALTH_NODE_NAME), 1
+            )
             self.assertIn('to="/site/lidar_1"', merged)
             root = ET.parse(output).getroot()
             relay_arg = next(
@@ -208,6 +218,44 @@ class StructuralLaunchMergeTests(unittest.TestCase):
             merged = output.read_text(encoding="utf-8")
             self.assertNotIn(merger.MONITOR_MARKER, merged)
             self.assertNotIn('name="monitor_layout"', merged)
+            self.assertEqual(merged.count(merger.NETWORK_HEALTH_MARKER), 1)
+            self.assertEqual(
+                merged.count('name="%s"' % merger.NETWORK_HEALTH_NODE_NAME), 1
+            )
+
+    def test_existing_network_health_integration_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "site.launch"
+            output = Path(tmp) / "candidate.launch"
+            source = _launch()
+            source = source.replace(
+                '    <arg name="health_log" default="true"/>',
+                '    <arg name="health_log" default="true"/>\n'
+                '    <arg name="network_health_enable" default="false"/>\n'
+                '    <arg name="network_health_config" '
+                'default="$(env HOME)/.config/livox/network_health.json"/>',
+                1,
+            )
+            source = source.replace(
+                '    <node name="livox_driver" pkg="livox_ros_driver"',
+                ('    <!-- %s -->\n' % merger.NETWORK_HEALTH_MARKER)
+                + '    <node if="$(arg network_health_enable)" '
+                'name="livox_network_health_monitor"\n'
+                '          pkg="livox_ros_driver" '
+                'type="livox_network_health_monitor.py"\n'
+                '          output="screen" respawn="true" respawn_delay="5"\n'
+                '          args="--config $(arg network_health_config)"/>\n'
+                '    <node name="livox_driver" pkg="livox_ros_driver"',
+                1,
+            )
+            local.write_text(source, encoding="utf-8")
+            merger.merge(local, output)
+            merged = output.read_text(encoding="utf-8")
+            self.assertEqual(merged.count(merger.NETWORK_HEALTH_MARKER), 1)
+            self.assertIn('name="network_health_enable" default="false"', merged)
+            self.assertEqual(
+                merged.count('name="%s"' % merger.NETWORK_HEALTH_NODE_NAME), 1
+            )
 
     def test_refuses_existing_or_ambiguous_power_cycle_integration(self):
         cases = {
@@ -260,6 +308,10 @@ class StructuralLaunchMergeTests(unittest.TestCase):
             ),
             "wrong-node-args": _launch(
                 monitor_layout="compact", monitor_args="--layout full"
+            ),
+            "network-marker-only": _launch().replace(
+                "</launch>",
+                "    <!-- %s -->\n</launch>" % merger.NETWORK_HEALTH_MARKER,
             ),
         }
         for name, source in cases.items():

@@ -24,6 +24,13 @@ MONITOR_MARKER = "LIVOX_MONITOR_LAYOUT_V1"
 MONITOR_LAYOUT_ARG = "monitor_layout"
 MONITOR_LAYOUT_VALUE = "--layout $(arg monitor_layout)"
 MONITOR_LAYOUTS = {"compact", "full", "history"}
+NETWORK_HEALTH_MARKER = "LIVOX_NETWORK_HEALTH_V1"
+NETWORK_HEALTH_ENABLE_ARG = "network_health_enable"
+NETWORK_HEALTH_CONFIG_ARG = "network_health_config"
+NETWORK_HEALTH_CONFIG_VALUE = "$(env HOME)/.config/livox/network_health.json"
+NETWORK_HEALTH_NODE_NAME = "livox_network_health_monitor"
+NETWORK_HEALTH_NODE_TYPE = "livox_network_health_monitor.py"
+NETWORK_HEALTH_ARGS = "--config $(arg network_health_config)"
 MAX_LAUNCH_BYTES = 1024 * 1024
 
 
@@ -57,6 +64,27 @@ def _has_relay_artifacts(root: ET.Element, text: str) -> bool:
             or node.get("name") == "livox_power_cycle_manager"
             for node in root.iter("node")
         )
+    )
+
+
+def _network_health_nodes(root: ET.Element):
+    return [
+        node
+        for node in root.findall("node")
+        if node.get("name") == NETWORK_HEALTH_NODE_NAME
+        or node.get("type") == NETWORK_HEALTH_NODE_TYPE
+    ]
+
+
+def _has_network_health_artifacts(root: ET.Element, text: str) -> bool:
+    return (
+        NETWORK_HEALTH_MARKER in text
+        or any(
+            node.get("name") == NETWORK_HEALTH_ENABLE_ARG
+            or node.get("name") == NETWORK_HEALTH_CONFIG_ARG
+            for node in root.findall("arg")
+        )
+        or bool(_network_health_nodes(root))
     )
 
 
@@ -124,6 +152,83 @@ def _validate_relay_integration(
     return root
 
 
+def _validate_network_health_integration(
+    root: ET.Element, text: str, scope: str
+) -> None:
+    if text.count(NETWORK_HEALTH_MARKER) != 1:
+        raise MergeError(
+            "%s must contain exactly one network health marker" % scope
+        )
+    enable_args = [
+        node
+        for node in root.findall("arg")
+        if node.get("name") == NETWORK_HEALTH_ENABLE_ARG
+    ]
+    config_args = [
+        node
+        for node in root.findall("arg")
+        if node.get("name") == NETWORK_HEALTH_CONFIG_ARG
+    ]
+    if len(enable_args) != 1:
+        raise MergeError(
+            "%s must contain exactly one network_health_enable arg" % scope
+        )
+    if len(config_args) != 1:
+        raise MergeError(
+            "%s must contain exactly one network_health_config arg" % scope
+        )
+    if enable_args[0].get("default", "").strip().lower() not in {
+        "true",
+        "false",
+    }:
+        raise MergeError(
+            "%s network_health_enable default must be literal true or false"
+            % scope
+        )
+    if config_args[0].get("default") != NETWORK_HEALTH_CONFIG_VALUE:
+        raise MergeError(
+            "%s network_health_config must use the fixed external config path"
+            % scope
+        )
+
+    nodes = _network_health_nodes(root)
+    if len(nodes) != 1:
+        raise MergeError(
+            "%s must contain exactly one direct network health node (found %d)"
+            % (scope, len(nodes))
+        )
+    node = nodes[0]
+    expected = {
+        "if": "$(arg network_health_enable)",
+        "name": NETWORK_HEALTH_NODE_NAME,
+        "pkg": "livox_ros_driver",
+        "type": NETWORK_HEALTH_NODE_TYPE,
+        "output": "screen",
+        "respawn": "true",
+        "respawn_delay": "5",
+        "args": NETWORK_HEALTH_ARGS,
+    }
+    if node.attrib != expected:
+        raise MergeError(
+            "%s network health node has unexpected attributes" % scope
+        )
+
+    drivers = [
+        child
+        for child in root.findall("node")
+        if child.get("name") == "livox_driver"
+    ]
+    if len(drivers) != 1:
+        raise MergeError(
+            "%s must contain exactly one direct livox_driver node" % scope
+        )
+    children = list(root)
+    if children.index(node) > children.index(drivers[0]):
+        raise MergeError(
+            "network health node must appear before livox_driver"
+        )
+
+
 def _validate_monitor_integration(root: ET.Element, text: str) -> None:
     monitor_nodes = [
         node
@@ -162,6 +267,7 @@ def _validate_integrated(
         "merged launch",
         require_safe_default=require_safe_relay_default,
     )
+    _validate_network_health_integration(root, text, "merged launch")
     _validate_monitor_integration(root, text)
 
 
@@ -301,6 +407,58 @@ def _inject_monitor_layout(text: str, root: ET.Element, newline: str) -> str:
     return text[: monitor_start.start()] + opening + text[monitor_start.end() :]
 
 
+def _inject_network_health(text: str, root: ET.Element, newline: str) -> str:
+    if _has_network_health_artifacts(root, text):
+        _validate_network_health_integration(root, text, "local launch")
+        return text
+
+    root_args, arg_lines = _root_arg_lines(text, root)
+    arg_indent = arg_lines[-1].group("indent")
+    block = (
+        arg_indent
+        + '<arg name="network_health_enable" default="true"/>'
+        + "   <!-- independent 1Hz ARP/ICMP health probe -->"
+        + newline
+        + arg_indent
+        + '<arg name="network_health_config" default="'
+        + NETWORK_HEALTH_CONFIG_VALUE
+        + '"/>'
+        + newline
+    )
+    text = text[: arg_lines[-1].end()] + block + text[arg_lines[-1].end() :]
+
+    root = _parse(text, "network-health-arg-integrated launch")
+    driver_start = re.search(
+        r"(?ms)^(?P<indent>[ \t]*)<node\b(?=[^>]*\bname\s*=\s*"
+        r"[\"']livox_driver[\"'])[^>]*>",
+        text,
+    )
+    if driver_start is None:
+        raise MergeError("cannot locate the direct livox_driver node in source text")
+    indent = driver_start.group("indent")
+    node_block = (
+        indent
+        + "<!-- "
+        + NETWORK_HEALTH_MARKER
+        + ": probe is isolated from the point-cloud data plane. -->"
+        + newline
+        + indent
+        + '<node if="$(arg network_health_enable)" '
+        + 'name="livox_network_health_monitor"'
+        + newline
+        + indent
+        + '      pkg="livox_ros_driver" type="livox_network_health_monitor.py"'
+        + newline
+        + indent
+        + '      output="screen" respawn="true" respawn_delay="5"'
+        + newline
+        + indent
+        + '      args="--config $(arg network_health_config)"/>'
+        + newline
+    )
+    return text[: driver_start.start()] + node_block + text[driver_start.start() :]
+
+
 def merge(local_path: Path, output_path: Path) -> None:
     if local_path.is_symlink() or not local_path.is_file():
         raise MergeError("local launch must be a regular non-symlink file")
@@ -322,9 +480,15 @@ def merge(local_path: Path, output_path: Path) -> None:
     relay_already_integrated = _has_relay_artifacts(root, text)
     if relay_already_integrated:
         _validate_relay_integration(text, "local launch")
+    network_health_already_integrated = _has_network_health_artifacts(root, text)
+    if network_health_already_integrated:
+        _validate_network_health_integration(root, text, "local launch")
 
     newline = "\r\n" if "\r\n" in text else "\n"
     text = _inject_monitor_layout(text, root, newline)
+    if not network_health_already_integrated:
+        root = _parse(text, "monitor-integrated local launch")
+        text = _inject_network_health(text, root, newline)
     if not relay_already_integrated:
         root = _parse(text, "monitor-integrated local launch")
         _root_args, arg_lines = _root_arg_lines(text, root)

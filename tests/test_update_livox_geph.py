@@ -20,6 +20,8 @@ RELAY_CHILD = "livox_ros_driver/launch/livox_power_cycle.launch"
 MARKER = "LIVOX_RELAY_LAUNCH_INTEGRATION"
 MONITOR_MARKER = "LIVOX_MONITOR_LAYOUT_V1"
 MONITOR_LAYOUT_VALUE = "--layout $(arg monitor_layout)"
+NETWORK_MARKER = "LIVOX_NETWORK_HEALTH_V1"
+NETWORK_CONFIG_VALUE = "$(env HOME)/.config/livox/network_health.json"
 DROPIN = (
     "/etc/systemd/system/livox-ros-driver.service.d/"
     "20-livox-power-cycle-safety.conf"
@@ -86,7 +88,10 @@ def _launch(
     monitor_layout=None,
     monitor_layout_default="compact",
     monitor_args=None,
+    network_health=None,
 ):
+    if network_health is None:
+        network_health = relay
     if monitor_layout is None:
         monitor_layout = relay and monitor_node
     lines = [
@@ -122,6 +127,25 @@ def _launch(
                 '  <include file="$(find livox_ros_driver)/launch/livox_power_cycle.launch">',
                 '    <arg name="enable" value="$(arg relay_power_cycle_enable)"/>',
                 '  </include>',
+            ]
+        )
+    if network_health:
+        lines.extend(
+            [
+                '  <arg name="network_health_enable" default="true"/>',
+                '  <arg name="network_health_config" default="%s"/>'
+                % NETWORK_CONFIG_VALUE,
+            ]
+        )
+    if network_health:
+        lines.extend(
+            [
+                "  <!-- %s -->" % NETWORK_MARKER,
+                '  <node if="$(arg network_health_enable)" '
+                'name="livox_network_health_monitor" '
+                'pkg="livox_ros_driver" type="livox_network_health_monitor.py" '
+                'output="screen" respawn="true" respawn_delay="5" '
+                'args="--config $(arg network_health_config)"/>',
             ]
         )
     lines.append(
@@ -299,6 +323,9 @@ python_validator() {
             self.assertEqual(merged.count('name="relay_power_cycle_enable"'), 1)
             self.assertEqual(merged.count(MONITOR_MARKER), 1)
             self.assertEqual(merged.count('name="monitor_layout"'), 1)
+            self.assertEqual(merged.count(NETWORK_MARKER), 1)
+            self.assertEqual(merged.count('name="network_health_enable"'), 1)
+            self.assertEqual(merged.count('name="network_health_config"'), 1)
             self.assertIn(MONITOR_LAYOUT_VALUE, merged)
             self.assertEqual(
                 merged.count('value="$(arg relay_power_cycle_enable)"'), 1
@@ -326,6 +353,7 @@ python_validator() {
             self.assertEqual(merged.count("livox_power_cycle.launch"), 1)
             self.assertEqual(merged.count(MONITOR_MARKER), 1)
             self.assertEqual(merged.count('name="monitor_layout"'), 1)
+            self.assertEqual(merged.count(NETWORK_MARKER), 1)
             self.assertIn(MONITOR_LAYOUT_VALUE, merged)
             self.assertNotIn("<<<<<<<", merged)
             candidate = backup / "candidate" / SITE_LAUNCH
@@ -359,6 +387,7 @@ python_validator() {
             self.assertEqual(merged.count("livox_power_cycle.launch"), 1)
             self.assertEqual(merged.count(MONITOR_MARKER), 1)
             self.assertEqual(merged.count('name="monitor_layout"'), 1)
+            self.assertEqual(merged.count(NETWORK_MARKER), 1)
             self.assertIn(MONITOR_LAYOUT_VALUE, merged)
             self.assertIn(
                 'name="relay_power_cycle_enable" default="true"', merged
@@ -668,6 +697,24 @@ class UpdaterEmbeddedValidationTests(unittest.TestCase):
             "monitor-does-not-consume-layout": shipped.replace(
                 b' args="--layout $(arg monitor_layout)"',
                 b"",
+                1,
+            ),
+            "missing-network-marker": shipped.replace(
+                ("  <!-- %s -->\n" % NETWORK_MARKER).encode("utf-8"),
+                b"",
+                1,
+            ),
+            "missing-network-config-arg": shipped.replace(
+                (
+                    '  <arg name="network_health_config" '
+                    'default="%s"/>\n' % NETWORK_CONFIG_VALUE
+                ).encode("utf-8"),
+                b"",
+                1,
+            ),
+            "network-node-wrong-config": shipped.replace(
+                b'args="--config $(arg network_health_config)"',
+                b'args="--config /tmp/network.json"',
                 1,
             ),
         }.items():

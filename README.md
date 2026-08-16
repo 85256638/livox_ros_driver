@@ -135,10 +135,12 @@ LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --
 
 代码更新不能推断本工位雷达身份、ROS 话题命名和继电器物理接线。旧工位原本正确的前两份文件会由 `--preserve-site-config` 自动恢复或安全合并，**不要用仓库示例覆盖它们**；迁移成功后仍必须逐项核对：
 
+如果旧工位的 `livox_lidar_multi.launch` 没有网络健康监测块，更新器的结构化回退会自动补入唯一的 `network_health_enable`、`network_health_config` 和 `livox_network_health_monitor` 节点，并固定指向仓库外的 `~/.config/livox/network_health.json`；不需要手工复制 XML。若检测到半集成、重复节点或非标准配置，更新器会 fail closed，禁止编译/重启，保留更新前现场文件供人工审阅。
+
 | 文件 | 必须人工核对/修改的内容 | 更新脚本的处理 |
 |---|---|---|
 | `~/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_lidar_config_multi.json` | `lidar_config` 只保留本工位实际使用的 4 个完整 `broadcast_code`，均设置正确的 `enable_connect`；同时核对 `return_mode`、坐标系、IMU 频率和外参来源 | 检测到本地修改时字节级原样恢复，不会替换广播码 |
-| `~/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_lidar_multi.launch` | 核对4台雷达的 lidar/IMU/status `remap`（广播码必须与 JSON 一致）、`config_file` 和 `max_distance`；生产恢复策略应使 `auto_recover=true`、`health_log=true`，无桌面/systemd 环境应使 `monitor=false`（也可由 `ExecStart` 参数覆盖）。不要手工复制或重复添加继电器 marker/include | 保留现场参数，并安全合入新版唯一继电器入口；无法明确合并时停止而不重启 |
+| `~/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_lidar_multi.launch` | 核对4台雷达的 lidar/IMU/status `remap`（广播码必须与 JSON 一致）、`config_file` 和 `max_distance`；生产恢复策略应使 `auto_recover=true`、`health_log=true`，无桌面/systemd 环境应使 `monitor=false`（也可由 `ExecStart` 参数覆盖）。不要手工复制或重复添加继电器、网络健康 marker/include/node | 保留现场参数，安全合入新版唯一继电器入口，并为旧 launch 自动补入网络健康监测入口；无法明确合并时停止而不重启 |
 | `~/.config/livox/power_cycle.json` | `members` 必须与Driver白名单完全相同且恰好4个；`protocol=legacy_tcp`；`host` 是本工位继电器IP而不是雷达IP；实机默认 `port=50000`、协议 `address=1`；本现场明确填写 `channels: [1, 2, 3, 4]`，四路作为一个不可拆分电源组通过同一A1掩码动作。真正只用一路的旧现场仍可兼容 `channel: 1..4`，但同一组不能同时出现 `channel` 和 `channels`；已确认的“正确CH+固定AA尾字节”保持 `allow_omitted_status_checksum=false`；`policy.off_seconds=5`；只在准备进入只读实机查询/最终武装时设该组 `enabled=true` | 安装脚本仅在缺失时从示例生成；以后更新永不覆盖。不要修改 `state_db` 和 ROS topics，除非同步审阅全部 service 参数 |
 | `/etc/systemd/system/livox-ros-driver.service` | 仅当现有 unit 的用户名、`HOME`、catkin workspace 或 launch 命令本来就不正确时才人工修改；正在正常启动该工位旧 Driver 的 unit 通常无需改 | 安装脚本只安装安全 drop-in 并验证主 unit，不会猜测或重写现场 `ExecStart` |
 
@@ -1389,7 +1391,7 @@ git clone --branch 'network-relay-added' --single-branch https://github.com/8525
 | `timesync/user_uart/user_uart.h/.cpp` | UART Open/Close/Read 串行；空闲读取有界返回；完整检查 termios/fcntl/read 错误 |
 | `scripts/livox_power_cycle_manager.py` | 原因特定的实时复核、共享组 OFF/ON、SQLite 去重/冷却/补上电义务和四台持续健康验收 |
 | `scripts/livox_stats_monitor.py` | 独立终端看板；默认24行固定高度compact布局，保留持续刷新的full诊断与一次性history模式，并显示共享继电器manager/group状态和持久历史 |
-| `scripts/merge_livox_relay_launch.py`、`update_livox_geph.sh` | 保留现场JSON/launch的升级事务；结构化回退同时安全补入继电器集成与已有stats monitor的compact布局入口 |
+| `scripts/merge_livox_relay_launch.py`、`update_livox_geph.sh` | 保留现场JSON/launch的升级事务；结构化回退同时安全补入继电器集成、网络健康监测入口与已有stats monitor的compact布局入口，并对半集成/重复结构 fail closed |
 
 ---
 
