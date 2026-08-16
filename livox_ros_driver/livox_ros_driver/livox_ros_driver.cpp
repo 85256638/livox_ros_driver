@@ -275,6 +275,15 @@ static void GroupPowerCycleIntentCb(
   }
 }
 
+/** Apply the independent ARP/ICMP health frame to the raw-lidar state.  ROS
+ * Noetic's NodeHandle::subscribe overloads do not accept a capturing or
+ * generic lambda directly, so keep this as a plain callback function. */
+static void NetworkHealthCb(const std_msgs::String::ConstPtr &message) {
+  if (g_read_lidar != nullptr && message) {
+    g_read_lidar->ApplyNetworkHealthJson(message->data);
+  }
+}
+
 static const char *LidarStateStr(uint8_t state) {
   switch (state) {
     case kLidarStateInit:        return "Init";
@@ -2517,12 +2526,7 @@ int main(int argc, char **argv) {
     group_power_cycle_intent_sub = livox_node.subscribe(
         "livox/group_power_cycle_intent", 8, GroupPowerCycleIntentCb);
     network_health_sub = livox_node.subscribe(
-        "livox/network_health", 8,
-        [](const std_msgs::String::ConstPtr &message) {
-          if (g_read_lidar != nullptr && message) {
-            g_read_lidar->ApplyNetworkHealthJson(message->data);
-          }
-        });
+        "livox/network_health", 8, NetworkHealthCb);
     stats_timer = livox_node.createTimer(ros::Duration(1.0), StatsTimerCb);
     ROS_INFO("Publishing stats topic: livox/lidar_stats (1Hz)");
     ROS_INFO("Publishing recovery topics: livox/power_cycle_request (latched) "
