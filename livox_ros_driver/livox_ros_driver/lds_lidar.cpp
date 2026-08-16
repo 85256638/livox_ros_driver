@@ -1588,25 +1588,15 @@ void LdsLidar::ApplyNetworkHealthJson(const std::string &json) {
     }
     const char *code = row["broadcast_code"].GetString();
     int handle = -1;
-    if (row.HasMember("handle") && row["handle"].IsInt()) {
-      handle = row["handle"].GetInt();
-    }
-    bool handle_matches = false;
-    if (handle >= 0 && handle < kMaxLidarCount) {
-      lock_guard<mutex> lock(link_stat_lock_[handle]);
-      handle_matches = link_stat_[handle].broadcast_code[0] != '\0' &&
-                       strncmp(link_stat_[handle].broadcast_code, code,
-                               sizeof(link_stat_[handle].broadcast_code)) == 0;
-    }
-    if (handle < 0 || handle >= kMaxLidarCount || !handle_matches) {
-      handle = -1;
-      for (uint8_t h = 0; h < kMaxLidarCount; ++h) {
-        lock_guard<mutex> lock(link_stat_lock_[h]);
-        if (strncmp(link_stat_[h].broadcast_code, code,
-                    sizeof(link_stat_[h].broadcast_code)) == 0) {
-          handle = h;
-          break;
-        }
+    // The SDK handle is a transient slot and may be reassigned after a
+    // reconnect or Driver restart.  Network identity is broadcast_code only;
+    // resolve the current handle from the live Driver state every frame.
+    for (uint8_t h = 0; h < kMaxLidarCount; ++h) {
+      lock_guard<mutex> lock(link_stat_lock_[h]);
+      if (strncmp(link_stat_[h].broadcast_code, code,
+                  sizeof(link_stat_[h].broadcast_code)) == 0) {
+        handle = h;
+        break;
       }
     }
     if (handle < 0 || handle >= kMaxLidarCount) {

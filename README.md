@@ -74,7 +74,7 @@ git -C "$HOME/catkin_ws/src/livox_ros_driver" restore --staged -- livox_ros_driv
 | 工位 multi launch | `~/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_lidar_multi.launch` | 是 |
 | 固定继电器 child launch | `~/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_power_cycle.launch` | 否 |
 | 生产继电器配置 | `~/.config/livox/power_cycle.json` | 是，且只允许在仓库外 |
-| 网络健康配置 | `~/.config/livox/network_health.json` | 是；填写本工位4台雷达的广播码、IP和handle |
+| 网络健康配置 | `~/.config/livox/network_health.json` | 是；填写本工位4台雷达的广播码和固定IP；不要填写会变化的SDK handle，interface通常留空 |
 | 继电器示例模板 | `~/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_power_cycle.example.json` | 否；文件名中是 `.example.json`，不是 `_example.json` |
 | 内部 manager 源码 | `~/catkin_ws/src/livox_ros_driver/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py` | 否；只有排障时才直接使用 |
 | 统一校验入口 | `~/catkin_ws/src/livox_ros_driver/validate_livox_site.sh` | 否；现场校验只运行它 |
@@ -157,13 +157,13 @@ LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --
 
 如果暂不启用继电器自动硬恢复，只需核对前两份 Driver 配置，并让外部JSON电源组和launch继电器开关都保持 `false`；systemd 主 unit 正常时也不用修改。准备执行只读B0实机查询时，可以先把外部JSON目标组设为 `enabled: true`，但必须继续保持 launch 中 `<arg name="relay_power_cycle_enable" default="false"/>`；组enabled本身不会启动manager，launch才是自动硬件控制总开关。完成广播码、继电器地址/通道集合及“所选通道全部只给本组4台雷达供电”的人工验收后，才把launch开关也改为 `true`。SDK源码、CMake文件、`livox_power_cycle.example.json` 和SQLite状态库都不是现场配置，不要手改或用示例文件覆盖生产文件。
 
-网络健康配置位于仓库外，不会被更新脚本覆盖。先从模板复制一次，再把四台雷达的实际IP替换为现场值；`handle` 必须与 Driver 看板中的 ID 对应：
+网络健康配置位于仓库外，不会被更新脚本覆盖。先从模板复制一次，再把四台雷达的实际IP替换为现场值。`broadcast_code` 和 IP 是持久身份；SDK `handle` 会在重连或 Driver 重启后重新分配，**不要写入网络健康配置**。`interface` 通常留空，让系统按 `ip route get <IP>` 自动选择出口网卡；只有多网卡且必须固定出口时才填写实际网卡名（例如 `enp3s0`）：
 
 ```bash
 mkdir -p "$HOME/.config/livox" && install -m 600 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_network_health.example.json" "$HOME/.config/livox/network_health.json" && nano "$HOME/.config/livox/network_health.json" && python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/livox_network_health_monitor.py" --config "$HOME/.config/livox/network_health.json" --validate-config
 ```
 
-如果工位已经存在旧版 `~/.config/livox/network_health.json`，更新脚本会原样保留它；请在更新后确认其中的 `window_seconds` 已从旧值 `10` 改为 `5`，否则该工位仍按旧的十秒窗口运行。不要用模板覆盖包含现场 IP、广播码和网卡名的生产配置。
+如果工位已经存在旧版 `~/.config/livox/network_health.json`，更新脚本会原样保留它；请在更新后确认其中的 `window_seconds` 已从旧值 `10` 改为 `5`，否则该工位仍按旧的十秒窗口运行。旧文件中若仍有 `handle` 字段可以暂时保留，新版会兼容读取但完全忽略它；建议人工删除。不要用模板覆盖包含现场 IP、广播码和网卡名的生产配置。
 
 推荐保持 `probe_interval_seconds=1`、`window_seconds=5`、`unstable_failures=2`、`unreachable_consecutive_failures=3`、`healthy_consecutive_successes=5`、`soft_reboot_max_attempts=3`、`soft_reboot_interval_seconds=5`、`soft_reboot_ack_timeout_seconds=2`。5秒内第一次有效丢包显示 `NET_DEGRADED`；5秒内第二次失败，或连续第二次失败的快速路径，立即显示 `NET_UNSTABLE`；连续3次完全无响应显示 `NET_UNREACHABLE`。前5次连续成功探测只用于建立健康基线，期间显示 `NET_UNKNOWN`，不会把正常启动误报成丢包；恢复仍需连续5次成功。探测在 `PowerSaving/StandBy` 期间也继续运行，因此看板的 `CURRENT` 不会再用休眠状态掩盖已确认的网络异常；60秒趋势统计仍由 `RECENT 60 SECONDS` 保留。multi launch 中的 `network_health_enable` 默认会启动独立探测进程；配置文件暂时不存在时该进程只记录 WARN 并保持空闲，不会拆掉 Driver。网络看门狗不直接操作继电器：它先重复软重启，只有配置的软重启预算（推荐3次、每次间隔5秒）仍未让窗口恢复健康，Driver 才发布 `NETWORK_RECOVERY_EXHAUSTED`，由已经武装的共享电源 manager 执行四路 OFF/ON。
 

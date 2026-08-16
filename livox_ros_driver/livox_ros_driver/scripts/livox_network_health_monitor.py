@@ -69,7 +69,6 @@ def _integer(data: Mapping[str, Any], key: str, default: int, minimum: int, maxi
 class Target:
     broadcast_code: str
     ip: str
-    handle: int
     interface: str = ""
 
 
@@ -162,21 +161,21 @@ def load_config(path: str) -> MonitorConfig:
             raise ConfigurationError("each target must be an object")
         code = row.get("broadcast_code")
         ip = row.get("ip")
-        handle = row.get("handle")
         interface = row.get("interface", "")
         if not isinstance(code, str) or not SAFE_CODE.fullmatch(code):
             raise ConfigurationError("target broadcast_code must be 15 alphanumeric characters")
         if not isinstance(ip, str) or not SAFE_IP.fullmatch(ip) or ip in seen_ips:
             raise ConfigurationError("target ip must be unique and valid")
-        if isinstance(handle, bool) or not isinstance(handle, int) or handle < 0 or handle > 31:
-            raise ConfigurationError("target handle must be between 0 and 31")
         if not isinstance(interface, str):
             raise ConfigurationError("target interface must be a string")
         if code in seen_codes:
             raise ConfigurationError("target broadcast_code must be unique")
         seen_codes.add(code)
         seen_ips.add(ip)
-        targets.append(Target(code, ip, handle, interface))
+        # ``handle`` was required by an early schema, but it is a transient
+        # SDK slot and can change after reconnects or Driver restarts.  Accept
+        # legacy files that still contain it, but never persist or use it.
+        targets.append(Target(code, ip, interface))
     if window < interval:
         raise ConfigurationError("window_seconds must be >= probe_interval_seconds")
     return MonitorConfig(
@@ -301,7 +300,6 @@ def run_ros(config: MonitorConfig) -> int:
             results[target.broadcast_code] = {
                 "broadcast_code": target.broadcast_code,
                 "ip": target.ip,
-                "handle": target.handle,
                 "state": policy["state"],
                 "success": success,
                 "probe": method,

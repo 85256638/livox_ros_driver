@@ -55,22 +55,18 @@ class NetworkHealthMonitorTests(unittest.TestCase):
                 {
                     "broadcast_code": "EXAMPLE00000001",
                     "ip": "192.168.31.52",
-                    "handle": 0,
                 },
                 {
                     "broadcast_code": "EXAMPLE00000002",
                     "ip": "192.168.31.53",
-                    "handle": 1,
                 },
                 {
                     "broadcast_code": "EXAMPLE00000003",
                     "ip": "192.168.31.54",
-                    "handle": 2,
                 },
                 {
                     "broadcast_code": "EXAMPLE00000004",
                     "ip": "192.168.31.55",
-                    "handle": 3,
                 },
             ],
         }
@@ -78,15 +74,34 @@ class NetworkHealthMonitorTests(unittest.TestCase):
             path = Path(tmp) / "network_health.json"
             path.write_text(json.dumps(raw), encoding="utf-8")
             config = MONITOR.load_config(str(path))
+            legacy = json.loads(json.dumps(raw))
+            legacy["targets"][0]["handle"] = 31
+            legacy_path = Path(tmp) / "legacy-network_health.json"
+            legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+            legacy_config = MONITOR.load_config(str(legacy_path))
         self.assertEqual(config.window_seconds, 5.0)
         self.assertEqual(config.probe_interval_seconds, 1.0)
         self.assertEqual(config.soft_reboot_max_attempts, 3)
         self.assertEqual(config.soft_reboot_interval_seconds, 5.0)
         self.assertEqual(config.soft_reboot_ack_timeout_seconds, 2.0)
         self.assertEqual(len(config.targets), 4)
+        self.assertFalse(hasattr(config.targets[0], "handle"))
+        self.assertFalse(hasattr(legacy_config.targets[0], "handle"))
+        frame = MONITOR._build_frame(
+            config,
+            {
+                "EXAMPLE00000001": {
+                    "broadcast_code": "EXAMPLE00000001",
+                    "state": MONITOR.STATE_OK,
+                }
+            },
+            False,
+            1.0,
+        )
+        self.assertNotIn("handle", frame["devices"][0])
 
     def test_arp_permission_failure_falls_back_to_icmp(self):
-        target = MONITOR.Target("EXAMPLE00000001", "192.168.31.52", 0)
+        target = MONITOR.Target("EXAMPLE00000001", "192.168.31.52")
         responses = [
             mock.Mock(returncode=1),
             mock.Mock(returncode=0),

@@ -12,25 +12,21 @@
     {
       "broadcast_code": "EXAMPLE00000001",
       "ip": "192.168.31.52",
-      "handle": 0,
       "interface": ""
     },
     {
       "broadcast_code": "EXAMPLE00000002",
       "ip": "192.168.31.53",
-      "handle": 1,
       "interface": ""
     },
     {
       "broadcast_code": "EXAMPLE00000003",
       "ip": "192.168.31.54",
-      "handle": 2,
       "interface": ""
     },
     {
       "broadcast_code": "EXAMPLE00000004",
       "ip": "192.168.31.55",
-      "handle": 3,
       "interface": ""
     }
   ]
