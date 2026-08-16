@@ -13,7 +13,8 @@
 9. **自动恢复看门狗（可选）** — 检测到假活（`Normal` 但**没有点云发布**）、配置长期不完成、`Error`（如电机故障）或显式唤醒后持续无广播时按各自路径恢复，带严格归因、重试上限和防死循环门禁
 10. **持久化健康日志（可选）** — 把健康事件与网络趋势落盘成 CSV（边沿事件 + 周期快照），供长期无人值守的趋势分析与故障取证
 11. **广播存活但握手卡死的识别与恢复** — 看板区分 `BROADCAST_ONLY / HANDSHAKE_STUCK / POWER_CYCLE_REQUIRED`；按单台雷达清理本地 session 并有限重试，仍失败时明确要求物理断电
-12. **共享电源组硬恢复闭环（可选、默认关闭）** — 独立 ROS manager 严格处理 `HANDSHAKE_STUCK / WAKE_DROPOUT / NORMAL_DROPOUT / STARTUP_MISSING / ERROR_REBOOT_EXHAUSTED`；任一成员需要硬恢复时，共用通道的 4 台只断/上电一次，SQLite 持久化补上电义务、冷却与次数上限，并以 4 台全部持续恢复点云作为最终成功判据
+12. **共享电源组硬恢复闭环（可选、默认关闭）** — 独立 ROS manager 严格处理 `HANDSHAKE_STUCK / WAKE_DROPOUT / NORMAL_DROPOUT / STARTUP_MISSING / ERROR_REBOOT_EXHAUSTED / NETWORK_RECOVERY_EXHAUSTED`；任一成员需要硬恢复时，共用通道的 4 台只断/上电一次，SQLite 持久化补上电义务、冷却与次数上限，并以 4 台全部持续恢复点云作为最终成功判据
+13. **网络不稳定看门狗** — 独立 ARP/ICMP 探测每秒运行一次；10 秒滑动窗口内累计 2 次失败显示 `NET_UNSTABLE`，先对该雷达软重启最多 3 次（每次间隔约 5 秒），仍未恢复才升级为 `NETWORK_RECOVERY_EXHAUSTED` 并请求共享继电器断电/上电。单次孤立丢包只显示为 `NET_DEGRADED`，不会立即重启
 
 > **整个分支必须配套固定版 SDK。** Driver 的异步 callback context 生命周期依赖 SDK 的 exactly-once completion/cancellation 契约；不能只为模式切换换 SDK、再让其他功能链接任意同名库。
 
@@ -73,6 +74,7 @@ git -C "$HOME/catkin_ws/src/livox_ros_driver" restore --staged -- livox_ros_driv
 | 工位 multi launch | `~/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_lidar_multi.launch` | 是 |
 | 固定继电器 child launch | `~/catkin_ws/src/livox_ros_driver/livox_ros_driver/launch/livox_power_cycle.launch` | 否 |
 | 生产继电器配置 | `~/.config/livox/power_cycle.json` | 是，且只允许在仓库外 |
+| 网络健康配置 | `~/.config/livox/network_health.json` | 是；填写本工位4台雷达的广播码、IP和handle |
 | 继电器示例模板 | `~/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_power_cycle.example.json` | 否；文件名中是 `.example.json`，不是 `_example.json` |
 | 内部 manager 源码 | `~/catkin_ws/src/livox_ros_driver/livox_ros_driver/livox_ros_driver/scripts/livox_power_cycle_manager.py` | 否；只有排障时才直接使用 |
 | 统一校验入口 | `~/catkin_ws/src/livox_ros_driver/validate_livox_site.sh` | 否；现场校验只运行它 |
@@ -108,13 +110,13 @@ nano "$HOME/.config/livox/power_cycle.json"
 **阶段4：离线校验。** 该入口不访问继电器、不改变任何输出，也不会重启服务。目标输出应包含 `Configuration valid`，并且 `Site identity valid` 中应为 `launch_armed=false driver=4 relay_enabled=4 remaps=4`：
 
 ```bash
-bash "$HOME/catkin_ws/src/livox_ros_driver/validate_livox_site.sh"
+bash "$HOME/catkin_ws/src/livox_ros_driver/validate_livox_site.sh" --check-network
 ```
 
 **阶段5：只读查询真实继电器。** 仍保持 `relay_power_cycle_enable=false`。下面的命令会先重复离线校验，再仅对每个enabled电源组执行B0状态查询；它不会发送OFF/ON。必须确认IP/端口可达、返回4路状态。1号工位CX-5104E-L已实测每个新TCP连接的第一次命令只返回ASCII `v1.0`，同一连接重发一次后才返回正式帧；B0既可能拆成8+1字节，也可能在正确第一校验字节后完全省略第9字节。manager会先短暂等待TCP尾分片，仍没有时才严格验证8字节地址、结束位、四路掩码和第一校验字节。2号工位在2026-08-04的200次只读B0抓包中确认：控制器保持ICMP可达，但4次由 `192.168.31.65:50000` 主动向SYN返回RST。后续实机又确认同一连接可连续执行30次B0、依次空闲1/5/15/30/60秒后继续B0，并可完成 `B0 → A1 OFF → B0=OFF → 保持5秒 → A1 ON → B0=ON`；本次实测B0确认的OFF至ON区间为5.393秒。manager因此在一次物理恢复事务内复用同一连接，只对首次连接或断线后的明确 `ECONNREFUSED`（Linux 111 / Windows 10061）按默认1秒间隔重连、单次建连最多覆盖3秒；恢复后保留WARN，超出边界或遇到超时、路由、协议错误仍fail closed。输出中的 `v1.0 handshake`、`fixed AA tail`、`single-checksum ... omitted second checksum byte` 或 `connection refused ... recovered` 兼容警告都是已确认且有边界的行为：
 
 ```bash
-bash "$HOME/catkin_ws/src/livox_ros_driver/validate_livox_site.sh" --check-relays
+bash "$HOME/catkin_ws/src/livox_ros_driver/validate_livox_site.sh" --check-network --check-relays
 ```
 
 **阶段6：武装并再次离线校验。** 本现场已确认继电器1～4路全部只控制本组4台雷达，因此生产JSON必须使用 `channels: [1, 2, 3, 4]`。只有人工确认所配通道集合不含其他负载后，才把multi launch中的 `relay_power_cycle_enable` 改为 `true`；再次运行校验，目标输出必须变为 `launch_armed=true driver=4 relay_enabled=4 remaps=4`：
@@ -154,6 +156,14 @@ LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --
 ```
 
 如果暂不启用继电器自动硬恢复，只需核对前两份 Driver 配置，并让外部JSON电源组和launch继电器开关都保持 `false`；systemd 主 unit 正常时也不用修改。准备执行只读B0实机查询时，可以先把外部JSON目标组设为 `enabled: true`，但必须继续保持 launch 中 `<arg name="relay_power_cycle_enable" default="false"/>`；组enabled本身不会启动manager，launch才是自动硬件控制总开关。完成广播码、继电器地址/通道集合及“所选通道全部只给本组4台雷达供电”的人工验收后，才把launch开关也改为 `true`。SDK源码、CMake文件、`livox_power_cycle.example.json` 和SQLite状态库都不是现场配置，不要手改或用示例文件覆盖生产文件。
+
+网络健康配置位于仓库外，不会被更新脚本覆盖。先从模板复制一次，再把四台雷达的实际IP替换为现场值；`handle` 必须与 Driver 看板中的 ID 对应：
+
+```bash
+mkdir -p "$HOME/.config/livox" && install -m 600 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_network_health.example.json" "$HOME/.config/livox/network_health.json" && nano "$HOME/.config/livox/network_health.json" && python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/livox_network_health_monitor.py" --config "$HOME/.config/livox/network_health.json" --validate-config
+```
+
+推荐保持 `probe_interval_seconds=1`、`window_seconds=10`、`unstable_failures=2`、`unreachable_consecutive_failures=3`、`healthy_consecutive_successes=5`、`soft_reboot_max_attempts=3`、`soft_reboot_interval_seconds=5`、`soft_reboot_ack_timeout_seconds=2`。前5次连续成功探测只用于建立健康基线，期间显示 `NET_UNKNOWN`，不会把正常启动误报成丢包；单次失败显示 `NET_DEGRADED`，10秒窗口累计2次才是 `NET_UNSTABLE`。探测在 `PowerSaving/StandBy` 期间也继续运行，因此看板的 `CURRENT` 不会再用休眠状态掩盖已确认的网络异常。multi launch 中的 `network_health_enable` 默认会启动独立探测进程；配置文件暂时不存在时该进程只记录 WARN 并保持空闲，不会拆掉 Driver。网络看门狗不直接操作继电器：它先重复软重启，只有配置的软重启预算（推荐3次、每次间隔5秒）仍未让窗口恢复健康，Driver 才发布 `NETWORK_RECOVERY_EXHAUSTED`，由已经武装的共享电源 manager 执行四路 OFF/ON。
 
 修改完成后统一运行根目录入口；不要再手工输入内部Python脚本的三层目录。只有输出 `Configuration valid` 和 `Site identity valid` 才允许进入后续步骤：
 
@@ -1218,7 +1228,7 @@ sudo systemctl restart livox-ros-driver && systemctl is-active livox-ros-driver
 | 断电后异常 | ON 无法确认时保留持久化 obligation，每 30 秒继续尝试并发出 CRITICAL；systemd 启动前先独立补 ON，配置损坏也不会跳过；补 ON 未完成前禁止任何新 OFF |
 | 告警存续 | 每个物理端点仍需人工处理的活动告警按原始 `WARN/ERROR/CRITICAL` 严重度、原始事件时间独立存入 SQLite，重启后原样重新发布；`RECOVERY_VERIFIED` 或实时状态确认 `STALE_OR_RECOVERED` 后清除。冷却等待不是永久告警，不会以CRITICAL回放 |
 
-配置和状态均在仓库外：更新 Driver 不会覆盖 `~/.config/livox/power_cycle.json`。生产安装把审计/去重数据库固定为 `~/.local/state/livox-power-cycle-manager/state.sqlite3`，配置中的 `state_db` 必须解析到同一路径。不要删除、替换或手工修改 SQLite，否则会丢失冷却预算和补上电义务；v2/v3 会保守补入旧原因字段，v4/v5 会在一个 `BEGIN IMMEDIATE` 事务内原子重建两张带 reason 约束的表，v6→v7会给活动告警补入持久严重度并只归档旧版遗留的 `SUPPRESSED_COOLDOWN` 告警行，cycle、事件历史、冷却预算与补ON义务均保留。任一步失败会整体回滚；未知、损坏或 legacy 结构仍严格拒绝，不会静默重建。
+配置和状态均在仓库外：更新 Driver 不会覆盖 `~/.config/livox/power_cycle.json`。生产安装把审计/去重数据库固定为 `~/.local/state/livox-power-cycle-manager/state.sqlite3`，配置中的 `state_db` 必须解析到同一路径。不要删除、替换或手工修改 SQLite，否则会丢失冷却预算和补上电义务；v2/v3 会保守补入旧原因字段，v4/v5/v7 会在一个 `BEGIN IMMEDIATE` 事务内原子重建两张带 reason 约束的表，v6→v7会给活动告警补入持久严重度并只归档旧版遗留的 `SUPPRESSED_COOLDOWN` 告警行，v8新增网络恢复原因 `NETWORK_RECOVERY_EXHAUSTED`；cycle、事件历史、冷却预算与补ON义务均保留。任一步失败会整体回滚；未知、损坏或 legacy 结构仍严格拒绝，不会静默重建。
 
 卸载同样不是直接删文件：先把 launch 开关改回 `false` 并安全停止 Driver，再执行 `bash "$HOME/catkin_ws/src/livox_ros_driver/install_livox_power_cycle_service.sh" --uninstall`。脚本只接受 Driver 已处于 `inactive/failed`，独立补 ON 成功后才删除 Driver drop-in；任何一步失败都会保留安全钩子，现场 JSON 和 SQLite 始终保留。
 

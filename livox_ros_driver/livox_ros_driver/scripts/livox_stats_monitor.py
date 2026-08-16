@@ -494,6 +494,24 @@ def _parse_recent_rows(lines):
     return rows
 
 
+def _parse_network_rows(lines):
+    rows = {}
+    for line in lines:
+        fields = line.split()
+        if (
+            len(fields) >= 6
+            and fields[0].isdigit()
+            and _BROADCAST_CODE_RE.fullmatch(fields[1]) is not None
+        ):
+            rows[fields[1]] = {
+                "state": fields[2],
+                "loss": fields[3],
+                "window": fields[4],
+                "soft_reboot": fields[5],
+            }
+    return rows
+
+
 def _parse_measurement_rows(lines):
     rows = {}
     current = None
@@ -829,6 +847,7 @@ def _compose_compact_dashboard(
     _preamble, sections, _order = _split_driver_sections(stats_text)
     devices = _parse_device_rows(sections.get("CURRENT DEVICES", []))
     recent = _parse_recent_rows(sections.get("RECENT 60 SECONDS", []))
+    network = _parse_network_rows(sections.get("NETWORK HEALTH (10s)", []))
     measurement = _parse_measurement_rows(
         sections.get("MEASUREMENT RECOVERY", [])
     )
@@ -884,7 +903,7 @@ def _compose_compact_dashboard(
     lines.extend(
         [
             "==================== RECOVERY / RECENT =================",
-            "ID   net_loss  queue_drop  handshake  session   Error    point-cloud   last-recovery       next-error",
+            "ID   net_loss  queue_drop  handshake  session   Error    point-cloud   last-recovery       next-error     network",
         ]
     )
     for device in devices:
@@ -893,8 +912,12 @@ def _compose_compact_dashboard(
             code, {"loss": "--", "queue_drop": "--", "handshake": "--"}
         )
         recovery = _compact_measurement(measurement.get(code))
+        network_row = network.get(
+            code,
+            {"state": "--", "loss": "--", "window": "--", "soft_reboot": "--"},
+        )
         lines.append(
-            "{:<3}  {:>8}  {:>10}  {:>9}  {:<8}  {:>7}  {:<12}  {:<18}  {:<12}".format(
+            "{:<3}  {:>8}  {:>10}  {:>9}  {:<8}  {:>7}  {:<12}  {:<18}  {:<12}  {:<18}".format(
                 _fit_cell(device["id"], 3),
                 _fit_cell(recent_row["loss"], 8),
                 _fit_cell(recent_row["queue_drop"], 10),
@@ -904,6 +927,15 @@ def _compose_compact_dashboard(
                 _fit_cell(recovery["point"], 12),
                 _fit_cell(recovery["last"], 18),
                 _fit_cell(recovery["next"], 12),
+                _fit_cell(
+                    "%s %s %s"
+                    % (
+                        network_row["state"],
+                        network_row["window"],
+                        network_row["soft_reboot"],
+                    ),
+                    18,
+                ),
             )
         )
 
@@ -953,6 +985,7 @@ def _history_stats_text(stats_text):
     for name in (
         "SOFTWARE",
         "CURRENT ALERTS",
+        "NETWORK HEALTH (10s)",
         "MEASUREMENT RECOVERY",
         "PROCESS HISTORY",
     ):

@@ -342,8 +342,41 @@ static const char *PowerCycleReasonStr(LdsLidar::PowerCycleReason reason) {
       return "ERROR_REBOOT_EXHAUSTED";
     case LdsLidar::kPowerCycleReasonStartupMissing:
       return "STARTUP_MISSING";
+    case LdsLidar::kPowerCycleReasonNetworkRecoveryExhausted:
+      return "NETWORK_RECOVERY_EXHAUSTED";
     default:
       return "NONE";
+  }
+}
+
+static const char *NetworkHealthStateStr(NetworkHealthState state) {
+  switch (state) {
+    case kNetworkHealthOk:
+      return "NET_OK";
+    case kNetworkHealthDegraded:
+      return "NET_DEGRADED";
+    case kNetworkHealthUnstable:
+      return "NET_UNSTABLE";
+    case kNetworkHealthUnreachable:
+      return "NET_UNREACHABLE";
+    default:
+      return "NET_UNKNOWN";
+  }
+}
+
+static const char *NetworkRecoveryStateStr(
+    LdsLidar::NetworkRecoveryState state) {
+  switch (state) {
+    case LdsLidar::kNetworkRecoveryWaiting:
+      return "NETWORK_WAITING";
+    case LdsLidar::kNetworkRecoverySoftRebootPending:
+      return "SOFT_REBOOT_PENDING";
+    case LdsLidar::kNetworkRecoverySoftRebootVerifying:
+      return "SOFT_REBOOT_VERIFYING";
+    case LdsLidar::kNetworkRecoveryPowerCycleRequired:
+      return "POWER_CYCLE_REQUIRED";
+    default:
+      return "IDLE";
   }
 }
 
@@ -360,9 +393,13 @@ static bool IsPowerCycleRequired(const LdsLidar::LinkStat &link) {
               LdsLidar::kPowerCycleReasonNormalDropout &&
           link.normal_dropout_state ==
               LdsLidar::kNormalDropoutPowerCycleRequired) ||
-         (link.power_cycle_reason ==
+          (link.power_cycle_reason ==
               LdsLidar::kPowerCycleReasonErrorRebootExhausted &&
-          link.measurement_session.error_power_cycle_required);
+          link.measurement_session.error_power_cycle_required) ||
+          (link.power_cycle_reason ==
+              LdsLidar::kPowerCycleReasonNetworkRecoveryExhausted &&
+           link.network_recovery_state ==
+              LdsLidar::kNetworkRecoveryPowerCycleRequired);
 }
 
 static const char *RecoveryStateStr(const LdsLidar::LinkStat &link) {
@@ -463,7 +500,14 @@ static void PublishRecoveryState(
       normal_reason ? link.normal_dropout_wall_s : 0, "IDLE", 0,
       error_reason ? link.measurement_session.session_id : 0,
       error_reason ? link.measurement_session.error_reboot_attempts : 0,
-      error_reason ? link.measurement_session.error_since_wall_s : 0);
+      error_reason ? link.measurement_session.error_since_wall_s : 0,
+      NetworkHealthStateStr(link.network_health_state),
+      NetworkRecoveryStateStr(link.network_recovery_state),
+      link.network_window_samples, link.network_window_failures,
+      link.network_loss_percent, link.network_soft_reboot_attempts,
+      link.network_soft_reboot_episode_wall_s,
+      link.network_soft_reboot_last_try_wall_s,
+      link.network_shared_suspected);
   g_recovery_state_pub.publish(msg);
 }
 
@@ -488,6 +532,9 @@ static void PublishPowerCycleRequest(uint8_t handle, const char *broadcast_code,
   const bool error_reason =
       link.power_cycle_reason ==
       LdsLidar::kPowerCycleReasonErrorRebootExhausted;
+  const bool network_reason =
+      link.power_cycle_reason ==
+      LdsLidar::kPowerCycleReasonNetworkRecoveryExhausted;
   std_msgs::String msg;
   msg.data = BuildPowerCycleRequestJson(
       event_id_text.c_str(), static_cast<int64_t>(time(nullptr)), detected_at,
@@ -508,7 +555,14 @@ static void PublishPowerCycleRequest(uint8_t handle, const char *broadcast_code,
       normal_reason ? link.normal_dropout_wall_s : 0, 0,
       error_reason ? link.measurement_session.session_id : 0,
       error_reason ? link.measurement_session.error_reboot_attempts : 0,
-      error_reason ? link.measurement_session.error_since_wall_s : 0);
+      error_reason ? link.measurement_session.error_since_wall_s : 0,
+      NetworkHealthStateStr(link.network_health_state),
+      NetworkRecoveryStateStr(link.network_recovery_state),
+      link.network_window_samples, link.network_window_failures,
+      link.network_loss_percent, link.network_soft_reboot_attempts,
+      network_reason ? link.network_soft_reboot_episode_wall_s : 0,
+      network_reason ? link.network_soft_reboot_last_try_wall_s : 0,
+      link.network_shared_suspected);
   g_power_cycle_request_pub.publish(msg);
   ROS_ERROR("[LivoxPowerCycle] published request event_id=%s lidar[%u][%s]",
             event_id_text.c_str(), static_cast<unsigned>(handle),
@@ -651,7 +705,49 @@ static std::string DashboardNowState(
         link.handshake_state != LdsLidar::kHandshakeLinkIdle) {
       return HandshakeStateStr(link.handshake_state);
     }
+    if (link.network_recovery_state ==
+        LdsLidar::kNetworkRecoveryPowerCycleRequired) {
+      return "POWER_CYCLE_REQUIRED";
+    }
+    if (link.network_health_state == kNetworkHealthUnreachable) {
+      return "NET_UNREACHABLE";
+    }
+    if (link.network_health_state == kNetworkHealthUnstable) {
+      return "NET_UNSTABLE";
+    }
+    if (link.network_health_state == kNetworkHealthDegraded) {
+      return "NET_DEGRADED";
+    }
     return "DISCONNECTED";
+  }
+  // Network probing remains active while a lidar is intentionally sleeping.
+  // Surface a verified network problem before the mode label so PowerSaving
+  // cannot hide the exact failure that will be recovered. Keep NO DATA and
+  // hardware Error as the primary labels because they carry a more specific
+  // data-plane/device diagnosis.
+  const bool preserve_specific_state =
+      strcmp(connected_state, "NO DATA") == 0 ||
+      strcmp(connected_state, "Error") == 0;
+  if (!preserve_specific_state) {
+    if (link.network_recovery_state ==
+        LdsLidar::kNetworkRecoveryPowerCycleRequired) {
+      return "POWER_CYCLE_REQUIRED";
+    }
+    if (link.network_recovery_state ==
+            LdsLidar::kNetworkRecoverySoftRebootPending ||
+        link.network_recovery_state ==
+            LdsLidar::kNetworkRecoverySoftRebootVerifying) {
+      return "NETWORK_RECOVERING";
+    }
+    if (link.network_health_state == kNetworkHealthUnreachable) {
+      return "NET_UNREACHABLE";
+    }
+    if (link.network_health_state == kNetworkHealthUnstable) {
+      return "NET_UNSTABLE";
+    }
+    if (link.network_health_state == kNetworkHealthDegraded) {
+      return "NET_DEGRADED";
+    }
   }
   if (strcmp(connected_state, "NO DATA") == 0) {
     return "NO_DATA";
@@ -814,6 +910,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
   g_read_lidar->TickHandshakeRecovery(g_auto_recover);
   g_read_lidar->TickWakeDropoutRecovery(g_auto_recover);
   g_read_lidar->TickNormalDropoutRecovery(g_auto_recover);
+  g_read_lidar->TickNetworkRecovery(g_auto_recover);
   static uint64_t prev_recv[kMaxLidarCount] = {0};
   static uint64_t prev_pub[kMaxLidarCount] = {0};
   static uint64_t prev_connection_generation[kMaxLidarCount] = {0};
@@ -878,6 +975,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
   std::ostringstream active_alerts;
   std::ostringstream process_history;
   std::ostringstream measurement_recovery;
+  std::ostringstream network_table;
   static const char kCurrentRowFormat[] =
       "%-2.2s  %-15.15s  %-20.20s  %-10.10s  %8.8s  %-10.10s  %11.11s  %6.6s\n";
   static const char kRecentRowFormat[] =
@@ -892,6 +990,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
            "handshake_timeouts");
   current_table << current_header;
   recent_table << recent_header;
+  network_table << "ID  broadcast_code    state            loss      window  "
+                   "soft-reboot\n";
   bool any_active_alert = false;
   bool any_process_history = false;
   bool any_measurement_recovery = false;
@@ -1431,29 +1531,42 @@ void StatsTimerCb(const ros::TimerEvent &) {
           live.last_broadcast_ns != 0 &&
           now_ns - live.last_broadcast_ns <=
               LdsLidar::HandshakeBroadcastFreshNs();
+      bool live_power_evidence = false;
+      switch (expected_power_reason) {
+        case LdsLidar::kPowerCycleReasonHandshakeStuck:
+          live_power_evidence =
+              live.broadcast_only_since_ns == expected_power_episode;
+          break;
+        case LdsLidar::kPowerCycleReasonWakeDropout:
+          live_power_evidence =
+              live.wake_request_id == expected_wake_request_id &&
+              live.wake_dropout_since_ns == expected_wake_dropout;
+          break;
+        case LdsLidar::kPowerCycleReasonNormalDropout:
+          live_power_evidence =
+              live.normal_dropout_generation == expected_normal_generation &&
+              live.normal_dropout_since_ns == expected_normal_silence;
+          break;
+        case LdsLidar::kPowerCycleReasonErrorRebootExhausted:
+          live_power_evidence =
+              live.measurement_session.session_id == expected_error_session &&
+              live.measurement_session.error_since_ns == expected_error_since;
+          break;
+        case LdsLidar::kPowerCycleReasonNetworkRecoveryExhausted:
+          live_power_evidence =
+              live.network_recovery_state ==
+                  LdsLidar::kNetworkRecoveryPowerCycleRequired &&
+              live.network_soft_reboot_episode_ns ==
+                  ls.network_soft_reboot_episode_ns;
+          break;
+        default:
+          break;
+      }
       publish_power_edge =
           expected_power_edge &&
           IsPowerCycleRequired(live) &&
           live.power_cycle_reason == expected_power_reason &&
-          (expected_power_reason ==
-                   LdsLidar::kPowerCycleReasonHandshakeStuck
-               ? live.broadcast_only_since_ns == expected_power_episode
-               : expected_power_reason ==
-                         LdsLidar::kPowerCycleReasonWakeDropout
-                     ? live.wake_request_id == expected_wake_request_id &&
-                           live.wake_dropout_since_ns == expected_wake_dropout
-                     : expected_power_reason ==
-                               LdsLidar::kPowerCycleReasonNormalDropout
-                           ? live.normal_dropout_generation ==
-                                     expected_normal_generation &&
-                                 live.normal_dropout_since_ns ==
-                                     expected_normal_silence
-                           : expected_power_reason ==
-                                     LdsLidar::kPowerCycleReasonErrorRebootExhausted &&
-                                 live.measurement_session.session_id ==
-                                     expected_error_session &&
-                                 live.measurement_session.error_since_ns ==
-                                     expected_error_since) &&
+          live_power_evidence &&
           live.power_cycle_required_count == expected_power_count;
       /** Keep the later footer coherent with the state just published. */
       ls = live;
@@ -1561,6 +1674,10 @@ void StatsTimerCb(const ros::TimerEvent &) {
         display_state == "POWER_CYCLE_REQUIRED" &&
         ls.power_cycle_reason ==
             LdsLidar::kPowerCycleReasonErrorRebootExhausted;
+    const bool power_reason_network =
+        display_state == "POWER_CYCLE_REQUIRED" &&
+        ls.power_cycle_reason ==
+            LdsLidar::kPowerCycleReasonNetworkRecoveryExhausted;
     const bool handshake_incident =
         display_state == "HANDSHAKE_STUCK" ||
         power_reason_handshake;
@@ -1571,6 +1688,22 @@ void StatsTimerCb(const ros::TimerEvent &) {
         display_state == "NORMAL_NO_BROADCAST" ||
         display_state == "NORMAL_DROPOUT" ||
         display_state == "BROADCAST_RETURNING" || power_reason_normal;
+    const bool network_incident =
+        display_state == "NET_UNSTABLE" ||
+        display_state == "NET_UNREACHABLE" ||
+        display_state == "NETWORK_RECOVERING" || power_reason_network;
+    if (ls.network_health_seen) {
+      char network_row[192];
+      snprintf(network_row, sizeof(network_row),
+               "%-2u  %-15.15s  %-15.15s  %7.2f%%  %u/%u    %u/%u\n",
+               static_cast<unsigned>(h), dashboard_bcode.c_str(),
+               NetworkHealthStateStr(ls.network_health_state),
+               ls.network_loss_percent, ls.network_window_failures,
+               ls.network_window_samples,
+               static_cast<unsigned>(ls.network_soft_reboot_attempts),
+               static_cast<unsigned>(ls.network_soft_reboot_max_attempts));
+      network_table << network_row;
+    }
     const bool config_exhausted =
         display_state == "CONFIG" && g_auto_recover &&
         config_reboots[h] >= kConfigRebootMaxAttempts;
@@ -1580,6 +1713,7 @@ void StatsTimerCb(const ros::TimerEvent &) {
         display_state == "NO_DATA" ||
         display_state == "ERROR" || display_state == "?" ||
         handshake_incident || wake_incident || normal_dropout_incident ||
+        network_incident ||
         config_exhausted ||
         (dashboard_connected && health_tags != "OK");
     live_signals.incident_active = current_incident;
@@ -1588,9 +1722,11 @@ void StatsTimerCb(const ros::TimerEvent &) {
         point_data_verifying ||
         (display_state == "CONFIG" && !config_exhausted) ||
         display_state == "INIT" ||
-        (display_state == "NORMAL" && !publishing_now);
+        (display_state == "NORMAL" && !publishing_now) ||
+        display_state == "NETWORK_RECOVERING";
     live_signals.intentionally_idle =
-        display_state == "POWER_SAVING" || display_state == "STANDBY";
+        (display_state == "POWER_SAVING" || display_state == "STANDBY") &&
+        display_state != "NET_DEGRADED" && !network_incident;
     const DashboardTrend trend = EvaluateTrend(window, live_signals);
     known_count++;
 
@@ -1785,6 +1921,40 @@ void StatsTimerCb(const ros::TimerEvent &) {
         } else if (ls.handshake_reset_phase ==
                    LdsLidar::kHandshakeResetCompleted) {
           active_alerts << "; post-reset observation";
+        }
+        active_alerts << "\n";
+      } else if (network_incident) {
+        const int64_t network_age =
+            ls.network_soft_reboot_episode_ns == 0
+                ? 0
+                : now_ns - ls.network_soft_reboot_episode_ns;
+        active_alerts << " age=" << FmtDur(network_age) << "\n"
+                      << "    network: "
+                      << NetworkHealthStateStr(ls.network_health_state)
+                      << "; rolling=" << ls.network_window_failures << "/"
+                      << ls.network_window_samples << " failed; loss=";
+        char network_loss[32];
+        snprintf(network_loss, sizeof(network_loss), "%.2f%%",
+                 ls.network_loss_percent);
+        active_alerts << network_loss << "; soft-reboots="
+                      << static_cast<unsigned>(ls.network_soft_reboot_attempts)
+                      << "/"
+                      << static_cast<unsigned>(ls.network_soft_reboot_max_attempts);
+        if (ls.network_shared_suspected) {
+          active_alerts << "; shared-path suspected";
+        }
+        if (power_reason_network) {
+          active_alerts
+              << "; configured soft-reboot budget exhausted; shared power-cycle request "
+                 "published";
+        } else if (display_state == "NETWORK_RECOVERING") {
+          active_alerts << "; soft reboot in progress/verification";
+        } else if (!g_auto_recover) {
+          active_alerts << "; detection only (auto_recover=off)";
+        } else {
+          active_alerts << "; soft-reboot budget is bounded to "
+                        << (ls.network_soft_recovery_deadline_ns / 1000000000LL)
+                        << "s";
         }
         active_alerts << "\n";
       } else if (power_reason_error) {
@@ -2127,6 +2297,10 @@ void StatsTimerCb(const ros::TimerEvent &) {
         "but dropped by Driver queue\n"
      << "  handshake_timeouts=SDK handshake attempts, not independent fault "
         "episodes\n"
+     << "==================== NETWORK HEALTH (10s) =========\n"
+     << "  ARP/ICMP probe; 2 failures inside 10s => NET_UNSTABLE; "
+        "soft reboot 3x before relay escalation\n"
+     << network_table.str()
      << "==================== ASSESSMENT GUIDE ============\n"
      << "  ACTIVE=current fault; RECOVERING=automatic recovery in progress; "
         "IDLE=intentional low-power\n"
@@ -2330,6 +2504,7 @@ int main(int argc, char **argv) {
    *  in a separate terminal for an always-current, isolated panel) */
   ros::Timer stats_timer;
   ros::Subscriber group_power_cycle_intent_sub;
+  ros::Subscriber network_health_sub;
   if (data_src == kSourceRawLidar) {
     g_stats_pub = livox_node.advertise<std_msgs::String>("livox/lidar_stats", 1);
     g_power_cycle_request_pub = livox_node.advertise<std_msgs::String>(
@@ -2340,12 +2515,21 @@ int main(int argc, char **argv) {
         "livox/group_power_cycle_ack", 8);
     group_power_cycle_intent_sub = livox_node.subscribe(
         "livox/group_power_cycle_intent", 8, GroupPowerCycleIntentCb);
+    network_health_sub = livox_node.subscribe(
+        "livox/network_health", 8,
+        [](const std_msgs::String::ConstPtr &message) {
+          if (g_read_lidar != nullptr && message) {
+            g_read_lidar->ApplyNetworkHealthJson(message->data);
+          }
+        });
     stats_timer = livox_node.createTimer(ros::Duration(1.0), StatsTimerCb);
     ROS_INFO("Publishing stats topic: livox/lidar_stats (1Hz)");
     ROS_INFO("Publishing recovery topics: livox/power_cycle_request (latched) "
              "and livox/lidar_recovery_state (1Hz)");
     ROS_INFO("Shared-power intent barrier: livox/group_power_cycle_intent -> "
              "livox/group_power_cycle_ack");
+    ROS_INFO("Network health monitor topic: livox/network_health (10s window, "
+             "2 losses => NET_UNSTABLE)");
     ROS_INFO("Auto-recover (no-data/Config/Error watchdogs): %s",
              g_auto_recover ? "ENABLED" : "disabled");
     ROS_INFO("Handshake session recovery (broadcast-only watchdog): %s",

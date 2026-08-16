@@ -75,7 +75,16 @@ inline std::string BuildLidarRecoveryStateJson(
     int64_t startup_missing_since = 0,
     uint64_t measurement_session_id = 0,
     uint8_t error_reboot_attempts = 0,
-    int64_t error_since_at = 0) {
+    int64_t error_since_at = 0,
+    const char *network_state = "UNKNOWN",
+    const char *network_recovery_state = "IDLE",
+    uint32_t network_window_samples = 0,
+    uint32_t network_window_failures = 0,
+    double network_loss_percent = 0.0,
+    uint8_t network_soft_reboot_attempts = 0,
+    int64_t network_episode_at = 0,
+    int64_t network_soft_reboot_last_try_at = 0,
+    bool network_shared_suspected = false) {
   std::ostringstream json;
   json << "{\"schema_version\":1,\"type\":\"LIDAR_RECOVERY_STATE\""
        << ",\"timestamp\":" << timestamp
@@ -116,6 +125,20 @@ inline std::string BuildLidarRecoveryStateJson(
        << ",\"error_reboot_attempts\":"
        << static_cast<unsigned>(error_reboot_attempts)
        << ",\"error_since_at\":" << error_since_at
+       << ",\"network_state\":\""
+       << RecoveryJsonEscape(network_state) << "\""
+       << ",\"network_recovery_state\":\""
+       << RecoveryJsonEscape(network_recovery_state) << "\""
+       << ",\"network_window_samples\":" << network_window_samples
+       << ",\"network_window_failures\":" << network_window_failures
+       << ",\"network_loss_percent\":" << network_loss_percent
+       << ",\"network_soft_reboot_attempts\":"
+       << static_cast<unsigned>(network_soft_reboot_attempts)
+       << ",\"network_episode_at\":" << network_episode_at
+       << ",\"network_soft_reboot_last_try_at\":"
+       << network_soft_reboot_last_try_at
+       << ",\"network_shared_suspected\":"
+       << (network_shared_suspected ? "true" : "false")
        << ",\"broadcast_fresh\":"
        << (broadcast_fresh ? "true" : "false")
        << ",\"publishing\":" << (publishing ? "true" : "false")
@@ -143,7 +166,16 @@ inline std::string BuildPowerCycleRequestJson(
     int64_t startup_missing_since = 0,
     uint64_t measurement_session_id = 0,
     uint8_t error_reboot_attempts = 0,
-    int64_t error_since_at = 0) {
+    int64_t error_since_at = 0,
+    const char *network_state = "UNKNOWN",
+    const char *network_recovery_state = "IDLE",
+    uint32_t network_window_samples = 0,
+    uint32_t network_window_failures = 0,
+    double network_loss_percent = 0.0,
+    uint8_t network_soft_reboot_attempts = 0,
+    int64_t network_episode_at = 0,
+    int64_t network_soft_reboot_last_try_at = 0,
+    bool network_shared_suspected = false) {
   std::ostringstream json;
   json << "{\"schema_version\":1,\"type\":\"POWER_CYCLE_REQUIRED\""
        << ",\"event_id\":\"" << RecoveryJsonEscape(event_id) << "\""
@@ -177,7 +209,21 @@ inline std::string BuildPowerCycleRequestJson(
        << ",\"error_since_at\":" << error_since_at
        << ",\"session_reset_attempts\":"
        << static_cast<unsigned>(session_reset_attempts)
-       << ",\"episode_count\":" << episode_count << "}";
+       << ",\"episode_count\":" << episode_count
+       << ",\"network_state\":\""
+       << RecoveryJsonEscape(network_state) << "\""
+       << ",\"network_recovery_state\":\""
+       << RecoveryJsonEscape(network_recovery_state) << "\""
+       << ",\"network_window_samples\":" << network_window_samples
+       << ",\"network_window_failures\":" << network_window_failures
+       << ",\"network_loss_percent\":" << network_loss_percent
+       << ",\"network_soft_reboot_attempts\":"
+       << static_cast<unsigned>(network_soft_reboot_attempts)
+       << ",\"network_episode_at\":" << network_episode_at
+       << ",\"network_soft_reboot_last_try_at\":"
+       << network_soft_reboot_last_try_at
+       << ",\"network_shared_suspected\":"
+       << (network_shared_suspected ? "true" : "false") << "}";
   return json.str();
 }
 

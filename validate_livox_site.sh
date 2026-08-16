@@ -14,15 +14,18 @@ CHILD_LAUNCH="${PACKAGE_DIR}/launch/livox_power_cycle.launch"
 EXAMPLE_CONFIG="${PACKAGE_DIR}/config/livox_power_cycle.example.json"
 MISPLACED_CONFIG="${PACKAGE_DIR}/config/livox_power_cycle.json"
 RELAY_CONFIG="${HOME}/.config/livox/power_cycle.json"
+NETWORK_CONFIG="${HOME}/.config/livox/network_health.json"
 CHECK_RELAYS=0
+CHECK_NETWORK=0
 
 usage() {
   cat <<'EOF'
-Usage: bash validate_livox_site.sh [--check-relays]
+Usage: bash validate_livox_site.sh [--check-relays] [--check-network]
 
 Without options, validate JSON syntax/safety and the Driver/relay/launch site
 identity without ROS or network access.  --check-relays performs those checks
 first, then sends one read-only B0 status query to each enabled relay group.
+--check-network additionally validates the external ARP/ICMP watchdog config.
 EOF
 }
 
@@ -34,6 +37,7 @@ die() {
 case "${1:-}" in
   "") ;;
   --check-relays) CHECK_RELAYS=1 ;;
+  --check-network) CHECK_NETWORK=1 ;;
   -h|--help)
     usage
     exit 0
@@ -81,6 +85,13 @@ python3 "${SITE_VALIDATOR}" \
   --relay-config "${RELAY_CONFIG}" \
   --driver-config "${DRIVER_CONFIG}" \
   --launch "${SITE_LAUNCH}"
+
+if ((CHECK_NETWORK)); then
+  [[ -f "${NETWORK_CONFIG}" && ! -L "${NETWORK_CONFIG}" ]] || die "network health config is missing or a symlink: ${NETWORK_CONFIG}"
+  printf 'Validating network health config: %s\n' "${NETWORK_CONFIG}"
+  python3 "${PACKAGE_DIR}/livox_ros_driver/scripts/livox_network_health_monitor.py" \
+    --config "${NETWORK_CONFIG}" --validate-config
+fi
 
 if ((CHECK_RELAYS)); then
   printf 'Querying enabled relay groups (read-only; no output state is changed)\n'

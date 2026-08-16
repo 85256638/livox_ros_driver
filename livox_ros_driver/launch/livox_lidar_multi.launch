@@ -21,6 +21,8 @@
     <arg name="health_log_dir" default=""/>   <!-- output dir; empty = node working dir (~/.ros). Must already exist -->
     <arg name="health_log_snapshot_s" default="600"/>   <!-- snapshot cadence in seconds; events are always logged the instant they happen -->
     <arg name="relay_power_cycle_enable" default="false"/>   <!-- true: start automatic shared-relay OFF/ON; false: do not start the manager or read its JSON -->
+    <arg name="network_health_enable" default="true"/>   <!-- independent 1Hz ARP/ICMP health probe -->
+    <arg name="network_health_config" default="$(env HOME)/.config/livox/network_health.json"/>
 
 
     <!-- Livox Configuration -->
@@ -54,6 +56,12 @@
     <param name="health_log" type="bool" value="$(arg health_log)"/>
     <param name="health_log_dir" type="string" value="$(arg health_log_dir)"/>
     <param name="health_log_snapshot_s" type="int" value="$(arg health_log_snapshot_s)"/>
+
+    <!-- LIVOX_NETWORK_HEALTH_V1: probe is isolated from the point-cloud data plane. -->
+    <node if="$(arg network_health_enable)" name="livox_network_health_monitor"
+          pkg="livox_ros_driver" type="livox_network_health_monitor.py"
+          output="screen" respawn="true" respawn_delay="5"
+          args="--config $(arg network_health_config)"/>
 
     <!-- LIVOX_RELAY_LAUNCH_INTEGRATION -->
     <include file="$(find livox_ros_driver)/launch/livox_power_cycle.launch">

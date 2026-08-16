@@ -42,7 +42,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 WIRE_SCHEMA_VERSION = 1
 CONFIG_SCHEMA_VERSION = 2
-STATE_DB_SCHEMA_VERSION = 7
+STATE_DB_SCHEMA_VERSION = 8
 REQUEST_TYPE = "POWER_CYCLE_REQUIRED"
 STATE_TYPE = "LIDAR_RECOVERY_STATE"
 STATUS_TYPE = "POWER_CYCLE_STATUS"
@@ -57,12 +57,14 @@ RECOVERY_REASON_WAKE_DROPOUT = "WAKE_DROPOUT"
 RECOVERY_REASON_NORMAL_DROPOUT = "NORMAL_DROPOUT"
 RECOVERY_REASON_STARTUP_MISSING = "STARTUP_MISSING"
 RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED = "ERROR_REBOOT_EXHAUSTED"
+RECOVERY_REASON_NETWORK = "NETWORK_RECOVERY_EXHAUSTED"
 RECOVERY_REASONS = {
     RECOVERY_REASON_HANDSHAKE,
     RECOVERY_REASON_WAKE_DROPOUT,
     RECOVERY_REASON_NORMAL_DROPOUT,
     RECOVERY_REASON_STARTUP_MISSING,
     RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED,
+    RECOVERY_REASON_NETWORK,
 }
 WAKE_STATE_REQUIRED = REQUEST_TYPE
 TERMINAL_EVENT_STATES = {
@@ -339,6 +341,15 @@ class PowerCycleRequest:
     measurement_session_id: int = 0
     error_reboot_attempts: int = 0
     error_since_at: float = 0.0
+    network_state: str = "UNKNOWN"
+    network_recovery_state: str = RECOVERY_STATE_IDLE
+    network_window_samples: int = 0
+    network_window_failures: int = 0
+    network_loss_percent: float = 0.0
+    network_soft_reboot_attempts: int = 0
+    network_episode_at: float = 0.0
+    network_soft_reboot_last_try_at: float = 0.0
+    network_shared_suspected: bool = False
 
     @property
     def identity(self) -> Tuple[Any, ...]:
@@ -372,6 +383,15 @@ class PowerCycleRequest:
             self.measurement_session_id,
             self.error_reboot_attempts,
             int(self.error_since_at),
+            self.network_state,
+            self.network_recovery_state,
+            self.network_window_samples,
+            self.network_window_failures,
+            int(self.network_loss_percent * 100),
+            self.network_soft_reboot_attempts,
+            int(self.network_episode_at),
+            int(self.network_soft_reboot_last_try_at),
+            self.network_shared_suspected,
         )
 
     @classmethod
@@ -411,6 +431,17 @@ class PowerCycleRequest:
             error_reboot_attempts,
             error_since_at,
         ) = _error_recovery_evidence(payload, recovery_reason)
+        (
+            network_state,
+            network_recovery_state,
+            network_window_samples,
+            network_window_failures,
+            network_loss_percent,
+            network_soft_reboot_attempts,
+            network_episode_at,
+            network_soft_reboot_last_try_at,
+            network_shared_suspected,
+        ) = _network_recovery_evidence(payload, recovery_reason)
         session_reset_attempts = _integer(
             payload, "session_reset_attempts", default=0, minimum=0, maximum=255
         )
@@ -471,6 +502,23 @@ class PowerCycleRequest:
             raise ValueError(
                 "ERROR_REBOOT_EXHAUSTED request violates the 3s Error confirmation"
             )
+        if recovery_reason == RECOVERY_REASON_NETWORK:
+            if network_recovery_state != RECOVERY_STATE_REQUIRED:
+                raise ValueError(
+                    "NETWORK_RECOVERY_EXHAUSTED requires POWER_CYCLE_REQUIRED state"
+                )
+            if network_state not in ("NET_UNSTABLE", "NET_UNREACHABLE"):
+                raise ValueError(
+                    "NETWORK_RECOVERY_EXHAUSTED requires NET_UNSTABLE or NET_UNREACHABLE"
+                )
+            if network_window_failures < 2 or network_soft_reboot_attempts < 3:
+                raise ValueError(
+                    "NETWORK_RECOVERY_EXHAUSTED requires two rolling failures and three soft reboots"
+                )
+            if network_episode_at <= 0 or detected_at < network_episode_at:
+                raise ValueError(
+                    "NETWORK_RECOVERY_EXHAUSTED requires ordered network episode evidence"
+                )
         if detected_at > timestamp + _EVENT_TIME_FUTURE_TOLERANCE_SECONDS:
             raise ValueError("power-cycle detection follows request timestamp")
         broadcast_fresh = payload.get("broadcast_fresh")
@@ -478,7 +526,8 @@ class PowerCycleRequest:
             raise ValueError("broadcast_fresh must be a boolean in request")
         expected_broadcast_fresh = recovery_reason == RECOVERY_REASON_HANDSHAKE
         if (
-            recovery_reason != RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED
+            recovery_reason
+            not in (RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED, RECOVERY_REASON_NETWORK)
             and broadcast_fresh is not expected_broadcast_fresh
         ):
             raise ValueError(
@@ -529,6 +578,15 @@ class PowerCycleRequest:
             measurement_session_id=measurement_session_id,
             error_reboot_attempts=error_reboot_attempts,
             error_since_at=error_since_at,
+            network_state=network_state,
+            network_recovery_state=network_recovery_state,
+            network_window_samples=network_window_samples,
+            network_window_failures=network_window_failures,
+            network_loss_percent=network_loss_percent,
+            network_soft_reboot_attempts=network_soft_reboot_attempts,
+            network_episode_at=network_episode_at,
+            network_soft_reboot_last_try_at=network_soft_reboot_last_try_at,
+            network_shared_suspected=network_shared_suspected,
         )
 
     @classmethod
@@ -628,10 +686,12 @@ def _recovery_reason(
         RECOVERY_REASON_NORMAL_DROPOUT,
         RECOVERY_REASON_STARTUP_MISSING,
         RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED,
+        RECOVERY_REASON_NETWORK,
     ):
         raise ValueError(
             "recovery_reason must be NONE, HANDSHAKE_STUCK, WAKE_DROPOUT, "
-            "NORMAL_DROPOUT, STARTUP_MISSING, or ERROR_REBOOT_EXHAUSTED"
+            "NORMAL_DROPOUT, STARTUP_MISSING, ERROR_REBOOT_EXHAUSTED, or "
+            "NETWORK_RECOVERY_EXHAUSTED"
         )
     return value
 
@@ -804,6 +864,87 @@ def _error_recovery_evidence(
     return measurement_session_id, error_reboot_attempts, error_since_at
 
 
+def _network_recovery_evidence(
+    payload: Mapping[str, Any], recovery_reason: str
+) -> Tuple[str, str, int, int, float, int, float, float, bool]:
+    """Validate the independent ARP/ICMP watchdog evidence.
+
+    Network recovery is deliberately independent from handshake and point
+    cloud evidence: a radar may still report PowerSaving while its Ethernet
+    path is already dropping packets.  The Driver must first spend the
+    bounded soft-reboot budget before the relay manager accepts this cause.
+    """
+
+    network_state = payload.get("network_state", "UNKNOWN")
+    network_recovery_state = payload.get(
+        "network_recovery_state", RECOVERY_STATE_IDLE
+    )
+    if not isinstance(network_state, str) or not network_state:
+        raise ValueError("network_state must be a non-empty string")
+    if not isinstance(network_recovery_state, str) or not network_recovery_state:
+        raise ValueError("network_recovery_state must be a non-empty string")
+    network_window_samples = _integer(
+        payload, "network_window_samples", default=0, minimum=0
+    )
+    network_window_failures = _integer(
+        payload, "network_window_failures", default=0, minimum=0
+    )
+    network_loss_percent = _number(
+        payload, "network_loss_percent", default=0.0, minimum=0, maximum=100
+    )
+    network_soft_reboot_attempts = _integer(
+        payload, "network_soft_reboot_attempts", default=0, minimum=0, maximum=255
+    )
+    network_episode_at = _number(
+        payload, "network_episode_at", default=0, minimum=0
+    )
+    network_soft_reboot_last_try_at = _number(
+        payload, "network_soft_reboot_last_try_at", default=0, minimum=0
+    )
+    network_shared_suspected = payload.get("network_shared_suspected", False)
+    if not isinstance(network_shared_suspected, bool):
+        raise ValueError("network_shared_suspected must be a boolean")
+    present = (
+        network_state != "UNKNOWN"
+        or network_recovery_state != RECOVERY_STATE_IDLE
+        or network_window_samples != 0
+        or network_window_failures != 0
+        or network_loss_percent != 0
+        or network_soft_reboot_attempts != 0
+        or network_episode_at != 0
+        or network_soft_reboot_last_try_at != 0
+        or network_shared_suspected
+    )
+    if recovery_reason == RECOVERY_REASON_NETWORK:
+        if not present:
+            raise ValueError(
+                "NETWORK_RECOVERY_EXHAUSTED requires network evidence"
+            )
+    elif present and (
+        network_recovery_state != RECOVERY_STATE_IDLE
+        or network_window_samples != 0
+        or network_window_failures != 0
+        or network_soft_reboot_attempts != 0
+        or network_episode_at != 0
+        or network_soft_reboot_last_try_at != 0
+        or network_shared_suspected
+    ):
+        raise ValueError(
+            "%s contains unrelated network recovery evidence" % recovery_reason
+        )
+    return (
+        network_state,
+        network_recovery_state,
+        network_window_samples,
+        network_window_failures,
+        network_loss_percent,
+        network_soft_reboot_attempts,
+        network_episode_at,
+        network_soft_reboot_last_try_at,
+        network_shared_suspected,
+    )
+
+
 def _wake_timing_evidence_valid(
     wake_started_at: float,
     wake_dropout_at: float,
@@ -949,6 +1090,17 @@ def _request_from_live_recovery_state(
             "recovery state is internally inconsistent: power-cycle "
             "detection follows state timestamp"
         )
+    (
+        network_state,
+        network_recovery_state,
+        network_window_samples,
+        network_window_failures,
+        network_loss_percent,
+        network_soft_reboot_attempts,
+        network_episode_at,
+        network_soft_reboot_last_try_at,
+        network_shared_suspected,
+    ) = _network_recovery_evidence(payload, recovery_reason)
     if recovery_reason == RECOVERY_REASON_ERROR_REBOOT_EXHAUSTED:
         if (
             connected is not True
@@ -961,6 +1113,11 @@ def _request_from_live_recovery_state(
                 "recovery state is internally inconsistent: "
                 "ERROR_REBOOT_EXHAUSTED requires a connected real handle in "
                 "Error and no point publication"
+            )
+    elif recovery_reason == RECOVERY_REASON_NETWORK:
+        if handle == 255:
+            raise ValueError(
+                "NETWORK_RECOVERY_EXHAUSTED requires a real handle"
             )
     elif (
         connected is not False
@@ -1021,6 +1178,20 @@ def _request_from_live_recovery_state(
             raise ValueError(
                 "recovery state is internally inconsistent: STARTUP_MISSING "
                 "requires synthetic handle 255 and no live link evidence"
+            )
+    elif recovery_reason == RECOVERY_REASON_NETWORK:
+        if (
+            handshake_state != RECOVERY_STATE_IDLE
+            or wake_state != RECOVERY_STATE_IDLE
+            or normal_state != RECOVERY_STATE_IDLE
+            or startup_state != RECOVERY_STATE_IDLE
+            or network_recovery_state != RECOVERY_STATE_REQUIRED
+            or network_state not in ("NET_UNSTABLE", "NET_UNREACHABLE")
+            or handle == 255
+        ):
+            raise ValueError(
+                "recovery state is internally inconsistent: "
+                "NETWORK_RECOVERY_EXHAUSTED requires only network evidence"
             )
     else:
         if (
@@ -1098,6 +1269,18 @@ def _request_from_live_recovery_state(
             "recovery state is internally inconsistent: "
             "ERROR_REBOOT_EXHAUSTED violates the 3s Error confirmation"
         )
+    if recovery_reason == RECOVERY_REASON_NETWORK:
+        if (
+            network_recovery_state != RECOVERY_STATE_REQUIRED
+            or network_state not in ("NET_UNSTABLE", "NET_UNREACHABLE")
+            or network_window_failures < 2
+            or network_soft_reboot_attempts < 3
+            or network_episode_at <= 0
+            or detected_at < network_episode_at
+        ):
+            raise ValueError(
+                "NETWORK_RECOVERY_EXHAUSTED violates network recovery evidence"
+            )
     event_id = "%s:%d:%d:%d" % (
         broadcast_code,
         driver_instance,
@@ -1128,6 +1311,15 @@ def _request_from_live_recovery_state(
         measurement_session_id=measurement_session_id,
         error_reboot_attempts=error_reboot_attempts,
         error_since_at=error_since_at,
+        network_state=network_state,
+        network_recovery_state=network_recovery_state,
+        network_window_samples=network_window_samples,
+        network_window_failures=network_window_failures,
+        network_loss_percent=network_loss_percent,
+        network_soft_reboot_attempts=network_soft_reboot_attempts,
+        network_episode_at=network_episode_at,
+        network_soft_reboot_last_try_at=network_soft_reboot_last_try_at,
+        network_shared_suspected=network_shared_suspected,
     )
 
 
@@ -1692,10 +1884,10 @@ class StateStore:
                 "unexpected table(s) in dedicated state database: %s"
                 % ",".join(sorted(unknown))
             )
-        if version not in {0, 2, 3, 4, 5, 6, STATE_DB_SCHEMA_VERSION}:
+        if version not in {0, 2, 3, 4, 5, 6, 7, STATE_DB_SCHEMA_VERSION}:
             raise StateStoreError(
                 "unsupported state database schema version %d "
-                "(expected 2, 3, 4, 5, 6, or %d)"
+                "(expected 2, 3, 4, 5, 6, 7, or %d)"
                 % (version, STATE_DB_SCHEMA_VERSION)
             )
         if version == 2:
@@ -1782,10 +1974,11 @@ class StateStore:
                     "NOT NULL DEFAULT 'HANDSHAKE_STUCK' "
                     "CHECK(recovery_reason IN "
                     "('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',"
-                    "'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED'))" % table
+                    "'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED',"
+                    "'NETWORK_RECOVERY_EXHAUSTED'))" % table
                 )
 
-        if version in {4, 5}:
+        if version in {4, 5, 7}:
             # SQLite cannot widen a column CHECK constraint with ALTER TABLE.
             # Rebuild both reason-bearing tables inside this existing IMMEDIATE
             # transaction so a crash leaves either the complete old database or
@@ -1820,7 +2013,8 @@ class StateStore:
                       detail TEXT NOT NULL DEFAULT '',
                       recovery_reason TEXT NOT NULL CHECK(recovery_reason IN
                         ('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',
-                         'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED'))
+                         'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED',
+                         'NETWORK_RECOVERY_EXHAUSTED'))
                     )
                     """
                 )
@@ -1848,7 +2042,8 @@ class StateStore:
                       last_attempt REAL NOT NULL DEFAULT 0,
                       recovery_reason TEXT NOT NULL CHECK(recovery_reason IN
                         ('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',
-                         'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED'))
+                         'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED',
+                         'NETWORK_RECOVERY_EXHAUSTED'))
                     )
                     """
                 )
@@ -1918,7 +2113,8 @@ class StateStore:
               recovery_reason TEXT NOT NULL
                 CHECK(recovery_reason IN
                   ('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',
-                   'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED'))
+                   'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED',
+                   'NETWORK_RECOVERY_EXHAUSTED'))
             )
             """,
             """
@@ -1964,7 +2160,8 @@ class StateStore:
               recovery_reason TEXT NOT NULL
                 CHECK(recovery_reason IN
                   ('HANDSHAKE_STUCK','WAKE_DROPOUT','NORMAL_DROPOUT',
-                   'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED'))
+                   'STARTUP_MISSING','ERROR_REBOOT_EXHAUSTED',
+                   'NETWORK_RECOVERY_EXHAUSTED'))
             )
             """,
             """

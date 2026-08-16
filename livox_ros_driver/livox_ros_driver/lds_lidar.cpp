@@ -28,6 +28,7 @@
 #include <string.h>
 #include <time.h>
 #include <chrono>
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -71,6 +72,21 @@ const uint32_t kWakeBroadcastHandoffMinFrames =
 const int64_t kNormalHealthyArmNs = LdsLidar::NormalHealthyArmNs();
 const int64_t kNormalDropoutConfirmNs =
     LdsLidar::NormalDropoutConfirmNs();
+const int64_t kNetworkSoftRebootAckTimeoutNs = 2000000000LL;
+const int64_t kNetworkSoftRebootRetryNs = 5000000000LL;
+const uint8_t kNetworkSoftRebootMaxAttempts = 3;
+const int64_t kNetworkHealthStaleNs = 4000000000LL;
+
+int64_t SecondsToNs(double seconds, int64_t fallback) {
+  if (!(seconds > 0.0) || seconds > 300.0) {
+    return fallback;
+  }
+  const double ns = seconds * 1000000000.0;
+  if (ns < 1.0 || ns > 300000000000LL) {
+    return fallback;
+  }
+  return static_cast<int64_t>(ns);
+}
 
 /** Clear only live wake attribution. Process-lifetime episode/action counters
  *  remain available to the dashboard after recovery. */
@@ -121,6 +137,44 @@ void ClearNormalDropoutState(LdsLidar::LinkStat *s) {
   s->normal_dropout_counted_this_episode = false;
   s->normal_power_cycle_counted_this_episode = false;
   memset(s->normal_broadcast_code, 0, sizeof(s->normal_broadcast_code));
+}
+
+/** A shared physical power cycle starts a fresh network baseline.  Do not
+ * carry the pre-cycle watchdog episode into the new connection, otherwise a
+ * successful relay recovery can remain stuck in POWER_CYCLE_REQUIRED. */
+void ClearNetworkRecoveryState(LdsLidar::LinkStat *s) {
+  if (s == nullptr) {
+    return;
+  }
+  if (s->power_cycle_reason ==
+      LdsLidar::kPowerCycleReasonNetworkRecoveryExhausted) {
+    s->power_cycle_reason = LdsLidar::kPowerCycleReasonNone;
+  }
+  s->network_health_state = kNetworkHealthUnknown;
+  s->network_health_seen = false;
+  s->network_shared_suspected = false;
+  s->network_health_since_ns = 0;
+  s->network_last_health_ns = 0;
+  s->network_last_success_ns = 0;
+  s->network_window_samples = 0;
+  s->network_window_failures = 0;
+  s->network_consecutive_failures = 0;
+  s->network_consecutive_successes = 0;
+  s->network_loss_percent = 0.0;
+  s->network_rtt_ms = 0.0;
+  s->network_recovery_state = LdsLidar::kNetworkRecoveryIdle;
+  s->network_soft_reboot_attempts = 0;
+  s->network_soft_reboot_episode_ns = 0;
+  s->network_soft_reboot_episode_wall_s = 0;
+  s->network_soft_reboot_last_try_ns = 0;
+  s->network_soft_reboot_last_try_wall_s = 0;
+  s->network_soft_reboot_generation = 0;
+  s->network_soft_reboot_inflight = false;
+  s->network_soft_reboot_ack = false;
+  s->network_soft_reboot_disconnect = false;
+  s->network_soft_reboot_reconnected = false;
+  s->network_soft_reboot_status = 0;
+  s->network_soft_reboot_response = 0;
 }
 
 NormalDropoutPolicyInput BuildNormalDropoutPolicyInput(
@@ -278,7 +332,15 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
   s.handshake_event_valid = false;
   s.handshake_last_network_error_ns = 0;
   s.power_cycle_required_counted_this_episode = false;
-  s.power_cycle_reason = kPowerCycleReasonNone;
+  const bool network_hard_recovery =
+      s.network_recovery_state == kNetworkRecoveryPowerCycleRequired;
+  if (network_hard_recovery) {
+    ClearNetworkRecoveryState(&s);
+  }
+  if (s.network_recovery_state != kNetworkRecoverySoftRebootPending &&
+      s.network_recovery_state != kNetworkRecoverySoftRebootVerifying) {
+    s.power_cycle_reason = kPowerCycleReasonNone;
+  }
   /** A real Connect is recovery evidence. In particular, clear a wake edge
    *  after relay ON so the pre-cycle Normal request cannot create a second
    *  dropout episode on the new connection. */
@@ -407,11 +469,17 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
     s.handshake_state = kHandshakeLinkIdle;
     s.power_cycle_reason = kPowerCycleReasonNone;
     s.power_cycle_required_counted_this_episode = false;
+    ClearNetworkRecoveryState(&s);
   } else if (planned_reboot_disconnect) {
     /** This disconnect belongs to an explicit software reboot, not to the
      *  earlier wake command. It must never grant shared-relay permission. */
     ClearWakeRecoveryState(&s);
     ClearNormalDropoutState(&s);
+    if (s.network_soft_reboot_generation == current_generation) {
+      s.network_soft_reboot_disconnect = true;
+      s.network_soft_reboot_inflight = false;
+      s.network_recovery_state = kNetworkRecoverySoftRebootVerifying;
+    }
     s.planned_reboot_generation = 0;
   } else if (s.wake_state == kWakeRecoveryObserving) {
     const bool same_identity =
@@ -1381,16 +1449,22 @@ livox_status LdsLidar::RequestLidarModeChange(uint8_t handle, LidarMode mode,
 }
 
 livox_status LdsLidar::RequestLidarReboot(uint8_t handle, uint16_t timeout_ms) {
-  return RequestLidarRebootImpl(handle, timeout_ms, false);
+  return RequestLidarRebootImpl(handle, timeout_ms, false, false);
 }
 
 livox_status LdsLidar::RequestLidarRebootIfModeIdle(
     uint8_t handle, uint16_t timeout_ms) {
-  return RequestLidarRebootImpl(handle, timeout_ms, true);
+  return RequestLidarRebootImpl(handle, timeout_ms, true, false);
+}
+
+livox_status LdsLidar::RequestNetworkLidarReboot(uint8_t handle,
+                                                  uint16_t timeout_ms) {
+  return RequestLidarRebootImpl(handle, timeout_ms, true, true);
 }
 
 livox_status LdsLidar::RequestLidarRebootImpl(
-    uint8_t handle, uint16_t timeout_ms, bool require_mode_idle) {
+    uint8_t handle, uint16_t timeout_ms, bool require_mode_idle,
+    bool network_reboot) {
   if (handle >= kMaxLidarCount) {
     return kStatusInvalidHandle;
   }
@@ -1417,7 +1491,18 @@ livox_status LdsLidar::RequestLidarRebootImpl(
   }
   {
     lock_guard<mutex> lock(link_stat_lock_[handle]);
-    link_stat_[handle].planned_reboot_generation = reboot_generation;
+    LinkStat &s = link_stat_[handle];
+    s.planned_reboot_generation = reboot_generation;
+    if (network_reboot) {
+      s.network_soft_reboot_generation = reboot_generation;
+      s.network_soft_reboot_inflight = true;
+      s.network_soft_reboot_ack = false;
+      s.network_soft_reboot_disconnect = false;
+      s.network_soft_reboot_reconnected = false;
+      s.network_soft_reboot_status = 0;
+      s.network_soft_reboot_response = 0;
+      s.network_recovery_state = kNetworkRecoverySoftRebootVerifying;
+    }
   }
   /** Arm the competing-cause marker before entering the SDK, so even a
    *  synchronous disconnect cannot be attributed to the earlier wake. A
@@ -1431,12 +1516,311 @@ livox_status LdsLidar::RequestLidarRebootImpl(
     if (s.planned_reboot_generation == reboot_generation) {
       s.planned_reboot_generation = 0;
       if (status == kStatusSuccess) {
-        ClearWakeRecoveryState(&s);
-        ClearNormalDropoutState(&s);
+        if (!network_reboot) {
+          ClearWakeRecoveryState(&s);
+          ClearNormalDropoutState(&s);
+        }
       }
+    }
+    if (network_reboot && s.network_soft_reboot_generation == reboot_generation &&
+        status != kStatusSuccess) {
+      s.network_soft_reboot_inflight = false;
+      s.network_soft_reboot_status = status;
+      s.network_recovery_state = kNetworkRecoveryWaiting;
     }
   }
   return status;
+}
+
+void LdsLidar::ApplyNetworkHealthJson(const std::string &json) {
+  rapidjson::Document doc;
+  doc.Parse(json.c_str());
+  if (doc.HasParseError() || !doc.IsObject() ||
+      !doc.HasMember("type") || !doc["type"].IsString() ||
+      std::string(doc["type"].GetString()) != "LIVOX_NETWORK_HEALTH" ||
+      !doc.HasMember("devices") || !doc["devices"].IsArray()) {
+    return;
+  }
+  const bool shared = doc.HasMember("shared_network_suspected") &&
+                      doc["shared_network_suspected"].IsBool() &&
+                      doc["shared_network_suspected"].GetBool();
+  uint8_t soft_max_attempts = kNetworkSoftRebootMaxAttempts;
+  if (doc.HasMember("soft_reboot_max_attempts") &&
+      doc["soft_reboot_max_attempts"].IsUint()) {
+    const unsigned value = doc["soft_reboot_max_attempts"].GetUint();
+    if (value >= 3 && value <= 10) {
+      soft_max_attempts = static_cast<uint8_t>(value);
+    }
+  }
+  int64_t soft_interval_ns = kNetworkSoftRebootRetryNs;
+  if (doc.HasMember("soft_reboot_interval_seconds") &&
+      doc["soft_reboot_interval_seconds"].IsNumber()) {
+    soft_interval_ns = SecondsToNs(
+        doc["soft_reboot_interval_seconds"].GetDouble(),
+        kNetworkSoftRebootRetryNs);
+    if (soft_interval_ns < 2000000000LL || soft_interval_ns > 30000000000LL) {
+      soft_interval_ns = kNetworkSoftRebootRetryNs;
+    }
+  }
+  int64_t soft_ack_timeout_ns = kNetworkSoftRebootAckTimeoutNs;
+  if (doc.HasMember("soft_reboot_ack_timeout_seconds") &&
+      doc["soft_reboot_ack_timeout_seconds"].IsNumber()) {
+    soft_ack_timeout_ns = SecondsToNs(
+        doc["soft_reboot_ack_timeout_seconds"].GetDouble(),
+        kNetworkSoftRebootAckTimeoutNs);
+    if (soft_ack_timeout_ns < 500000000LL ||
+        soft_ack_timeout_ns >= soft_interval_ns) {
+      soft_ack_timeout_ns = kNetworkSoftRebootAckTimeoutNs;
+    }
+  }
+  if (soft_ack_timeout_ns >= soft_interval_ns) {
+    soft_ack_timeout_ns = std::max<int64_t>(500000000LL, soft_interval_ns / 2);
+  }
+  const int64_t soft_deadline_ns =
+      soft_interval_ns * static_cast<int64_t>(soft_max_attempts);
+  const int64_t now =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  for (rapidjson::SizeType i = 0; i < doc["devices"].Size(); ++i) {
+    const rapidjson::Value &row = doc["devices"][i];
+    if (!row.IsObject() || !row.HasMember("broadcast_code") ||
+        !row["broadcast_code"].IsString()) {
+      continue;
+    }
+    const char *code = row["broadcast_code"].GetString();
+    int handle = -1;
+    if (row.HasMember("handle") && row["handle"].IsInt()) {
+      handle = row["handle"].GetInt();
+    }
+    bool handle_matches = false;
+    if (handle >= 0 && handle < kMaxLidarCount) {
+      lock_guard<mutex> lock(link_stat_lock_[handle]);
+      handle_matches = link_stat_[handle].broadcast_code[0] != '\0' &&
+                       strncmp(link_stat_[handle].broadcast_code, code,
+                               sizeof(link_stat_[handle].broadcast_code)) == 0;
+    }
+    if (handle < 0 || handle >= kMaxLidarCount || !handle_matches) {
+      handle = -1;
+      for (uint8_t h = 0; h < kMaxLidarCount; ++h) {
+        lock_guard<mutex> lock(link_stat_lock_[h]);
+        if (strncmp(link_stat_[h].broadcast_code, code,
+                    sizeof(link_stat_[h].broadcast_code)) == 0) {
+          handle = h;
+          break;
+        }
+      }
+    }
+    if (handle < 0 || handle >= kMaxLidarCount) {
+      continue;
+    }
+    NetworkHealthState state = kNetworkHealthUnknown;
+    if (row.HasMember("state") && row["state"].IsString()) {
+      const std::string state_text = row["state"].GetString();
+      if (state_text == "NET_OK") {
+        state = kNetworkHealthOk;
+      } else if (state_text == "NET_DEGRADED") {
+        state = kNetworkHealthDegraded;
+      } else if (state_text == "NET_UNSTABLE") {
+        state = kNetworkHealthUnstable;
+      } else if (state_text == "NET_UNREACHABLE") {
+        state = kNetworkHealthUnreachable;
+      }
+    }
+    lock_guard<mutex> lock(link_stat_lock_[handle]);
+    LinkStat &s = link_stat_[handle];
+    if (strncmp(s.broadcast_code, code, sizeof(s.broadcast_code)) != 0) {
+      continue;
+    }
+    s.network_health_seen = true;
+    s.network_shared_suspected = shared;
+    s.network_soft_reboot_max_attempts = soft_max_attempts;
+    s.network_soft_reboot_interval_ns = soft_interval_ns;
+    s.network_soft_reboot_ack_timeout_ns = soft_ack_timeout_ns;
+    s.network_soft_recovery_deadline_ns = soft_deadline_ns;
+    s.network_health_state = state;
+    s.network_last_health_ns = now;
+    if (row.HasMember("window_samples") && row["window_samples"].IsUint()) {
+      s.network_window_samples = row["window_samples"].GetUint();
+    }
+    if (row.HasMember("window_failures") && row["window_failures"].IsUint()) {
+      s.network_window_failures = row["window_failures"].GetUint();
+    }
+    if (row.HasMember("consecutive_failures") &&
+        row["consecutive_failures"].IsUint()) {
+      s.network_consecutive_failures = row["consecutive_failures"].GetUint();
+    }
+    if (row.HasMember("consecutive_successes") &&
+        row["consecutive_successes"].IsUint()) {
+      s.network_consecutive_successes = row["consecutive_successes"].GetUint();
+    }
+    if (row.HasMember("loss_percent") && row["loss_percent"].IsNumber()) {
+      s.network_loss_percent = row["loss_percent"].GetDouble();
+    }
+    if (row.HasMember("rtt_ms") && row["rtt_ms"].IsNumber()) {
+      s.network_rtt_ms = row["rtt_ms"].GetDouble();
+    }
+    if (row.HasMember("success") && row["success"].IsBool() &&
+        row["success"].GetBool()) {
+      s.network_last_success_ns = now;
+    }
+  }
+}
+
+void LdsLidar::TickNetworkRecovery(bool enable_recovery) {
+  const int64_t now =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  for (uint8_t handle = 0; handle < kMaxLidarCount; ++handle) {
+    bool request_reboot = false;
+    bool commit_power = false;
+    uint64_t expected_generation = 0;
+    uint8_t attempt_number = 0;
+    uint8_t max_attempts = kNetworkSoftRebootMaxAttempts;
+    int64_t episode_since = 0;
+    char broadcast_code[kBroadcastCodeSize] = {0};
+    {
+      lock_guard<mutex> lock(link_stat_lock_[handle]);
+      LinkStat &s = link_stat_[handle];
+      if (!s.network_health_seen ||
+          now - s.network_last_health_ns > kNetworkHealthStaleNs) {
+        if (s.network_recovery_state != kNetworkRecoveryPowerCycleRequired) {
+          s.network_health_state = kNetworkHealthUnknown;
+          s.network_recovery_state = kNetworkRecoveryIdle;
+          s.network_soft_reboot_attempts = 0;
+          s.network_soft_reboot_episode_ns = 0;
+          s.network_soft_reboot_episode_wall_s = 0;
+          s.network_soft_reboot_last_try_ns = 0;
+          s.network_soft_reboot_last_try_wall_s = 0;
+          s.network_soft_reboot_inflight = false;
+        }
+        continue;
+      }
+      const bool bad = s.network_health_state == kNetworkHealthUnstable ||
+                       s.network_health_state == kNetworkHealthUnreachable;
+      if (!bad) {
+        if (s.network_health_state == kNetworkHealthOk &&
+            s.network_consecutive_successes >= 5 &&
+            s.network_recovery_state != kNetworkRecoveryPowerCycleRequired) {
+          s.network_recovery_state = kNetworkRecoveryIdle;
+          s.network_soft_reboot_attempts = 0;
+          s.network_soft_reboot_episode_ns = 0;
+          s.network_soft_reboot_episode_wall_s = 0;
+          s.network_soft_reboot_last_try_ns = 0;
+          s.network_soft_reboot_last_try_wall_s = 0;
+          s.network_soft_reboot_inflight = false;
+          s.network_soft_reboot_ack = false;
+          s.network_soft_reboot_disconnect = false;
+          s.network_soft_reboot_reconnected = false;
+        }
+        continue;
+      }
+      if (s.network_soft_reboot_episode_ns == 0) {
+        s.network_soft_reboot_episode_ns = now;
+        s.network_soft_reboot_episode_wall_s = static_cast<int64_t>(time(nullptr));
+        s.network_health_since_ns = now;
+        s.network_recovery_state = kNetworkRecoveryWaiting;
+      }
+      episode_since = s.network_soft_reboot_episode_ns;
+      strncpy(broadcast_code, s.broadcast_code, sizeof(broadcast_code) - 1);
+      if (s.network_recovery_state == kNetworkRecoveryPowerCycleRequired) {
+        continue;
+      }
+      if (s.network_soft_reboot_inflight &&
+          now - s.network_soft_reboot_last_try_ns >=
+              s.network_soft_reboot_ack_timeout_ns) {
+        s.network_soft_reboot_inflight = false;
+        s.network_recovery_state = kNetworkRecoveryWaiting;
+      }
+      const bool deadline =
+          now - episode_since >= s.network_soft_recovery_deadline_ns;
+      if (enable_recovery && deadline &&
+          s.network_soft_reboot_attempts >=
+              s.network_soft_reboot_max_attempts) {
+        commit_power = true;
+      } else if (enable_recovery && !s.network_soft_reboot_inflight &&
+                 s.network_soft_reboot_attempts <
+                     s.network_soft_reboot_max_attempts &&
+                 (s.network_soft_reboot_last_try_ns == 0 ||
+                  now - s.network_soft_reboot_last_try_ns >=
+                      s.network_soft_reboot_interval_ns)) {
+        s.network_soft_reboot_attempts++;
+        s.network_soft_reboot_last_try_ns = now;
+        s.network_soft_reboot_last_try_wall_s = static_cast<int64_t>(time(nullptr));
+        s.network_soft_reboot_generation =
+            connection_generation_[handle].load(std::memory_order_acquire);
+        s.network_soft_reboot_inflight = true;
+        s.network_soft_reboot_ack = false;
+        s.network_soft_reboot_disconnect = false;
+        s.network_soft_reboot_reconnected = false;
+        s.network_recovery_state = kNetworkRecoverySoftRebootPending;
+        expected_generation = s.network_soft_reboot_generation;
+        attempt_number = s.network_soft_reboot_attempts;
+        max_attempts = s.network_soft_reboot_max_attempts;
+        request_reboot = true;
+      }
+    }
+    if (commit_power) {
+      const int64_t commit_now =
+          std::chrono::steady_clock::now().time_since_epoch().count();
+      bool committed = false;
+      uint8_t committed_max_attempts = kNetworkSoftRebootMaxAttempts;
+      {
+        lock_guard<mutex> lock(link_stat_lock_[handle]);
+        LinkStat &s = link_stat_[handle];
+        if (s.network_recovery_state != kNetworkRecoveryPowerCycleRequired &&
+            s.network_soft_reboot_episode_ns == episode_since &&
+            (s.network_health_state == kNetworkHealthUnstable ||
+             s.network_health_state == kNetworkHealthUnreachable) &&
+            s.network_soft_reboot_attempts >=
+                s.network_soft_reboot_max_attempts &&
+            commit_now - episode_since >= s.network_soft_recovery_deadline_ns) {
+          s.network_recovery_state = kNetworkRecoveryPowerCycleRequired;
+          s.power_cycle_reason = kPowerCycleReasonNetworkRecoveryExhausted;
+          s.power_cycle_required_count++;
+          if (!s.power_cycle_required_counted_this_episode) {
+            s.power_cycle_required_episode_count++;
+            s.power_cycle_required_counted_this_episode = true;
+          }
+          s.power_cycle_required_wall_s = static_cast<int64_t>(time(nullptr));
+          committed_max_attempts = s.network_soft_reboot_max_attempts;
+          committed = true;
+          strncpy(broadcast_code, s.broadcast_code,
+                  sizeof(broadcast_code) - 1);
+        }
+      }
+      if (committed) {
+        PrintLidarEvent(handle, broadcast_code, "NETWORK_POWER_CYCLE_REQUIRED");
+        HealthLogger::Get().LogEvent(
+            handle, broadcast_code, "POWER_CYCLE_REQUIRED",
+            "reason=NETWORK_RECOVERY_EXHAUSTED; configured soft-reboot "
+            "budget did not restore the 10s network window");
+        printf("[LivoxRecover] Lidar[%d][%s] network unstable after %u soft "
+               "reboots; physical group power cycle required\n",
+               handle, broadcast_code,
+               static_cast<unsigned>(committed_max_attempts));
+      }
+      continue;
+    }
+    if (!request_reboot) {
+      continue;
+    }
+    livox_status status = RequestNetworkLidarReboot(handle);
+    if (status != kStatusSuccess) {
+      lock_guard<mutex> lock(link_stat_lock_[handle]);
+      LinkStat &s = link_stat_[handle];
+      if (s.network_soft_reboot_generation == expected_generation) {
+        s.network_soft_reboot_inflight = false;
+        s.network_soft_reboot_status = status;
+        s.network_recovery_state = kNetworkRecoveryWaiting;
+      }
+    }
+    char detail[128];
+    snprintf(detail, sizeof(detail), "network soft reboot %u/%u returned %d",
+             static_cast<unsigned>(attempt_number),
+             static_cast<unsigned>(max_attempts), status);
+    printf("[LivoxRecover] Lidar[%d][%s] %s\n", handle, broadcast_code,
+           detail);
+    HealthLogger::Get().LogEvent(handle, broadcast_code, "NETWORK_REBOOT",
+                                 detail);
+  }
 }
 
 livox_status LdsLidar::RequestRestartSampling(uint8_t handle) {
@@ -3250,6 +3634,18 @@ void LdsLidar::RebootCb(livox_status status, uint8_t handle, uint8_t response,
                         void *client_data) {
   printf("Lidar[%d] reboot command status[%d] response[%d]\n", handle, status,
          response);
+  if (g_lds_ldiar == nullptr || handle >= kMaxLidarCount) {
+    return;
+  }
+  lock_guard<mutex> lock(g_lds_ldiar->link_stat_lock_[handle]);
+  LinkStat &s = g_lds_ldiar->link_stat_[handle];
+  if (s.network_soft_reboot_inflight) {
+    s.network_soft_reboot_inflight = false;
+    s.network_soft_reboot_ack = status == kStatusSuccess;
+    s.network_soft_reboot_status = status;
+    s.network_soft_reboot_response = response;
+    s.network_recovery_state = kNetworkRecoverySoftRebootVerifying;
+  }
 }
 
 void LdsLidar::SetPointCloudReturnModeCb(livox_status status, uint8_t handle,

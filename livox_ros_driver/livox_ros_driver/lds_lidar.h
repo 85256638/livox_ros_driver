@@ -41,6 +41,7 @@
 #include "lds.h"
 #include "livox_sdk.h"
 #include "measurement_session_policy.h"
+#include "network_health_policy.h"
 #include "point_cloud_outage_policy.h"
 #include "rapidjson/document.h"
 #include "timesync.h"
@@ -87,6 +88,10 @@ class LdsLidar : public Lds {
                                const char *broadcast_code);
   void RecordPointCloudPublished(uint8_t handle) override;
   void TickNormalDropoutRecovery(bool enable_recovery);
+  /** Apply one JSON frame from the isolated network-health probe. */
+  void ApplyNetworkHealthJson(const std::string &json);
+  /** Called at 1 Hz: aggressively recover a radar-specific network episode. */
+  void TickNetworkRecovery(bool enable_recovery);
   static int64_t HandshakeBroadcastFreshNs() { return 3000000000LL; }
   static uint8_t HandshakeResetMaxAttempts() { return 1; }
   static int64_t WakeObservationNs() { return 60000000000LL; }
@@ -121,6 +126,10 @@ class LdsLidar : public Lds {
    *  send race. Manual reboot remains an explicit override. */
   livox_status RequestLidarRebootIfModeIdle(uint8_t handle,
                                             uint16_t timeout_ms = 100);
+  /** Network watchdog variant. The reboot callback and planned disconnect are
+   *  tracked separately so an unconfirmed UDP command can be retried safely. */
+  livox_status RequestNetworkLidarReboot(uint8_t handle,
+                                         uint16_t timeout_ms = 100);
   livox_status RequestRestartSampling(uint8_t handle);
   /** True while this lidar has an unfinished Normal/PowerSaving/Standby
    *  request. Thread-safe; used by recovery code to avoid fighting a planned
@@ -180,7 +189,16 @@ class LdsLidar : public Lds {
     kPowerCycleReasonWakeDropout,
     kPowerCycleReasonNormalDropout,
     kPowerCycleReasonErrorRebootExhausted,
-    kPowerCycleReasonStartupMissing
+    kPowerCycleReasonStartupMissing,
+    kPowerCycleReasonNetworkRecoveryExhausted
+  };
+
+  enum NetworkRecoveryState {
+    kNetworkRecoveryIdle = 0,
+    kNetworkRecoveryWaiting,
+    kNetworkRecoverySoftRebootPending,
+    kNetworkRecoverySoftRebootVerifying,
+    kNetworkRecoveryPowerCycleRequired
   };
 
   struct LinkStat {
@@ -325,6 +343,36 @@ class LdsLidar : public Lds {
     uint32_t handshake_rejected_count = 0;
     uint32_t handshake_network_error_count = 0;
     uint32_t handshake_protocol_error_count = 0;
+    /** Network health is supplied by the isolated ARP/ICMP monitor. */
+    NetworkHealthState network_health_state = kNetworkHealthUnknown;
+    bool network_health_seen = false;
+    bool network_shared_suspected = false;
+    int64_t network_health_since_ns = 0;
+    int64_t network_last_health_ns = 0;
+    int64_t network_last_success_ns = 0;
+    uint32_t network_window_samples = 0;
+    uint32_t network_window_failures = 0;
+    uint32_t network_consecutive_failures = 0;
+    uint32_t network_consecutive_successes = 0;
+    double network_loss_percent = 0.0;
+    double network_rtt_ms = 0.0;
+    NetworkRecoveryState network_recovery_state = kNetworkRecoveryIdle;
+    uint8_t network_soft_reboot_attempts = 0;
+    uint8_t network_soft_reboot_max_attempts = 3;
+    int64_t network_soft_reboot_interval_ns = 5000000000LL;
+    int64_t network_soft_reboot_ack_timeout_ns = 2000000000LL;
+    int64_t network_soft_recovery_deadline_ns = 15000000000LL;
+    int64_t network_soft_reboot_episode_ns = 0;
+    int64_t network_soft_reboot_episode_wall_s = 0;
+    int64_t network_soft_reboot_last_try_ns = 0;
+    int64_t network_soft_reboot_last_try_wall_s = 0;
+    uint64_t network_soft_reboot_generation = 0;
+    bool network_soft_reboot_inflight = false;
+    bool network_soft_reboot_ack = false;
+    bool network_soft_reboot_disconnect = false;
+    bool network_soft_reboot_reconnected = false;
+    int32_t network_soft_reboot_status = 0;
+    uint8_t network_soft_reboot_response = 0;
   };
   LinkStat link_stat_[kMaxLidarCount];
   /** SDK event callbacks update LinkStat concurrently with the 1 Hz dashboard
@@ -342,7 +390,8 @@ class LdsLidar : public Lds {
                           uint64_t connection_generation);
   void CancelWakeObservation(uint8_t handle, uint64_t expected_request_id = 0);
   livox_status RequestLidarRebootImpl(uint8_t handle, uint16_t timeout_ms,
-                                      bool require_mode_idle);
+                                      bool require_mode_idle,
+                                      bool network_reboot = false);
 
   struct ModeChangeRequest {
     ModeChangeRequest() {
