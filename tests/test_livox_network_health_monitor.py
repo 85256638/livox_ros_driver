@@ -27,6 +27,51 @@ SPEC.loader.exec_module(MONITOR)
 
 
 class NetworkHealthMonitorTests(unittest.TestCase):
+    def test_roslaunch_remap_arguments_are_filtered_before_argparse(self):
+        args = [
+            "--config",
+            "/tmp/network_health.json",
+            "/livox/lidar_a:=/livox/lidar_site",
+            "__name:=livox_network_health_monitor",
+            "__log:=/tmp/monitor.log",
+        ]
+        self.assertEqual(
+            MONITOR._strip_ros_remap_args(args),
+            ["--config", "/tmp/network_health.json"],
+        )
+
+    def test_main_accepts_roslaunch_remaps_with_validate_config(self):
+        raw = {
+            "schema_version": 1,
+            "probe_interval_seconds": 1,
+            "window_seconds": 5,
+            "unstable_failures": 2,
+            "unreachable_consecutive_failures": 3,
+            "healthy_consecutive_successes": 5,
+            "soft_reboot_max_attempts": 3,
+            "soft_reboot_interval_seconds": 5,
+            "soft_reboot_ack_timeout_seconds": 2,
+            "targets": [
+                {
+                    "broadcast_code": "EXAMPLE00000001",
+                    "ip": "192.168.31.52",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "network_health.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            result = MONITOR.main(
+                [
+                    "--config",
+                    str(path),
+                    "--validate-config",
+                    "/livox/lidar_a:=/livox/lidar_site",
+                    "__name:=livox_network_health_monitor",
+                ]
+            )
+        self.assertEqual(result, 0)
+
     def test_window_states_and_recovery_boundaries(self):
         window = MONITOR.TargetWindow(5.0, 2, 3, 5)
         self.assertEqual(window.observe(True, 1.0)["state"], MONITOR.STATE_UNKNOWN)

@@ -17,6 +17,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -44,6 +45,22 @@ SAFE_IP = re.compile(r"^[0-9a-fA-F:.]+$")
 
 class ConfigurationError(ValueError):
     pass
+
+
+def _strip_ros_remap_args(argv: Sequence[str]) -> List[str]:
+    """Remove ROS launch remap/private-name arguments before argparse.
+
+    roslaunch appends topic remaps and private arguments such as
+    ``/livox/lidar_x:=/livox/lidar_site`` and ``__name:=...`` to every node
+    command.  They are consumed by rospy, not by this monitor's CLI parser.
+    Keep all normal arguments intact so real configuration typos still fail.
+    """
+
+    return [
+        value
+        for value in argv
+        if not (":=" in value and not value.startswith("--"))
+    ]
 
 
 def _number(data: Mapping[str, Any], key: str, default: float, minimum: float, maximum: float) -> float:
@@ -321,7 +338,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--validate-config", action="store_true")
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(_strip_ros_remap_args(raw_argv))
     try:
         config = load_config(args.config)
     except ConfigurationError as exc:
