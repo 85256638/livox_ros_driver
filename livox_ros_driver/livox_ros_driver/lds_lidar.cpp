@@ -1791,7 +1791,7 @@ void LdsLidar::TickNetworkRecovery(bool enable_recovery) {
         HealthLogger::Get().LogEvent(
             handle, broadcast_code, "POWER_CYCLE_REQUIRED",
             "reason=NETWORK_RECOVERY_EXHAUSTED; configured soft-reboot "
-            "budget did not restore the 10s network window");
+            "budget did not restore the configured network window");
         printf("[LivoxRecover] Lidar[%d][%s] network unstable after %u soft "
                "reboots; physical group power cycle required\n",
                handle, broadcast_code,

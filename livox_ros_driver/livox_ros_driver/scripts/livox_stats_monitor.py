@@ -847,7 +847,12 @@ def _compose_compact_dashboard(
     _preamble, sections, _order = _split_driver_sections(stats_text)
     devices = _parse_device_rows(sections.get("CURRENT DEVICES", []))
     recent = _parse_recent_rows(sections.get("RECENT 60 SECONDS", []))
-    network = _parse_network_rows(sections.get("NETWORK HEALTH (10s)", []))
+    network_lines = sections.get("NETWORK HEALTH (5s)")
+    if network_lines is None:
+        # Accept one older full-layout frame while the Driver is being
+        # upgraded; new output is always labeled NETWORK HEALTH (5s).
+        network_lines = sections.get("NETWORK HEALTH (10s)", [])
+    network = _parse_network_rows(network_lines)
     measurement = _parse_measurement_rows(
         sections.get("MEASUREMENT RECOVERY", [])
     )
@@ -985,6 +990,7 @@ def _history_stats_text(stats_text):
     for name in (
         "SOFTWARE",
         "CURRENT ALERTS",
+        "NETWORK HEALTH (5s)",
         "NETWORK HEALTH (10s)",
         "MEASUREMENT RECOVERY",
         "PROCESS HISTORY",

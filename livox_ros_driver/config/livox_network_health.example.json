@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "probe_interval_seconds": 1,
-  "window_seconds": 10,
+  "window_seconds": 5,
   "unstable_failures": 2,
   "unreachable_consecutive_failures": 3,
   "healthy_consecutive_successes": 5,

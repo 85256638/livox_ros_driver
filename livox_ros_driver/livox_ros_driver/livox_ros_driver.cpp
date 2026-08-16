@@ -2297,8 +2297,9 @@ void StatsTimerCb(const ros::TimerEvent &) {
         "but dropped by Driver queue\n"
      << "  handshake_timeouts=SDK handshake attempts, not independent fault "
         "episodes\n"
-     << "==================== NETWORK HEALTH (10s) =========\n"
-     << "  ARP/ICMP probe; 2 failures inside 10s => NET_UNSTABLE; "
+     << "==================== NETWORK HEALTH (5s) =========\n"
+     << "  ARP/ICMP probe; 1 loss=NET_DEGRADED; 2 failures inside 5s => "
+        "NET_UNSTABLE; 3 consecutive misses=NET_UNREACHABLE; "
         "soft reboot 3x before relay escalation\n"
      << network_table.str()
      << "==================== ASSESSMENT GUIDE ============\n"
@@ -2528,8 +2529,9 @@ int main(int argc, char **argv) {
              "and livox/lidar_recovery_state (1Hz)");
     ROS_INFO("Shared-power intent barrier: livox/group_power_cycle_intent -> "
              "livox/group_power_cycle_ack");
-    ROS_INFO("Network health monitor topic: livox/network_health (10s window, "
-             "2 losses => NET_UNSTABLE)");
+    ROS_INFO("Network health monitor topic: livox/network_health (5s window, "
+             "2 losses => NET_UNSTABLE; 3 consecutive misses => "
+             "NET_UNREACHABLE)");
     ROS_INFO("Auto-recover (no-data/Config/Error watchdogs): %s",
              g_auto_recover ? "ENABLED" : "disabled");
     ROS_INFO("Handshake session recovery (broadcast-only watchdog): %s",

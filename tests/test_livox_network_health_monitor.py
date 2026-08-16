@@ -28,7 +28,7 @@ SPEC.loader.exec_module(MONITOR)
 
 class NetworkHealthMonitorTests(unittest.TestCase):
     def test_window_states_and_recovery_boundaries(self):
-        window = MONITOR.TargetWindow(10.0, 2, 3, 5)
+        window = MONITOR.TargetWindow(5.0, 2, 3, 5)
         self.assertEqual(window.observe(True, 1.0)["state"], MONITOR.STATE_UNKNOWN)
         for second in range(2, 5):
             window.observe(True, float(second))
@@ -36,15 +36,15 @@ class NetworkHealthMonitorTests(unittest.TestCase):
         self.assertEqual(window.observe(False, 6.0)["state"], MONITOR.STATE_DEGRADED)
         self.assertEqual(window.observe(False, 7.0)["state"], MONITOR.STATE_UNSTABLE)
         self.assertEqual(window.observe(False, 8.0)["state"], MONITOR.STATE_UNREACHABLE)
-        for second in range(19, 24):
+        for second in range(13, 18):
             state = window.observe(True, float(second))["state"]
         self.assertEqual(state, MONITOR.STATE_OK)
 
-    def test_config_requires_ten_second_window_and_four_targets(self):
+    def test_config_requires_five_second_window_and_four_targets(self):
         raw = {
             "schema_version": 1,
             "probe_interval_seconds": 1,
-            "window_seconds": 10,
+            "window_seconds": 5,
             "unstable_failures": 2,
             "unreachable_consecutive_failures": 3,
             "healthy_consecutive_successes": 5,
@@ -78,7 +78,7 @@ class NetworkHealthMonitorTests(unittest.TestCase):
             path = Path(tmp) / "network_health.json"
             path.write_text(json.dumps(raw), encoding="utf-8")
             config = MONITOR.load_config(str(path))
-        self.assertEqual(config.window_seconds, 10.0)
+        self.assertEqual(config.window_seconds, 5.0)
         self.assertEqual(config.probe_interval_seconds, 1.0)
         self.assertEqual(config.soft_reboot_max_attempts, 3)
         self.assertEqual(config.soft_reboot_interval_seconds, 5.0)

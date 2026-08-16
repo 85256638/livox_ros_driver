@@ -21,7 +21,7 @@ livox_ros::NetworkHealthPolicyResult Observe(
   return policy->Observe(input);
 }
 
-bool TestSlidingTenSecondWindow() {
+bool TestSlidingFiveSecondWindow() {
   livox_ros::NetworkHealthPolicy policy;
   livox_ros::NetworkHealthPolicyResult observing = Observe(&policy, 1, true);
   if (!Check(observing.state == livox_ros::kNetworkHealthUnknown,
@@ -48,9 +48,9 @@ bool TestSlidingTenSecondWindow() {
     return false;
   }
   livox_ros::NetworkHealthPolicyResult aged_out =
-      Observe(&policy, 18, true);
+      Observe(&policy, 13, true);
   return Check(aged_out.window_failures == 0,
-               "failures older than ten seconds must expire");
+               "failures older than five seconds must expire");
 }
 
 bool TestUnreachableAndRecoveryBoundaries() {
@@ -74,7 +74,7 @@ bool TestUnreachableAndRecoveryBoundaries() {
 }  // namespace
 
 int main() {
-  if (!TestSlidingTenSecondWindow()) return 1;
+  if (!TestSlidingFiveSecondWindow()) return 1;
   if (!TestUnreachableAndRecoveryBoundaries()) return 2;
   std::cout << "network_health_policy_qc: OK\n";
   return 0;

@@ -30,7 +30,7 @@ struct NetworkHealthPolicyResult {
 };
 
 /**
- * Sliding ten-second policy used by the independent network probe and the
+ * Sliding five-second policy used by the independent network probe and the
  * Driver's recovery gate. One failure is visible as DEGRADED; two failures in
  * the rolling window are UNSTABLE. Consecutive failures therefore trigger on
  * the second sample without waiting for the full window to expire, while a
@@ -38,7 +38,7 @@ struct NetworkHealthPolicyResult {
  */
 class NetworkHealthPolicy {
  public:
-  NetworkHealthPolicy(int64_t window_ns = 10000000000LL,
+  NetworkHealthPolicy(int64_t window_ns = 5000000000LL,
                       uint32_t unstable_failures = 2,
                       uint32_t unreachable_consecutive_failures = 3,
                       uint32_t healthy_consecutive_successes = 5)
