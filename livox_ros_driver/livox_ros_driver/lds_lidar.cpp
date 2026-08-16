@@ -177,6 +177,44 @@ void ClearNetworkRecoveryState(LdsLidar::LinkStat *s) {
   s->network_soft_reboot_response = 0;
 }
 
+/** Clear a network watchdog episode after the probe has verified recovery.
+ *
+ * Unlike ClearNetworkRecoveryState(), this deliberately keeps the current
+ * probe result (NET_OK, rolling window and success counters) visible to the
+ * dashboard.  A radar can recover on its own after the final soft reboot;
+ * keeping the old POWER_CYCLE_REQUIRED latch in that case produces an
+ * internally contradictory recovery-state frame and makes the relay manager
+ * reject the already-recovered event.
+ */
+void ClearRecoveredNetworkRecoveryState(LdsLidar::LinkStat *s) {
+  if (s == nullptr) {
+    return;
+  }
+  const bool network_reason =
+      s->power_cycle_reason ==
+      LdsLidar::kPowerCycleReasonNetworkRecoveryExhausted;
+  if (network_reason) {
+    s->power_cycle_reason = LdsLidar::kPowerCycleReasonNone;
+  }
+  s->network_recovery_state = LdsLidar::kNetworkRecoveryIdle;
+  s->network_health_since_ns = 0;
+  s->network_soft_reboot_attempts = 0;
+  s->network_soft_reboot_episode_ns = 0;
+  s->network_soft_reboot_episode_wall_s = 0;
+  s->network_soft_reboot_last_try_ns = 0;
+  s->network_soft_reboot_last_try_wall_s = 0;
+  s->network_soft_reboot_generation = 0;
+  s->network_soft_reboot_inflight = false;
+  s->network_soft_reboot_ack = false;
+  s->network_soft_reboot_disconnect = false;
+  s->network_soft_reboot_reconnected = false;
+  s->network_soft_reboot_status = 0;
+  s->network_soft_reboot_response = 0;
+  if (network_reason) {
+    s->power_cycle_required_counted_this_episode = false;
+  }
+}
+
 NormalDropoutPolicyInput BuildNormalDropoutPolicyInput(
     const LdsLidar::LinkStat &s, int64_t now_ns) {
   NormalDropoutPolicyInput input;
@@ -1688,17 +1726,18 @@ void LdsLidar::TickNetworkRecovery(bool enable_recovery) {
       if (!bad) {
         if (s.network_health_state == kNetworkHealthOk &&
             s.network_consecutive_successes >= 5 &&
-            s.network_recovery_state != kNetworkRecoveryPowerCycleRequired) {
-          s.network_recovery_state = kNetworkRecoveryIdle;
-          s.network_soft_reboot_attempts = 0;
-          s.network_soft_reboot_episode_ns = 0;
-          s.network_soft_reboot_episode_wall_s = 0;
-          s.network_soft_reboot_last_try_ns = 0;
-          s.network_soft_reboot_last_try_wall_s = 0;
-          s.network_soft_reboot_inflight = false;
-          s.network_soft_reboot_ack = false;
-          s.network_soft_reboot_disconnect = false;
-          s.network_soft_reboot_reconnected = false;
+            (s.network_recovery_state != kNetworkRecoveryIdle ||
+             s.network_soft_reboot_attempts != 0 ||
+             s.network_soft_reboot_episode_ns != 0 ||
+             s.network_soft_reboot_last_try_ns != 0 ||
+             s.power_cycle_reason ==
+                 kPowerCycleReasonNetworkRecoveryExhausted)) {
+          /** NET_OK is authoritative after the configured healthy-success
+           *  confirmation, including when the last soft reboot had already
+           *  latched POWER_CYCLE_REQUIRED.  Clear the live latch so the
+           *  recovery topic remains self-consistent and the manager can
+           *  archive a recovered request without attempting OFF/ON. */
+          ClearRecoveredNetworkRecoveryState(&s);
         }
         continue;
       }

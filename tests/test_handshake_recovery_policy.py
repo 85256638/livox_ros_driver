@@ -76,6 +76,33 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
         self.assertIn("kHandshakeNetworkErrorGateNs", CPP)
         self.assertIn("POWER_CYCLE_CANCELLED_NETWORK_ERROR", CPP)
 
+    def test_network_power_latch_clears_after_confirmed_recovery(self):
+        helper = CPP[
+            CPP.index("void ClearRecoveredNetworkRecoveryState(") :
+            CPP.index("NormalDropoutPolicyInput BuildNormalDropoutPolicyInput")
+        ]
+        self.assertIn(
+            "s->power_cycle_reason = LdsLidar::kPowerCycleReasonNone", helper
+        )
+        self.assertIn(
+            "s->network_recovery_state = LdsLidar::kNetworkRecoveryIdle",
+            helper,
+        )
+        self.assertIn("s->power_cycle_required_counted_this_episode = false", helper)
+        self.assertIn("network_soft_reboot_attempts = 0", helper)
+        self.assertNotIn("network_health_state = kNetworkHealthUnknown", helper)
+
+        tick = CPP[
+            CPP.index("void LdsLidar::TickNetworkRecovery") :
+            CPP.index("livox_status LdsLidar::RequestRestartSampling")
+        ]
+        self.assertIn("s.network_consecutive_successes >= 5", tick)
+        self.assertIn("ClearRecoveredNetworkRecoveryState(&s)", tick)
+        self.assertNotIn(
+            "s.network_recovery_state != kNetworkRecoveryPowerCycleRequired",
+            tick[tick.index("if (!bad)") : tick.index("if (s.network_soft_reboot_episode_ns")],
+        )
+
     def test_power_alert_is_revalidated_and_counted_only_at_commit(self):
         commit = CPP[
             CPP.index("if (power_cycle_candidate)") :
