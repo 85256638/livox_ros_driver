@@ -51,6 +51,7 @@ class NetworkHealthMonitorTests(unittest.TestCase):
             "soft_reboot_max_attempts": 3,
             "soft_reboot_interval_seconds": 5,
             "soft_reboot_ack_timeout_seconds": 2,
+            "soft_reboot_settle_seconds": 60,
             "targets": [
                 {
                     "broadcast_code": "EXAMPLE00000001",
@@ -96,6 +97,7 @@ class NetworkHealthMonitorTests(unittest.TestCase):
             "soft_reboot_max_attempts": 3,
             "soft_reboot_interval_seconds": 5,
             "soft_reboot_ack_timeout_seconds": 2,
+            "soft_reboot_settle_seconds": 60,
             "targets": [
                 {
                     "broadcast_code": "EXAMPLE00000001",
@@ -129,6 +131,7 @@ class NetworkHealthMonitorTests(unittest.TestCase):
         self.assertEqual(config.soft_reboot_max_attempts, 3)
         self.assertEqual(config.soft_reboot_interval_seconds, 5.0)
         self.assertEqual(config.soft_reboot_ack_timeout_seconds, 2.0)
+        self.assertEqual(config.soft_reboot_settle_seconds, 60.0)
         self.assertEqual(len(config.targets), 4)
         self.assertFalse(hasattr(config.targets[0], "handle"))
         self.assertFalse(hasattr(legacy_config.targets[0], "handle"))
@@ -144,6 +147,25 @@ class NetworkHealthMonitorTests(unittest.TestCase):
             1.0,
         )
         self.assertNotIn("handle", frame["devices"][0])
+        self.assertEqual(frame["soft_reboot_settle_seconds"], 60.0)
+
+    def test_settle_window_has_safe_bounds_and_legacy_default(self):
+        raw = {
+            "schema_version": 1,
+            "targets": [{"broadcast_code": "EXAMPLE00000001", "ip": "192.168.31.52"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "network_health.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            config = MONITOR.load_config(str(path))
+        self.assertEqual(config.soft_reboot_settle_seconds, 60.0)
+        for value in (14, 121):
+            raw["soft_reboot_settle_seconds"] = value
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "network_health.json"
+                path.write_text(json.dumps(raw), encoding="utf-8")
+                with self.assertRaises(MONITOR.ConfigurationError):
+                    MONITOR.load_config(str(path))
 
     def test_arp_permission_failure_falls_back_to_icmp(self):
         target = MONITOR.Target("EXAMPLE00000001", "192.168.31.52")

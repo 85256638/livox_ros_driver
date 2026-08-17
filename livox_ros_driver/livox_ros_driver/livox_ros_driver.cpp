@@ -1949,6 +1949,12 @@ void StatsTimerCb(const ros::TimerEvent &) {
                       << static_cast<unsigned>(ls.network_soft_reboot_attempts)
                       << "/"
                       << static_cast<unsigned>(ls.network_soft_reboot_max_attempts);
+        if (ls.network_soft_reboot_settle_deadline_ns > now_ns) {
+          active_alerts << "; accepted reboot settle="
+                        << FmtDur(ls.network_soft_reboot_settle_deadline_ns -
+                                  now_ns)
+                        << " remaining";
+        }
         if (ls.network_shared_suspected) {
           active_alerts << "; shared-path suspected";
         }
@@ -2309,7 +2315,8 @@ void StatsTimerCb(const ros::TimerEvent &) {
      << "==================== NETWORK HEALTH (5s) =========\n"
      << "  ARP/ICMP probe; 1 loss=NET_DEGRADED; 2 failures inside 5s => "
         "NET_UNSTABLE; 3 consecutive misses=NET_UNREACHABLE; "
-        "soft reboot 3x before relay escalation\n"
+        "send-failure retries are short; accepted reboot waits its settle "
+        "window before another retry; relay follows the bounded budget\n"
      << network_table.str()
      << "==================== ASSESSMENT GUIDE ============\n"
      << "  ACTIVE=current fault; RECOVERING=automatic recovery in progress; "

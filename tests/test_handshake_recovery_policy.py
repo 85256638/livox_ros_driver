@@ -103,6 +103,30 @@ class HandshakeRecoveryPolicySourceTests(unittest.TestCase):
             tick[tick.index("if (!bad)") : tick.index("if (s.network_soft_reboot_episode_ns")],
         )
 
+    def test_network_reboot_waits_after_accepted_command(self):
+        self.assertIn("network_soft_reboot_settle_ns", HEADER)
+        self.assertIn("network_soft_reboot_settle_deadline_ns", HEADER)
+        self.assertIn("network_soft_reboot_command_accepted", HEADER)
+        self.assertIn('soft_reboot_settle_seconds', CPP)
+        self.assertIn(
+            "s.network_soft_reboot_settle_deadline_ns =\n          now + s.network_soft_reboot_settle_ns",
+            CPP,
+        )
+        self.assertIn("const bool reboot_settling", CPP)
+        self.assertIn("if (reboot_settling)", CPP)
+        self.assertIn(
+            "s.network_soft_reboot_command_accepted = status == kStatusSuccess",
+            CPP,
+        )
+        self.assertIn(
+            "s.network_soft_reboot_command_accepted &&",
+            CPP,
+        )
+        self.assertIn(
+            "soft_settle_ns * static_cast<int64_t>(soft_max_attempts)",
+            CPP,
+        )
+
     def test_power_alert_is_revalidated_and_counted_only_at_commit(self):
         commit = CPP[
             CPP.index("if (power_cycle_candidate)") :

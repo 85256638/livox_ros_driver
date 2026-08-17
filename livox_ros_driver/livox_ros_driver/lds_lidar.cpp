@@ -74,6 +74,7 @@ const int64_t kNormalDropoutConfirmNs =
     LdsLidar::NormalDropoutConfirmNs();
 const int64_t kNetworkSoftRebootAckTimeoutNs = 2000000000LL;
 const int64_t kNetworkSoftRebootRetryNs = 5000000000LL;
+const int64_t kNetworkSoftRebootSettleNs = 60000000000LL;
 const uint8_t kNetworkSoftRebootMaxAttempts = 3;
 const int64_t kNetworkHealthStaleNs = 4000000000LL;
 
@@ -171,8 +172,10 @@ void ClearNetworkRecoveryState(LdsLidar::LinkStat *s) {
   s->network_soft_reboot_generation = 0;
   s->network_soft_reboot_inflight = false;
   s->network_soft_reboot_ack = false;
+  s->network_soft_reboot_command_accepted = false;
   s->network_soft_reboot_disconnect = false;
   s->network_soft_reboot_reconnected = false;
+  s->network_soft_reboot_settle_deadline_ns = 0;
   s->network_soft_reboot_status = 0;
   s->network_soft_reboot_response = 0;
 }
@@ -206,8 +209,10 @@ void ClearRecoveredNetworkRecoveryState(LdsLidar::LinkStat *s) {
   s->network_soft_reboot_generation = 0;
   s->network_soft_reboot_inflight = false;
   s->network_soft_reboot_ack = false;
+  s->network_soft_reboot_command_accepted = false;
   s->network_soft_reboot_disconnect = false;
   s->network_soft_reboot_reconnected = false;
+  s->network_soft_reboot_settle_deadline_ns = 0;
   s->network_soft_reboot_status = 0;
   s->network_soft_reboot_response = 0;
   if (network_reason) {
@@ -359,6 +364,10 @@ void LdsLidar::OnLidarConnectEvent(uint8_t handle, const char *broadcast_code) {
   uint8_t reset_attempts = s.handshake_reset_attempts;
   int64_t handshake_since_ns = s.broadcast_only_since_ns;
   s.connect_since_ns = now;
+  if (s.network_soft_reboot_disconnect &&
+      s.network_recovery_state == kNetworkRecoverySoftRebootVerifying) {
+    s.network_soft_reboot_reconnected = true;
+  }
   s.broadcast_only_since_ns = 0;
   s.handshake_state = kHandshakeLinkIdle;
   s.handshake_reset_attempts = 0;
@@ -516,6 +525,9 @@ void LdsLidar::OnLidarDisconnectEvent(uint8_t handle,
     if (s.network_soft_reboot_generation == current_generation) {
       s.network_soft_reboot_disconnect = true;
       s.network_soft_reboot_inflight = false;
+      s.network_soft_reboot_command_accepted = true;
+      s.network_soft_reboot_settle_deadline_ns =
+          now + s.network_soft_reboot_settle_ns;
       s.network_recovery_state = kNetworkRecoverySoftRebootVerifying;
     }
     s.planned_reboot_generation = 0;
@@ -1535,8 +1547,10 @@ livox_status LdsLidar::RequestLidarRebootImpl(
       s.network_soft_reboot_generation = reboot_generation;
       s.network_soft_reboot_inflight = true;
       s.network_soft_reboot_ack = false;
+      s.network_soft_reboot_command_accepted = false;
       s.network_soft_reboot_disconnect = false;
       s.network_soft_reboot_reconnected = false;
+      s.network_soft_reboot_settle_deadline_ns = 0;
       s.network_soft_reboot_status = 0;
       s.network_soft_reboot_response = 0;
       s.network_recovery_state = kNetworkRecoverySoftRebootVerifying;
@@ -1563,6 +1577,8 @@ livox_status LdsLidar::RequestLidarRebootImpl(
     if (network_reboot && s.network_soft_reboot_generation == reboot_generation &&
         status != kStatusSuccess) {
       s.network_soft_reboot_inflight = false;
+      s.network_soft_reboot_command_accepted = false;
+      s.network_soft_reboot_settle_deadline_ns = 0;
       s.network_soft_reboot_status = status;
       s.network_recovery_state = kNetworkRecoveryWaiting;
     }
@@ -1614,8 +1630,19 @@ void LdsLidar::ApplyNetworkHealthJson(const std::string &json) {
   if (soft_ack_timeout_ns >= soft_interval_ns) {
     soft_ack_timeout_ns = std::max<int64_t>(500000000LL, soft_interval_ns / 2);
   }
+  int64_t soft_settle_ns = kNetworkSoftRebootSettleNs;
+  if (doc.HasMember("soft_reboot_settle_seconds") &&
+      doc["soft_reboot_settle_seconds"].IsNumber()) {
+    soft_settle_ns = SecondsToNs(
+        doc["soft_reboot_settle_seconds"].GetDouble(),
+        kNetworkSoftRebootSettleNs);
+    if (soft_settle_ns < 15000000000LL ||
+        soft_settle_ns > 120000000000LL) {
+      soft_settle_ns = kNetworkSoftRebootSettleNs;
+    }
+  }
   const int64_t soft_deadline_ns =
-      soft_interval_ns * static_cast<int64_t>(soft_max_attempts);
+      soft_settle_ns * static_cast<int64_t>(soft_max_attempts);
   const int64_t now =
       std::chrono::steady_clock::now().time_since_epoch().count();
   for (rapidjson::SizeType i = 0; i < doc["devices"].Size(); ++i) {
@@ -1663,6 +1690,7 @@ void LdsLidar::ApplyNetworkHealthJson(const std::string &json) {
     s.network_soft_reboot_max_attempts = soft_max_attempts;
     s.network_soft_reboot_interval_ns = soft_interval_ns;
     s.network_soft_reboot_ack_timeout_ns = soft_ack_timeout_ns;
+    s.network_soft_reboot_settle_ns = soft_settle_ns;
     s.network_soft_recovery_deadline_ns = soft_deadline_ns;
     s.network_health_state = state;
     s.network_last_health_ns = now;
@@ -1756,7 +1784,23 @@ void LdsLidar::TickNetworkRecovery(bool enable_recovery) {
           now - s.network_soft_reboot_last_try_ns >=
               s.network_soft_reboot_ack_timeout_ns) {
         s.network_soft_reboot_inflight = false;
+        s.network_soft_reboot_command_accepted = false;
+        s.network_soft_reboot_settle_deadline_ns = 0;
         s.network_recovery_state = kNetworkRecoveryWaiting;
+      }
+      /** A successful reboot ACK means the device accepted the command; it
+       *  does not mean the post-reboot handshake is complete.  Hold off on
+       *  another software reboot until the configured settle deadline. */
+      const bool reboot_settling =
+          s.network_soft_reboot_command_accepted &&
+          s.network_soft_reboot_settle_deadline_ns != 0 &&
+          now < s.network_soft_reboot_settle_deadline_ns;
+      if (reboot_settling) {
+        continue;
+      }
+      if (s.network_soft_reboot_settle_deadline_ns != 0) {
+        s.network_soft_reboot_settle_deadline_ns = 0;
+        s.network_soft_reboot_command_accepted = false;
       }
       const bool deadline =
           now - episode_since >= s.network_soft_recovery_deadline_ns;
@@ -3671,8 +3715,25 @@ void LdsLidar::RebootCb(livox_status status, uint8_t handle, uint8_t response,
   if (s.network_soft_reboot_inflight) {
     s.network_soft_reboot_inflight = false;
     s.network_soft_reboot_ack = status == kStatusSuccess;
+    s.network_soft_reboot_command_accepted = status == kStatusSuccess;
     s.network_soft_reboot_status = status;
     s.network_soft_reboot_response = response;
+    if (status == kStatusSuccess) {
+      const int64_t now =
+          std::chrono::steady_clock::now().time_since_epoch().count();
+      s.network_soft_reboot_settle_deadline_ns =
+          now + s.network_soft_reboot_settle_ns;
+      printf("Lidar[%d] network reboot command accepted; waiting %.0fs "
+             "for post-reboot handshake before retry\n",
+             handle,
+             static_cast<double>(s.network_soft_reboot_settle_ns) /
+                 1000000000.0);
+    } else {
+      s.network_soft_reboot_settle_deadline_ns = 0;
+      printf("Lidar[%d] network reboot command was not accepted; retry "
+             "after the configured short interval\n",
+             handle);
+    }
     s.network_recovery_state = kNetworkRecoverySoftRebootVerifying;
   }
 }

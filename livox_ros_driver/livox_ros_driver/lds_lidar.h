@@ -361,7 +361,13 @@ class LdsLidar : public Lds {
     uint8_t network_soft_reboot_max_attempts = 3;
     int64_t network_soft_reboot_interval_ns = 5000000000LL;
     int64_t network_soft_reboot_ack_timeout_ns = 2000000000LL;
-    int64_t network_soft_recovery_deadline_ns = 15000000000LL;
+    /** After a reboot command is accepted, give the lidar a full startup
+     *  settle window before allowing another software reboot.  This is
+     *  intentionally separate from network_soft_reboot_interval_ns, which
+     *  is only the retry delay for a command that was not accepted. */
+    int64_t network_soft_reboot_settle_ns = 60000000000LL;
+    int64_t network_soft_reboot_settle_deadline_ns = 0;
+    int64_t network_soft_recovery_deadline_ns = 180000000000LL;
     int64_t network_soft_reboot_episode_ns = 0;
     int64_t network_soft_reboot_episode_wall_s = 0;
     int64_t network_soft_reboot_last_try_ns = 0;
@@ -369,6 +375,7 @@ class LdsLidar : public Lds {
     uint64_t network_soft_reboot_generation = 0;
     bool network_soft_reboot_inflight = false;
     bool network_soft_reboot_ack = false;
+    bool network_soft_reboot_command_accepted = false;
     bool network_soft_reboot_disconnect = false;
     bool network_soft_reboot_reconnected = false;
     int32_t network_soft_reboot_status = 0;

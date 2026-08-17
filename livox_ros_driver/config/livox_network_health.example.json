@@ -8,6 +8,7 @@
   "soft_reboot_max_attempts": 3,
   "soft_reboot_interval_seconds": 5,
   "soft_reboot_ack_timeout_seconds": 2,
+  "soft_reboot_settle_seconds": 60,
   "targets": [
     {
       "broadcast_code": "EXAMPLE00000001",

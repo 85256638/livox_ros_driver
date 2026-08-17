@@ -162,12 +162,20 @@ LIVOX_JOBS=2 bash "$HOME/catkin_ws/src/livox_ros_driver/update_livox_geph.sh" --
 网络健康配置位于仓库外，不会被更新脚本覆盖。先从模板复制一次，再把四台雷达的实际IP替换为现场值。`broadcast_code` 和 IP 是持久身份；SDK `handle` 会在重连或 Driver 重启后重新分配，**不要写入网络健康配置**。`interface` 通常留空，让系统按 `ip route get <IP>` 自动选择出口网卡；只有多网卡且必须固定出口时才填写实际网卡名（例如 `enp3s0`）：
 
 ```bash
-mkdir -p "$HOME/.config/livox" && install -m 600 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_network_health.example.json" "$HOME/.config/livox/network_health.json" && nano "$HOME/.config/livox/network_health.json" && python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/scripts/livox_network_health_monitor.py" --config "$HOME/.config/livox/network_health.json" --validate-config
+mkdir -p "$HOME/.config/livox" && install -m 600 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/config/livox_network_health.example.json" "$HOME/.config/livox/network_health.json" && nano "$HOME/.config/livox/network_health.json" && python3 "$HOME/catkin_ws/src/livox_ros_driver/livox_ros_driver/livox_ros_driver/scripts/livox_network_health_monitor.py" --config "$HOME/.config/livox/network_health.json" --validate-config
 ```
 
-如果工位已经存在旧版 `~/.config/livox/network_health.json`，更新脚本会原样保留它；请在更新后确认其中的 `window_seconds` 已从旧值 `10` 改为 `5`，否则该工位仍按旧的十秒窗口运行。旧文件中若仍有 `handle` 字段可以暂时保留，新版会兼容读取但完全忽略它；建议人工删除。不要用模板覆盖包含现场 IP、广播码和网卡名的生产配置。
+如果工位已经存在旧版 `~/.config/livox/network_health.json`，更新脚本会原样保留它；请在更新后确认其中的 `window_seconds` 已从旧值 `10` 改为 `5`，否则该工位仍按旧的十秒窗口运行。新版还建议手动补上 `soft_reboot_settle_seconds: 60`；如果旧文件暂时没有这一项，Driver/monitor 会按60秒默认值运行，但建议显式写入，便于现场审计。旧文件中若仍有 `handle` 字段可以暂时保留，新版会兼容读取但完全忽略它；建议人工删除。不要用模板覆盖包含现场 IP、广播码和网卡名的生产配置。
 
-推荐保持 `probe_interval_seconds=1`、`window_seconds=5`、`unstable_failures=2`、`unreachable_consecutive_failures=3`、`healthy_consecutive_successes=5`、`soft_reboot_max_attempts=3`、`soft_reboot_interval_seconds=5`、`soft_reboot_ack_timeout_seconds=2`。5秒内第一次有效丢包显示 `NET_DEGRADED`；5秒内第二次失败，或连续第二次失败的快速路径，立即显示 `NET_UNSTABLE`；连续3次完全无响应显示 `NET_UNREACHABLE`。前5次连续成功探测只用于建立健康基线，期间显示 `NET_UNKNOWN`，不会把正常启动误报成丢包；恢复仍需连续5次成功。若雷达在达到软重启预算后自行恢复，连续5次 `NET_OK` 会清除 Driver 上的网络 `POWER_CYCLE_REQUIRED` 活动锁存，同时保留 `NET_OK` 和历史计数；这种已恢复事件不会再要求继电器 OFF/ON，也不会向 manager 发布自相矛盾的 `NETWORK_RECOVERY_EXHAUSTED + NET_OK` 状态。探测在 `PowerSaving/StandBy` 期间也继续运行，因此看板的 `CURRENT` 不会再用休眠状态掩盖已确认的网络异常；60秒趋势统计仍由 `RECENT 60 SECONDS` 保留。multi launch 中的 `network_health_enable` 默认会启动独立探测进程；配置文件暂时不存在时该进程只记录 WARN 并保持空闲，不会拆掉 Driver。网络看门狗不直接操作继电器：它先重复软重启，只有配置的软重启预算（推荐3次、每次间隔5秒）仍未让窗口恢复健康，Driver 才发布 `NETWORK_RECOVERY_EXHAUSTED`，由已经武装的共享电源 manager 执行四路 OFF/ON。
+已有生产配置可以用下面这一行只更新策略字段，不会改动 `targets` 中的广播码、IP 或 `interface`：
+
+```bash
+python3 -c 'import json,pathlib; p=pathlib.Path.home()/".config/livox/network_health.json"; d=json.loads(p.read_text()); d.update({"probe_interval_seconds":1,"window_seconds":5,"unstable_failures":2,"unreachable_consecutive_failures":3,"healthy_consecutive_successes":5,"soft_reboot_max_attempts":3,"soft_reboot_interval_seconds":5,"soft_reboot_ack_timeout_seconds":2,"soft_reboot_settle_seconds":60}); p.write_text(json.dumps(d,ensure_ascii=False,indent=2)+"\n")'
+```
+
+如果文件尚不存在，先从 `livox_network_health.example.json` 复制一份，再把四台雷达的真实 `broadcast_code` 和固定 IP 填入；`handle` 不要填写，`interface` 通常留空。继电器 `~/.config/livox/power_cycle.json`、Driver 白名单 JSON 和 launch 本次不需要因“软重启稳定等待”改动。
+
+推荐保持 `probe_interval_seconds=1`、`window_seconds=5`、`unstable_failures=2`、`unreachable_consecutive_failures=3`、`healthy_consecutive_successes=5`、`soft_reboot_max_attempts=3`、`soft_reboot_interval_seconds=5`、`soft_reboot_ack_timeout_seconds=2`、`soft_reboot_settle_seconds=60`。5秒内第一次有效丢包显示 `NET_DEGRADED`；5秒内第二次失败，或连续第二次失败的快速路径，立即显示 `NET_UNSTABLE`；连续3次完全无响应显示 `NET_UNREACHABLE`。前5次连续成功探测只用于建立健康基线，期间显示 `NET_UNKNOWN`，不会把正常启动误报成丢包；恢复仍需连续5次成功。网络软重启的5秒 `soft_reboot_interval_seconds` 现在只用于“命令未被接受/发送失败”的短重试；一旦雷达接受了软重启命令，Driver 会进入 `soft_reboot_settle_seconds` 稳定等待，在等待窗口内禁止再次软重启，直到设备信息握手、心跳和点云恢复，或等待窗口到期。根据现场实测，推荐60秒可覆盖约40～48秒的实际恢复时间。若雷达在达到软重启预算后自行恢复，连续5次 `NET_OK` 会清除 Driver 上的网络 `POWER_CYCLE_REQUIRED` 活动锁存，同时保留 `NET_OK` 和历史计数；这种已恢复事件不会再要求继电器 OFF/ON，也不会向 manager 发布自相矛盾的 `NETWORK_RECOVERY_EXHAUSTED + NET_OK` 状态。探测在 `PowerSaving/StandBy` 期间也继续运行，因此看板的 `CURRENT` 不会再用休眠状态掩盖已确认的网络异常；60秒趋势统计仍由 `RECENT 60 SECONDS` 保留。multi launch 中的 `network_health_enable` 默认会启动独立探测进程；配置文件暂时不存在时该进程只记录 WARN 并保持空闲，不会拆掉 Driver。网络看门狗不直接操作继电器：它先按“发送失败短重试、接受后稳定等待”的策略重复软重启，只有配置的软重启预算（推荐3次、每次最多等待60秒）仍未让窗口恢复健康，Driver 才发布 `NETWORK_RECOVERY_EXHAUSTED`，由已经武装的共享电源 manager 执行四路 OFF/ON。
 
 修改完成后统一运行根目录入口；不要再手工输入内部Python脚本的三层目录。只有输出 `Configuration valid` 和 `Site identity valid` 才允许进入后续步骤：
 

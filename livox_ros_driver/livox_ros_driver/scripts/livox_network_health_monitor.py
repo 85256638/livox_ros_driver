@@ -34,6 +34,7 @@ DEFAULT_HEALTHY_CONSECUTIVE_SUCCESSES = 5
 DEFAULT_SOFT_REBOOT_MAX_ATTEMPTS = 3
 DEFAULT_SOFT_REBOOT_INTERVAL_SECONDS = 5.0
 DEFAULT_SOFT_REBOOT_ACK_TIMEOUT_SECONDS = 2.0
+DEFAULT_SOFT_REBOOT_SETTLE_SECONDS = 60.0
 STATE_UNKNOWN = "UNKNOWN"
 STATE_OK = "NET_OK"
 STATE_DEGRADED = "NET_DEGRADED"
@@ -99,6 +100,7 @@ class MonitorConfig:
     soft_reboot_max_attempts: int
     soft_reboot_interval_seconds: float
     soft_reboot_ack_timeout_seconds: float
+    soft_reboot_settle_seconds: float
     targets: Tuple[Target, ...]
 
 
@@ -167,6 +169,7 @@ def load_config(path: str) -> MonitorConfig:
     soft_ack = _number(raw, "soft_reboot_ack_timeout_seconds", DEFAULT_SOFT_REBOOT_ACK_TIMEOUT_SECONDS, 0.5, 5.0)
     if soft_ack >= soft_interval:
         raise ConfigurationError("soft_reboot_ack_timeout_seconds must be < soft_reboot_interval_seconds")
+    soft_settle = _number(raw, "soft_reboot_settle_seconds", DEFAULT_SOFT_REBOOT_SETTLE_SECONDS, 15.0, 120.0)
     targets_raw = raw.get("targets")
     if not isinstance(targets_raw, list) or not targets_raw:
         raise ConfigurationError("targets must be a non-empty array")
@@ -204,6 +207,7 @@ def load_config(path: str) -> MonitorConfig:
         soft_max,
         soft_interval,
         soft_ack,
+        soft_settle,
         tuple(targets),
     )
 
@@ -281,6 +285,7 @@ def _build_frame(config: MonitorConfig, states: Mapping[str, Dict[str, Any]], sh
         "soft_reboot_max_attempts": config.soft_reboot_max_attempts,
         "soft_reboot_interval_seconds": config.soft_reboot_interval_seconds,
         "soft_reboot_ack_timeout_seconds": config.soft_reboot_ack_timeout_seconds,
+        "soft_reboot_settle_seconds": config.soft_reboot_settle_seconds,
         "shared_network_suspected": shared,
         "devices": list(states.values()),
     }
@@ -305,7 +310,7 @@ def run_ros(config: MonitorConfig) -> int:
     if not arping_available and shutil.which("ping") is None:
         rospy.logerr("neither arping nor ping is available; network monitor disabled")
         return 2
-    rospy.loginfo("Livox network health monitor: targets=%d window=%.1fs interval=%.1fs probe=%s soft-reboots=%d/%0.1fs ack=%0.1fs", len(config.targets), config.window_seconds, config.probe_interval_seconds, "ARP/ICMP" if arping_available else "ICMP", config.soft_reboot_max_attempts, config.soft_reboot_interval_seconds, config.soft_reboot_ack_timeout_seconds)
+    rospy.loginfo("Livox network health monitor: targets=%d window=%.1fs interval=%.1fs probe=%s soft-reboots=%d retry=%0.1fs ack=%0.1fs settle=%0.1fs", len(config.targets), config.window_seconds, config.probe_interval_seconds, "ARP/ICMP" if arping_available else "ICMP", config.soft_reboot_max_attempts, config.soft_reboot_interval_seconds, config.soft_reboot_ack_timeout_seconds, config.soft_reboot_settle_seconds)
     rate = rospy.Rate(1.0 / config.probe_interval_seconds)
     while not rospy.is_shutdown():
         now = time.time()
@@ -357,7 +362,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         rospy.spin()
         return 0
     if args.validate_config:
-        print("Configuration valid: targets=%d window=%.1fs interval=%.1fs unstable=%d unreachable=%d healthy=%d soft_reboots=%d interval=%.1fs ack=%.1fs" % (len(config.targets), config.window_seconds, config.probe_interval_seconds, config.unstable_failures, config.unreachable_consecutive_failures, config.healthy_consecutive_successes, config.soft_reboot_max_attempts, config.soft_reboot_interval_seconds, config.soft_reboot_ack_timeout_seconds))
+        print("Configuration valid: targets=%d window=%.1fs interval=%.1fs unstable=%d unreachable=%d healthy=%d soft_reboots=%d retry=%.1fs ack=%.1fs settle=%.1fs" % (len(config.targets), config.window_seconds, config.probe_interval_seconds, config.unstable_failures, config.unreachable_consecutive_failures, config.healthy_consecutive_successes, config.soft_reboot_max_attempts, config.soft_reboot_interval_seconds, config.soft_reboot_ack_timeout_seconds, config.soft_reboot_settle_seconds))
         return 0
     return run_ros(config)
 
